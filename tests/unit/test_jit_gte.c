@@ -542,6 +542,8 @@ static int test_gte_inline_code_size(void) {
             }
             arm_emit_reset(&g_size_emit, g_size_buf, (u32)sizeof(g_size_buf));
             CHECK_TRUE(jit_emit_gte_inline(&g_size_emit, op), "jit_emit_gte_inline emitted");
+            /* Instruction words only: the literal pool appended by finalize is data */
+            u32 code_words = arm_emit_offset_words(&g_size_emit);
             u32 bytes = 0u;
             CHECK_TRUE(arm_emit_finalize(&g_size_emit, &bytes), "arm_emit_finalize");
             u32 words = bytes / 4u;
@@ -551,7 +553,7 @@ static int test_gte_inline_code_size(void) {
                 return 1;
             }
             /* No r12 / lr writes inside inline kernels (cached GPR slots 5/6 stay live) */
-            for (u32 w = 0u; w < words; ++w) {
+            for (u32 w = 0u; w < code_words; ++w) {
                 u32 ins = g_size_buf[w];
                 bool is_push_pop = ((ins & 0x0FFF0000u) == 0x092D0000u) ||
                                    ((ins & 0x0FFF0000u) == 0x08BD0000u);
@@ -562,7 +564,7 @@ static int test_gte_inline_code_size(void) {
                 u32 rd = (ins >> 12) & 15u;
                 if (dp && !is_push_pop && !is_bl && (rd == 12u || rd == 14u)) {
                     /* Allowed only as `ldr r12, =fn` / `blx r12` far-call sequence inside emit_call */
-                    bool next_is_blx = (w + 1u < words) && ((g_size_buf[w + 1u] & 0x0FFFFFFFu) == 0x012FFF3Cu);
+                    bool next_is_blx = (w + 1u < code_words) && ((g_size_buf[w + 1u] & 0x0FFFFFFFu) == 0x012FFF3Cu);
                     if (!next_is_blx) {
                         fprintf(stderr, "op=0x%08lX writes r%lu at word %lu (0x%08lX)\n",
                                 (unsigned long)op, (unsigned long)rd, (unsigned long)w, (unsigned long)ins);

@@ -1922,6 +1922,7 @@ emit_tails:
     sys->stats.jit_blocks_live++;
     sys->stats.jit_blocks_compiled_frame++;
     sys->stats.jit_code_bytes = (u32)(j->code_ptr - j->mem.rw);
+    j->native_emitted = 1u;
 
     return b;
 
@@ -2009,7 +2010,7 @@ PSX_USED void *jit_compile_at_pc(PsxCpu *cpu) {
     JitState *j = &sys->jit;
     u32 pc = cpu->pc;
 
-    if (cpu->cycles_left <= 0 || sys->quit || sys->frame_done) {
+    if (cpu->cycles_left <= 0 || sys->quit || sys->frame_done || j->native_exhausted != 0u) {
         return (void *)jit_exit;
     }
 
@@ -2017,6 +2018,9 @@ PSX_USED void *jit_compile_at_pc(PsxCpu *cpu) {
     if ((j->max_blocks - j->n_blocks) < (JIT_EAGER_BUDGET + 1u) ||
         (size_t)(j->code_end - j->code_ptr) < ((size_t)(JIT_EAGER_BUDGET + 1u) * JIT_MAX_BLOCK_BYTES)) {
         jit_flush_all(sys);
+        if (j->native_exhausted != 0u) {
+            return (void *)jit_exit; /* jit_run() continues on the cached interpreter */
+        }
     }
 
     u32 budget = JIT_EAGER_BUDGET;
@@ -2089,8 +2093,10 @@ void jit_run(PsxSystem *sys) {
     PsxCpu *c = &sys->cpu;
     JitState *j = &sys->jit;
 
-    /* Fallback seamlessly to cached interpreter if host/OS denied executable JIT memory */
-    if (!j->mem.rx || j->mem.mode == JIT_MEM_NONE || !j->tab_ram || !j->tab_bios) {
+    /* Fallback seamlessly to cached interpreter if host/OS denied executable JIT memory,
+     * or if HLE RWX_INPLACE append-only code space was exhausted (see jit_flush_all) */
+    if (!j->mem.rx || j->mem.mode == JIT_MEM_NONE || !j->tab_ram || !j->tab_bios ||
+        j->native_exhausted != 0u) {
         cpu_cached_run(sys);
         return;
     }
@@ -2122,6 +2128,10 @@ void jit_run(PsxSystem *sys) {
         c->in_jit = 0u;
         if (c->in_delay_slot == 0u) {
             c->next_pc = c->pc + 4u;
+        }
+        if (PSX_UNLIKELY(j->native_exhausted != 0u)) {
+            cpu_cached_run(sys);
+            return;
         }
 
         if (rc == PSX_EXIT_STEP_ONE) {

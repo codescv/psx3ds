@@ -1237,6 +1237,66 @@ static int test_diff_subpage_smc(void) {
     return 0;
 }
 
+/* ============================================================================
+ * Test 10c: HLE RWX_INPLACE (no icache SVC) append-only code-space exhaustion:
+ * the buffer must never be rewound over previously executed native code; the
+ * engine retires native JIT and continues on the cached interpreter.
+ * ============================================================================ */
+static int test_rwx_inplace_exhaustion(void) {
+#if PSX3DS_HAVE_JIT
+    const u32 base = 0x80010000u;
+    const u32 prog[] = {
+        M_LUI(R_S7, 0x8001u),
+        M_ORI(R_S7, R_S7, 0x2000u),
+        M_ORI(R_T0, R_ZERO, 100u),
+        M_ORI(R_V0, R_ZERO, 0u),
+        /* loop: */
+        M_ADDU(R_V0, R_V0, R_T0),
+        M_ADDIU(R_T0, R_T0, -1),
+        M_BNE(R_T0, R_ZERO, -3),
+        M_NOP,
+        M_SW(R_V0, 0, R_S7),
+        M_BEQ(R_ZERO, R_ZERO, -1),
+        M_NOP
+    };
+    const u32 n = (u32)(sizeof(prog) / 4u);
+    const u32 halt_va = base + (n - 2u) * 4u;
+    PsxSystem *s = &g_sys[2];
+    JitState *j = &s->jit;
+
+    /* Phase 1: run natively (marks native_emitted) */
+    test_sys_prepare(s, base);
+    write_code(s, 0x10000u, prog, n);
+    run_engine_until_halt(s, true, halt_va, 4096, 32u);
+    CHECK_TRUE(read_ram32(s, 0x12000u) == 5050u, "native run computes 5050");
+    CHECK_TRUE(j->native_emitted != 0u && j->native_exhausted == 0u, "native code emitted");
+
+    /* Phase 2: pretend HLE RWX_INPLACE with < 1 MiB never-executed space left */
+    JitMemMode saved_mode = j->mem.mode;
+    bool saved_luma = j->mem.luma_icache_svc;
+    j->mem.mode = JIT_MEM_RWX_INPLACE;
+    j->mem.luma_icache_svc = false;
+    /* jit_compile_at_pc flushes when < (JIT_EAGER_BUDGET + 1 = 33) * JIT_MAX_BLOCK_BYTES remain */
+    j->code_ptr = j->code_end - (33u * JIT_MAX_BLOCK_BYTES - 64u);
+    write_ram32(s, 0x12000u, 0u);
+    jit_invalidate_page(s, 0x10u);
+    s->cpu.pc = base;
+    s->cpu.next_pc = base + 4u;
+    run_engine_until_halt(s, true, halt_va, 4096, 32u);
+
+    bool ok = (read_ram32(s, 0x12000u) == 5050u) && (j->native_exhausted != 0u) &&
+              (j->n_blocks > 0u) && ((j->blocks[0].flags & JB_CACHED_OP) != 0u);
+
+    /* Restore host JIT state for the remaining tests */
+    j->mem.mode = saved_mode;
+    j->mem.luma_icache_svc = saved_luma;
+    j->native_exhausted = 0u;
+    jit_flush_all(s);
+    CHECK_TRUE(ok, "exhausted RWX_INPLACE buffer retires native JIT -> cached, result 5050");
+#endif
+    return 0;
+}
+
 /* Case I: Live Self-Modifying Code (SMC) */
 static int test_diff_live_smc(void) {
     const u32 base = 0x80010000u;
@@ -1598,6 +1658,7 @@ int main(void) {
     if (test_idle_and_counted_loops() != 0) return 1;
     if (test_diff_live_smc() != 0) return 1;
     if (test_diff_subpage_smc() != 0) return 1;
+    if (test_rwx_inplace_exhaustion() != 0) return 1;
     if (test_diff_openbios_epilogue_and_next_pc() != 0) return 1;
     if (test_microbenchmark() != 0) return 1;
 
