@@ -46,7 +46,8 @@ static inline s32 max3_s32(s32 a, s32 b, s32 c) {
     return (m > c) ? m : c;
 }
 
-/* Exact floor(rhs / d) for d in 1..1023 using Q20 reciprocal + <=1-step correction */
+/* Exact floor(rhs / d) for d in 1..1023 using Q20 reciprocal + <=1-step correction
+ * (called only during per-edge triangle setup, never per scanline) */
 static inline s32 div_floor_pos(s32 rhs, s32 d) {
     s32 q = (s32)(((s64)rhs * (s64)s_recip_q20[d]) >> 20);
     while (d * q > rhs) {
@@ -58,16 +59,37 @@ static inline s32 div_floor_pos(s32 rhs, s32 d) {
     return q;
 }
 
-/* Exact ceil(lhs / d) for d in 1..1023 using Q20 reciprocal + <=1-step correction */
-static inline s32 div_ceil_pos(s32 lhs, s32 d) {
-    s32 q = (s32)(((s64)lhs * (s64)s_recip_q20[d]) >> 20);
-    while (d * q < lhs) {
-        q++;
+/* Exact incremental floor(rhs(y) / D) walker for one sloped triangle edge */
+typedef struct EdgeStepper {
+    s32 q, r;   /* floor(rhs / D), rhs mod D (0 <= r < D) */
+    s32 qs, rs; /* floor(dx / D),  dx mod D  (0 <= rs < D) */
+    s32 D;      /* |dy| (1..511) */
+} EdgeStepper;
+
+/* Directed edge e_k connects vertex k -> (k + 1) % 3 */
+static inline int edge_of_verts(int i, int j) {
+    return (j == (i + 1) % 3) ? i : j;
+}
+
+static inline void edge_stepper_init(EdgeStepper *s, s32 dx, s32 dy, s32 px, s32 py, s32 y) {
+    s32 bias = (dy < 0) ? 0 : -1; /* sloped edges: left (dy < 0) edges are top-left */
+    s32 rhs  = dx * (y - py) + dy * px + bias;
+    s32 D    = (dy >= 0) ? dy : -dy;
+    s->D  = D;
+    s->q  = div_floor_pos(rhs, D);
+    s->r  = rhs - s->q * D;
+    s->qs = div_floor_pos(dx, D);
+    s->rs = dx - s->qs * D;
+}
+
+static inline void edge_stepper_step(EdgeStepper *s) {
+    s32 r = s->r + s->rs;
+    s->q += s->qs;
+    if (r >= s->D) {
+        s->q++;
+        r -= s->D;
     }
-    while (d * (q - 1) >= lhs) {
-        q--;
-    }
-    return q;
+    s->r = r;
 }
 
 static const u16 *ensure_clut(GpuSoft *gs, const u16 *vram, u16 clut_attr, u8 depth) {
@@ -184,16 +206,57 @@ static void rasterize_triangle(GpuSoft *gs, const GpuPrim *p,
      *   left edge: dy_i < 0
      * Bias = 0 if top-left, -1 otherwise -> E_i(x, y) + bias_i >= 0
      *   <=> dy_i * x <= dx_i * (y - py_i) + dy_i * px_i + bias_i = rhs_i(y)
+     *
+     * Per-row bounds: dy_i > 0 -> x <= floor(rhs_i / dy_i)          (right bound)
+     *                 dy_i < 0 -> x >= -floor(rhs_i / |dy_i|)       (left bound)
+     *                 dy_i == 0 -> top edge: no constraint; bottom edge: excludes row y = max_y
+     *
+     * Two-active-edge scanline walk (exactly equivalent to the 3-half-space test): with vertices
+     * sorted y0 <= y1 <= y2, rows [y0, y1) are bounded by the long edge (top->bot) and short edge
+     * s1 (top->mid); rows [y1, y2] by the long edge and s2 (mid->bot). s1 and s2 lie on the same
+     * side (same role, same bias), and by convexity the inactive short edge is never tighter, so
+     * dropping it is exact (at row y1 both short edges pass through the middle vertex).
+     *
+     * rhs(y + 1) = rhs(y) + dx, so floor(rhs / |dy|) is walked with an exact Bresenham
+     * quotient/remainder stepper set up once per edge: zero divisions/multiplies per scanline.
      */
     s32 edx[3] = { bx - ax, cx - bx, ax - cx };
     s32 edy[3] = { by - ay, cy - by, ay - cy };
     s32 epx[3] = { ax, bx, cx };
     s32 epy[3] = { ay, by, cy };
-    s32 erhs[3];
-    for (int e = 0; e < 3; e++) {
-        s32 bias = ((edy[e] < 0) || (edy[e] == 0 && edx[e] > 0)) ? 0 : -1;
-        erhs[e] = edx[e] * (y_start - epy[e]) + edy[e] * epx[e] + bias;
+
+    int v_top = 0, v_mid = 1, v_bot = 2;
+    {
+        const s32 vy[3] = { ay, by, cy };
+        int t;
+        if (vy[v_mid] < vy[v_top]) { t = v_top; v_top = v_mid; v_mid = t; }
+        if (vy[v_bot] < vy[v_mid]) { t = v_mid; v_mid = v_bot; v_bot = t; }
+        if (vy[v_mid] < vy[v_top]) { t = v_top; v_top = v_mid; v_mid = t; }
     }
+    s32 y1 = epy[v_mid];
+    s32 y2 = epy[v_bot];
+    /* Flat bottom: the horizontal bottom edge (dx < 0, bias -1) excludes row y2 */
+    if (y1 == y2 && y_end >= y2) {
+        y_end = y2 - 1;
+        if (y_start > y_end) {
+            return;
+        }
+    }
+    int e_long = edge_of_verts(v_top, v_bot);
+    int e_s1   = edge_of_verts(v_top, v_mid);
+    int e_s2   = edge_of_verts(v_mid, v_bot);
+    bool long_is_right = edy[e_long] > 0;
+
+    EdgeStepper st_long, st_short;
+    edge_stepper_init(&st_long, edx[e_long], edy[e_long], epx[e_long], epy[e_long], y_start);
+    bool in_phase1 = (y_start < y1);
+    if (in_phase1) {
+        edge_stepper_init(&st_short, edx[e_s1], edy[e_s1], epx[e_s1], epy[e_s1], y_start);
+    } else {
+        edge_stepper_init(&st_short, edx[e_s2], edy[e_s2], epx[e_s2], epy[e_s2], y_start);
+    }
+    EdgeStepper *st_r = long_is_right ? &st_long : &st_short;
+    EdgeStepper *st_l = long_is_right ? &st_short : &st_long;
 
     u8   flags  = p->flags;
     bool is_tex = (flags & PF_TEXTURED) != 0u;
@@ -201,15 +264,30 @@ static void rasterize_triangle(GpuSoft *gs, const GpuPrim *p,
     bool is_gou = (flags & PF_GOURAUD) != 0u;
     bool is_sem = (flags & PF_SEMI) != 0u;
     bool do_dither = (env->dither != 0u) && (is_gou || (is_tex && !is_raw));
+    bool need_gou_grad = is_gou && !(is_tex && is_raw);
 
-    s64 inv_area_q32 = ((s64)1 << 32) / (s64)area;
+    /* Exact floor(2^32 / area) via 32-bit unsigned division (no 64-bit __aeabi_ldivmod),
+     * computed only when colour or UV gradients are actually interpolated. */
+    s64 inv_area_q32 = 0;
+    if (need_gou_grad || is_tex) {
+        u32 a = (u32)area;
+        if (a == 1u) {
+            inv_area_q32 = (s64)1 << 32;
+        } else {
+            u32 q = 0xFFFFFFFFu / a;
+            if ((0xFFFFFFFFu - q * a) == (a - 1u)) {
+                q++;
+            }
+            inv_area_q32 = (s64)q;
+        }
+    }
 
     s32 dr_dx = 0, dr_dy = 0, dg_dx = 0, dg_dy = 0, db_dx = 0, db_dy = 0;
     s32 r0_base = ((s32)va->r << 16) + 0x8000;
     s32 g0_base = ((s32)va->g << 16) + 0x8000;
     s32 b0_base = ((s32)va->b << 16) + 0x8000;
 
-    if (is_gou && !(is_tex && is_raw)) {
+    if (need_gou_grad) {
         s32 dcy = cy - ay, dby = by - ay;
         s32 dbx = bx - ax, dcx = cx - ax;
 
@@ -294,34 +372,16 @@ static void rasterize_triangle(GpuSoft *gs, const GpuPrim *p,
     sp.tw_or_y    = tw_or_y;
 
     for (s32 y = y_start; y <= y_end; y++) {
-        s32 xl = sc_x0;
-        s32 xr = sc_x1;
-
-        for (int e = 0; e < 3; e++) {
-            s32 dy = edy[e];
-            s32 rhs = erhs[e];
-            if (dy == 0) {
-                if (rhs < 0) {
-                    xl = 1;
-                    xr = 0;
-                    break;
-                }
-            } else if (dy > 0) {
-                s32 bound = div_floor_pos(rhs, dy);
-                if (bound < xr) {
-                    xr = bound;
-                }
-            } else {
-                s32 bound = div_ceil_pos(-rhs, -dy);
-                if (bound > xl) {
-                    xl = bound;
-                }
-            }
+        if (in_phase1 && y == y1) {
+            edge_stepper_init(&st_short, edx[e_s2], edy[e_s2], epx[e_s2], epy[e_s2], y);
+            in_phase1 = false;
         }
-
-        erhs[0] += edx[0];
-        erhs[1] += edx[1];
-        erhs[2] += edx[2];
+        s32 xl = -st_l->q;
+        s32 xr = st_r->q;
+        if (xl < sc_x0) xl = sc_x0;
+        if (xr > sc_x1) xr = sc_x1;
+        edge_stepper_step(&st_long);
+        edge_stepper_step(&st_short);
 
         if (xl > xr) {
             continue;
@@ -331,7 +391,7 @@ static void rasterize_triangle(GpuSoft *gs, const GpuPrim *p,
         u16 *row_ptr = vram + ((u32)y * PSX_VRAM_W);
         u16 *dst = row_ptr + xl;
 
-        if (!is_tex && !env->check_mask && !do_dither) {
+        if (!is_tex && !env->check_mask) {
             if (!is_gou) {
                 if (!is_sem) {
                     gpu_soft_span_fill16(dst, (u16)(flat_col15 | mask_or), count);
@@ -339,13 +399,18 @@ static void rasterize_triangle(GpuSoft *gs, const GpuPrim *p,
                     gpu_soft_span_flat_abr(dst, count, flat_col15, p->abr, mask_or);
                 }
                 continue;
-            } else {
+            } else if (!do_dither || !is_sem) {
                 s32 dx_a = xl - ax;
                 s32 dy_a = y - ay;
                 s32 rq = r0_base + dr_dx * dx_a + dr_dy * dy_a;
                 s32 gq = g0_base + dg_dx * dx_a + dg_dy * dy_a;
                 s32 bq = b0_base + db_dx * dx_a + db_dy * dy_a;
-                if (!is_sem) {
+                if (do_dither) {
+                    gpu_soft_span_gouraud_dither_opaque(dst, count, rq, gq, bq,
+                                                        dr_dx, dg_dx, db_dx,
+                                                        g_gpu_dither_pack[y & 3][xl & 3],
+                                                        mask_or);
+                } else if (!is_sem) {
                     gpu_soft_span_gouraud_opaque(dst, count, rq, gq, bq,
                                                  dr_dx, dg_dx, db_dx, mask_or);
                 } else {
@@ -503,6 +568,13 @@ static void rasterize_rect(GpuSoft *gs, const GpuPrim *p, const GpuDrawEnv *env)
 
         for (s32 y = cy0; y <= cy1; y++) {
             u16 *dst = vram + ((u32)y * PSX_VRAM_W) + cx0;
+            if (!is_sem && step_u > 0) {
+                /* Unflipped opaque sprite row: 4bpp = 4 texels/load, 8bpp = 2 texels/load */
+                gpu_soft_sprite_row_c(dst, count, tex_base_ptr + ((u32)v_cur << 10), clut,
+                                      u_start, depth, is_raw, flat_mod, mask_or);
+                v_cur = (u8)((s32)v_cur + step_v);
+                continue;
+            }
             u32 uv_pack = ((u32)v_cur << 24) | ((u32)u_start << 8);
             if (!is_sem) {
                 if (is_raw) {

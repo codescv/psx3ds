@@ -1,6 +1,7 @@
 #include "gpu_internal.h"
 
 u32 g_gpu_rgb555_to_888[32768];
+u32 g_gpu_dither_pack[4][4];
 static bool s_tables_initialized = false;
 
 /* Sony PSX 4x4 signed dithering matrix (indexed by [y & 3][x & 3]) */
@@ -20,6 +21,15 @@ void gpu_soft_span_init_tables(void) {
         u32 g5 = (c >> 5) & 0x1Fu;
         u32 b5 = (c >> 10) & 0x1Fu;
         g_gpu_rgb555_to_888[c] = (r5 << 3) | (g5 << 11) | (b5 << 19);
+    }
+    for (u32 y = 0u; y < 4u; y++) {
+        for (u32 x = 0u; x < 4u; x++) {
+            u32 pack = 0u;
+            for (u32 k = 0u; k < 4u; k++) {
+                pack |= ((u32)(u8)s_psx_dither[y][(x + k) & 3u]) << (8u * k);
+            }
+            g_gpu_dither_pack[y][x] = pack;
+        }
     }
     s_tables_initialized = true;
 }
@@ -150,6 +160,127 @@ void gpu_soft_span_gouraud_opaque_c(u16 *dst, u32 count,
         r_q16 += dr_q16;
         g_q16 += dg_q16;
         b_q16 += db_q16;
+    }
+}
+
+static inline u32 clamp8_asr16(s32 v) {
+    s32 s = v >> 16;
+    if (s < 0) return 0u;
+    if (s > 255) return 255u;
+    return (u32)s;
+}
+
+void gpu_soft_span_gouraud_dither_opaque_c(u16 *dst, u32 count,
+                                           s32 r_q16, s32 g_q16, s32 b_q16,
+                                           s32 dr_q16, s32 dg_q16, s32 db_q16,
+                                           u32 dither_pack, u16 mask_or) {
+    for (u32 i = 0u; i < count; i++) {
+        s32 d = (s32)(s8)(u8)(dither_pack & 0xFFu);
+        dither_pack = (dither_pack >> 8) | (dither_pack << 24);
+        u32 r5 = dither_chan8_to_5((s32)clamp8_asr16(r_q16), d);
+        u32 g5 = dither_chan8_to_5((s32)clamp8_asr16(g_q16), d);
+        u32 b5 = dither_chan8_to_5((s32)clamp8_asr16(b_q16), d);
+        dst[i] = (u16)(r5 | (g5 << 5) | (b5 << 10) | mask_or);
+        r_q16 += dr_q16;
+        g_q16 += dg_q16;
+        b_q16 += db_q16;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 3b. Unflipped Sprite Row Blitters (4bpp: 4 texels/load, 8bpp: 2 texels/load)
+ * -------------------------------------------------------------------------- */
+static inline void sprite_put(u16 *dst, u16 texel, bool raw,
+                              u32 cr, u32 cg, u32 cb, u16 mask_or) {
+    if (texel == 0x0000u) {
+        return;
+    }
+    if (raw) {
+        *dst = (u16)(texel | mask_or);
+    } else {
+        u32 r5 = sat5_mod(texel & 0x1Fu, cr);
+        u32 g5 = sat5_mod((texel >> 5) & 0x1Fu, cg);
+        u32 b5 = sat5_mod((texel >> 10) & 0x1Fu, cb);
+        *dst = (u16)(r5 | (g5 << 5) | (b5 << 10) | (texel & 0x8000u) | mask_or);
+    }
+}
+
+static inline __attribute__((always_inline))
+void sprite_row4(u16 *dst, u32 count, const u16 *tex_row, const u16 *clut,
+                 u32 u, bool raw, u32 cr, u32 cg, u32 cb, u16 mask_or) {
+    u32 i = 0u;
+    u = u & 0xFFu;
+    while (i < count && (u & 3u) != 0u) {
+        u16 w = tex_row[u >> 2];
+        sprite_put(&dst[i], clut[(w >> ((u & 3u) << 2)) & 0xFu], raw, cr, cg, cb, mask_or);
+        i++;
+        u = (u + 1u) & 0xFFu;
+    }
+    while (i + 4u <= count) {
+        u32 w = tex_row[u >> 2];
+        if (w != 0u || clut[0] != 0x0000u) {
+            sprite_put(&dst[i + 0u], clut[w & 0xFu], raw, cr, cg, cb, mask_or);
+            sprite_put(&dst[i + 1u], clut[(w >> 4) & 0xFu], raw, cr, cg, cb, mask_or);
+            sprite_put(&dst[i + 2u], clut[(w >> 8) & 0xFu], raw, cr, cg, cb, mask_or);
+            sprite_put(&dst[i + 3u], clut[(w >> 12) & 0xFu], raw, cr, cg, cb, mask_or);
+        }
+        i += 4u;
+        u = (u + 4u) & 0xFFu;
+    }
+    while (i < count) {
+        u16 w = tex_row[u >> 2];
+        sprite_put(&dst[i], clut[(w >> ((u & 3u) << 2)) & 0xFu], raw, cr, cg, cb, mask_or);
+        i++;
+        u = (u + 1u) & 0xFFu;
+    }
+}
+
+static inline __attribute__((always_inline))
+void sprite_row8(u16 *dst, u32 count, const u16 *tex_row, const u16 *clut,
+                 u32 u, bool raw, u32 cr, u32 cg, u32 cb, u16 mask_or) {
+    u32 i = 0u;
+    u = u & 0xFFu;
+    if (i < count && (u & 1u) != 0u) {
+        sprite_put(&dst[i], clut[tex_row[u >> 1] >> 8], raw, cr, cg, cb, mask_or);
+        i++;
+        u = (u + 1u) & 0xFFu;
+    }
+    while (i + 2u <= count) {
+        u32 w = tex_row[u >> 1];
+        sprite_put(&dst[i + 0u], clut[w & 0xFFu], raw, cr, cg, cb, mask_or);
+        sprite_put(&dst[i + 1u], clut[w >> 8], raw, cr, cg, cb, mask_or);
+        i += 2u;
+        u = (u + 2u) & 0xFFu;
+    }
+    if (i < count) {
+        sprite_put(&dst[i], clut[tex_row[u >> 1] & 0xFFu], raw, cr, cg, cb, mask_or);
+    }
+}
+
+static inline __attribute__((always_inline))
+void sprite_row16(u16 *dst, u32 count, const u16 *tex_row,
+                  u32 u, bool raw, u32 cr, u32 cg, u32 cb, u16 mask_or) {
+    u = u & 0xFFu;
+    for (u32 i = 0u; i < count; i++) {
+        sprite_put(&dst[i], tex_row[u], raw, cr, cg, cb, mask_or);
+        u = (u + 1u) & 0xFFu;
+    }
+}
+
+void gpu_soft_sprite_row_c(u16 *dst, u32 count, const u16 *tex_row, const u16 *clut,
+                           u32 u0, u32 depth, bool raw, u32 rgb_mod, u16 mask_or) {
+    u32 cr = rgb_mod & 0xFFu;
+    u32 cg = (rgb_mod >> 8) & 0xFFu;
+    u32 cb = (rgb_mod >> 16) & 0xFFu;
+    if (depth == 0u) {
+        if (raw) sprite_row4(dst, count, tex_row, clut, u0, true, 128u, 128u, 128u, mask_or);
+        else     sprite_row4(dst, count, tex_row, clut, u0, false, cr, cg, cb, mask_or);
+    } else if (depth == 1u) {
+        if (raw) sprite_row8(dst, count, tex_row, clut, u0, true, 128u, 128u, 128u, mask_or);
+        else     sprite_row8(dst, count, tex_row, clut, u0, false, cr, cg, cb, mask_or);
+    } else {
+        if (raw) sprite_row16(dst, count, tex_row, u0, true, 128u, 128u, 128u, mask_or);
+        else     sprite_row16(dst, count, tex_row, u0, false, cr, cg, cb, mask_or);
     }
 }
 

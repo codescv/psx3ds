@@ -268,7 +268,117 @@ static int test_c_fast_spans_vs_general(void) {
     return 0;
 }
 
+/* Dithered Gouraud C span vs general reference across all 16 dither phases + saturation edges */
+static int test_dither_gouraud_c_vs_general(void) {
+    u32 rng = 0x0BADF00Du;
+    for (u32 y = 0u; y < 4u; y++) {
+        for (u32 off = 2u; off < 6u; off++) {
+            for (u32 iter = 0u; iter < 24u; iter++) {
+                u32 count = 1u + (xorshift32(&rng) % 300u);
+                u16 mask_or = (iter & 1u) ? 0x8000u : 0x0000u;
+                s32 r0 = ((s32)(xorshift32(&rng) % 320u) - 32) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+                s32 g0 = ((s32)(xorshift32(&rng) % 320u) - 32) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+                s32 b0 = ((s32)(xorshift32(&rng) % 320u) - 32) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+                s32 dr = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 64;
+                s32 dg = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 64;
+                s32 db = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 64;
+
+                seed_pair(&rng, off, count);
+                GpuSpanParams sp;
+                memset(&sp, 0, sizeof(sp));
+                sp.dst_row  = s_buf_ref;
+                sp.vram     = s_vram;
+                sp.x_start  = (s32)off;
+                sp.y        = (s32)y;
+                sp.count    = count;
+                sp.r_q16 = r0; sp.g_q16 = g0; sp.b_q16 = b0;
+                sp.dr_q16 = dr; sp.dg_q16 = dg; sp.db_q16 = db;
+                sp.flags    = PF_GOURAUD;
+                sp.dither   = 1u;
+                sp.set_mask = mask_or ? 1u : 0u;
+                sp.tw_and_x = 0xFFu;
+                sp.tw_and_y = 0xFFu;
+                gpu_soft_span_general(&sp);
+                gpu_soft_span_gouraud_dither_opaque_c(&s_buf_dut[off], count, r0, g0, b0, dr, dg, db,
+                                                      g_gpu_dither_pack[y][off & 3u], mask_or);
+                if (verify_buffers_equal("c_vs_gen:gouraud_dither_opaque", off, count) != 0) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Unflipped sprite row blitters vs general reference across 4/8/15bpp, raw/modulated, U wrap */
+static int test_sprite_rows_vs_general(void) {
+    u32 rng = 0x5EED1234u;
+    static const u16 tx_bases[3] = { 960u, 896u, 768u }; /* last legal fast page per depth */
+    for (u32 depth = 0u; depth < 3u; depth++) {
+        for (u32 iter = 0u; iter < 200u; iter++) {
+            u32 count   = 1u + (xorshift32(&rng) % 300u); /* > 256 exercises U wrap */
+            u32 u0      = xorshift32(&rng) & 0xFFu;
+            u32 v       = xorshift32(&rng) & 0xFFu;
+            u16 ty_base = (xorshift32(&rng) & 1u) ? 256u : 0u;
+            u16 tx_base = (iter & 1u) ? tx_bases[depth] : 256u;
+            bool raw    = (iter & 2u) != 0u;
+            u32 cr = xorshift32(&rng) & 0xFFu, cg = xorshift32(&rng) & 0xFFu, cb = xorshift32(&rng) & 0xFFu;
+            u16 mask_or = (iter & 4u) ? 0x8000u : 0x0000u;
+            u32 off = 2u + (iter & 1u);
+            const u16 *clut = (depth == 0u) ? s_clut4 : s_clut8;
+
+            seed_pair(&rng, off, count);
+            GpuSpanParams sp;
+            memset(&sp, 0, sizeof(sp));
+            sp.dst_row   = s_buf_ref;
+            sp.vram      = s_vram;
+            sp.clut      = clut;
+            sp.x_start   = (s32)off;
+            sp.count     = count;
+            sp.r_q16     = (s32)(cr << 16);
+            sp.g_q16     = (s32)(cg << 16);
+            sp.b_q16     = (s32)(cb << 16);
+            sp.u_q16     = (s32)(u0 << 16);
+            sp.v_q16     = (s32)(v << 16);
+            sp.du_q16    = 1 << 16;
+            sp.tx_base   = tx_base;
+            sp.ty_base   = ty_base;
+            sp.tex_depth = (u8)depth;
+            sp.flags     = (u8)(PF_TEXTURED | (raw ? PF_RAW_TEX : 0u));
+            sp.set_mask  = mask_or ? 1u : 0u;
+            sp.tw_and_x  = 0xFFu;
+            sp.tw_and_y  = 0xFFu;
+            gpu_soft_span_general(&sp);
+
+            const u16 *tex_row = &s_vram[((u32)ty_base + v) * PSX_VRAM_W + tx_base];
+            gpu_soft_sprite_row_c(&s_buf_dut[off], count, tex_row, clut, u0, depth, raw,
+                                  cr | (cg << 8) | (cb << 16), mask_or);
+            if (verify_buffers_equal("c_vs_gen:sprite_row", off, count) != 0) return 1;
+        }
+    }
+    return 0;
+}
+
 #if PSX3DS_ARCH_ARMV6K
+static int test_armv6_dither_parity(void) {
+    u32 rng = 0xD17E4ABCu;
+    for (u32 iter = 0u; iter < 4000u; iter++) {
+        u32 count = 1u + (xorshift32(&rng) % 140u);
+        u32 off   = 2u + (iter & 1u); /* aligned and odd-unaligned destinations */
+        u16 mask_or = (xorshift32(&rng) & 1u) ? 0x8000u : 0x0000u;
+        u32 pack  = g_gpu_dither_pack[xorshift32(&rng) & 3u][xorshift32(&rng) & 3u];
+        s32 r0 = ((s32)(xorshift32(&rng) % 330u) - 37) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+        s32 g0 = ((s32)(xorshift32(&rng) % 330u) - 37) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+        s32 b0 = ((s32)(xorshift32(&rng) % 330u) - 37) * 65536 + (s32)(xorshift32(&rng) & 0xFFFFu);
+        s32 dr = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 128;
+        s32 dg = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 128;
+        s32 db = ((s32)(xorshift32(&rng) % 4096u) - 2048) * 128;
+        seed_pair(&rng, off, count);
+        gpu_soft_span_gouraud_dither_opaque_c(&s_buf_ref[off], count, r0, g0, b0, dr, dg, db, pack, mask_or);
+        gpu_soft_span_gouraud_dither_opaque_armv6(&s_buf_dut[off], count, r0, g0, b0, dr, dg, db, pack, mask_or);
+        if (verify_buffers_equal("armv6:gouraud_dither_opaque", off, count) != 0) return 1;
+    }
+    return 0;
+}
+
 static int test_armv6_vs_c_parity(void) {
     static const u32 counts[] = { 1u, 2u, 3u, 4u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 32u, 33u, 64u, 127u, 128u, 129u };
     u32 rng = 0xCAFEBABEu;
@@ -424,6 +534,28 @@ static void run_throughput_benchmark(void) {
     BENCH_PAIR("tex16_mod_flat_opaque",
                gpu_soft_span_tex16_mod_flat_opaque_c(s_bench_dst, span_len, tex_base, 0x00000000u, 0x00800100u, 0x8090A0u, 0u),
                gpu_soft_span_tex16_mod_flat_opaque_armv6(s_bench_dst, span_len, tex_base, 0x00000000u, 0x00800100u, 0x8090A0u, 0u));
+    BENCH_PAIR("gouraud_dither_opaque",
+               gpu_soft_span_gouraud_dither_opaque_c(s_bench_dst, span_len, 16<<16, 64<<16, 128<<16, 256, 512, -256, g_gpu_dither_pack[1][2], 0u),
+               gpu_soft_span_gouraud_dither_opaque_armv6(s_bench_dst, span_len, 16<<16, 64<<16, 128<<16, 256, 512, -256, g_gpu_dither_pack[1][2], 0u));
+    /* Dithered Gouraud: previous fallback (general C span) vs new ARMv6K kernel */
+    {
+        GpuSpanParams sp;
+        memset(&sp, 0, sizeof(sp));
+        sp.dst_row = s_bench_dst; sp.vram = s_vram; sp.count = span_len; sp.y = 1;
+        sp.r_q16 = 16 << 16; sp.g_q16 = 64 << 16; sp.b_q16 = 128 << 16;
+        sp.dr_q16 = 256; sp.dg_q16 = 512; sp.db_q16 = -256;
+        sp.flags = PF_GOURAUD; sp.dither = 1u; sp.tw_and_x = 0xFFu; sp.tw_and_y = 0xFFu;
+        BENCH_PAIR("dither: general->armv6",
+                   gpu_soft_span_general(&sp),
+                   gpu_soft_span_gouraud_dither_opaque_armv6(s_bench_dst, span_len, 16<<16, 64<<16, 128<<16, 256, 512, -256, g_gpu_dither_pack[1][0], 0u));
+    }
+    /* Unflipped sprites: previous UADD16 span path (ARMv6K) vs new multi-texel row blitter */
+    BENCH_PAIR("sprite4_raw: span->row",
+               gpu_soft_span_tex4_raw_opaque_armv6(s_bench_dst, span_len, tex_base, s_clut4, 0x00000000u, 0x00000100u, 0u),
+               gpu_soft_sprite_row_c(s_bench_dst, span_len, tex_base, s_clut4, 0u, 0u, true, 0x808080u, 0u));
+    BENCH_PAIR("sprite8_mod: span->row",
+               gpu_soft_span_tex8_mod_flat_opaque_armv6(s_bench_dst, span_len, tex_base, s_clut8, 0x00000000u, 0x00000100u, 0x8090A0u, 0u),
+               gpu_soft_sprite_row_c(s_bench_dst, span_len, tex_base, s_clut8, 0u, 1u, false, 0x8090A0u, 0u));
 #undef BENCH_PAIR
 #else
 #define BENCH_C(name, call_c)                                                       \
@@ -440,6 +572,9 @@ static void run_throughput_benchmark(void) {
     BENCH_C("gouraud_opaque", gpu_soft_span_gouraud_opaque_c(s_bench_dst, span_len, 16<<16, 64<<16, 128<<16, 256, 512, -256, 0u));
     BENCH_C("tex4_mod_flat_opaque", gpu_soft_span_tex4_mod_flat_opaque_c(s_bench_dst, span_len, tex_base, s_clut4, 0u, 0x00800100u, 0x8090A0u, 0u));
     BENCH_C("tex8_mod_flat_abr1", gpu_soft_span_tex8_mod_flat_abr_c(s_bench_dst, span_len, tex_base, s_clut8, 0u, 0x00800100u, 0x8090A0u, 1u, 0u));
+    BENCH_C("gouraud_dither_opaque", gpu_soft_span_gouraud_dither_opaque_c(s_bench_dst, span_len, 16<<16, 64<<16, 128<<16, 256, 512, -256, g_gpu_dither_pack[1][2], 0u));
+    BENCH_C("sprite4_raw_row", gpu_soft_sprite_row_c(s_bench_dst, span_len, tex_base, s_clut4, 0u, 0u, true, 0x808080u, 0u));
+    BENCH_C("sprite8_mod_row", gpu_soft_sprite_row_c(s_bench_dst, span_len, tex_base, s_clut8, 0u, 1u, false, 0x8090A0u, 0u));
 #undef BENCH_C
 #endif
 }
@@ -450,8 +585,11 @@ int main(void) {
 
     if (test_abr_blend_formulas() != 0) return 1;
     if (test_c_fast_spans_vs_general() != 0) return 1;
+    if (test_dither_gouraud_c_vs_general() != 0) return 1;
+    if (test_sprite_rows_vs_general() != 0) return 1;
 #if PSX3DS_ARCH_ARMV6K
     if (test_armv6_vs_c_parity() != 0) return 1;
+    if (test_armv6_dither_parity() != 0) return 1;
 #endif
 
     run_throughput_benchmark();

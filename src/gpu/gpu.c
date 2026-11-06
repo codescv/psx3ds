@@ -357,17 +357,34 @@ static void exec_gp0_polygon(PsxSystem *sys, u8 cmd) {
     prim.texpage   = (u16)(active_tp & 0x09FFu);
     prim.clut      = clut;
 
-    if (tri_within_max_span(&verts[0], &verts[1], &verts[2])) {
+    /*
+     * PSX hardware applies the max-span cull (|dx| > 1023 || |dy| > 511) independently to each
+     * constituent triangle (0,1,2) and (1,2,3) of a quad. When both halves survive, submit ONE
+     * PRIM_QUAD (v[0..3] in PSX Z-order) so backends do a single draw/texcache lookup; backends
+     * rasterize it as (0,1,2)+(1,2,3). Otherwise submit only the surviving half as PRIM_TRI.
+     */
+    bool ok0 = tri_within_max_span(&verts[0], &verts[1], &verts[2]);
+    bool ok1 = is_quad && tri_within_max_span(&verts[1], &verts[2], &verts[3]);
+    if (is_quad && ok0 && ok1) {
+        prim.kind = PRIM_QUAD;
         prim.v[0] = verts[0];
         prim.v[1] = verts[1];
         prim.v[2] = verts[2];
+        prim.v[3] = verts[3];
         submit_prim(sys, &prim);
-    }
-    if (is_quad && tri_within_max_span(&verts[1], &verts[2], &verts[3])) {
-        prim.v[0] = verts[1];
-        prim.v[1] = verts[2];
-        prim.v[2] = verts[3];
-        submit_prim(sys, &prim);
+    } else {
+        if (ok0) {
+            prim.v[0] = verts[0];
+            prim.v[1] = verts[1];
+            prim.v[2] = verts[2];
+            submit_prim(sys, &prim);
+        }
+        if (ok1) {
+            prim.v[0] = verts[1];
+            prim.v[1] = verts[2];
+            prim.v[2] = verts[3];
+            submit_prim(sys, &prim);
+        }
     }
 
     gpu_schedule_cmd_cost(sys, is_quad ? 64u : 32u);

@@ -364,6 +364,65 @@ static int test_dithering_lines_and_mask(PsxSystem *sys) {
     return 0;
 }
 
+/* Brute-force canonical half-space coverage (PSX top-left rule) for walker exactness checks */
+static bool ref_tri_covers(s32 ax, s32 ay, s32 bx, s32 by, s32 cx, s32 cy, s32 x, s32 y) {
+    s32 area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area == 0) return false;
+    if (area < 0) { s32 t; t = bx; bx = cx; cx = t; t = by; by = cy; cy = t; }
+    const s32 px[3] = { ax, bx, cx }, py[3] = { ay, by, cy };
+    for (int e = 0; e < 3; e++) {
+        s32 dx = px[(e + 1) % 3] - px[e];
+        s32 dy = py[(e + 1) % 3] - py[e];
+        s32 bias = ((dy < 0) || (dy == 0 && dx > 0)) ? 0 : -1;
+        if (dx * (y - py[e]) - dy * (x - px[e]) + bias < 0) return false;
+    }
+    return true;
+}
+
+static u32 s_tri_rng = 0xA5A5F00Du;
+static s32 tri_rand(s32 lo, s32 hi) {
+    s_tri_rng ^= s_tri_rng << 13; s_tri_rng ^= s_tri_rng >> 17; s_tri_rng ^= s_tri_rng << 5;
+    return lo + (s32)(s_tri_rng % (u32)(hi - lo + 1));
+}
+
+static int test_triangle_walker_exactness(PsxSystem *sys) {
+    gpu_reset(sys);
+    u16 *vram = sys->gpu.vram;
+    setup_clip(sys, 0u, 0u, 319u, 239u);
+    for (int iter = 0; iter < 400; iter++) {
+        s32 v[3][2];
+        bool small = (iter % 3) == 0;
+        for (int i = 0; i < 3; i++) {
+            v[i][0] = small ? tri_rand(100, 116) : tri_rand(-60, 380);
+            v[i][1] = small ? tri_rand(100, 116) : tri_rand(-60, 300);
+        }
+        if ((iter % 5) == 1) v[1][1] = v[0][1]; /* flat top or flat bottom */
+        if ((iter % 7) == 2) v[2][1] = v[1][1];
+        if ((iter % 11) == 3) v[2][0] = v[0][0]; /* vertical edge */
+
+        for (u32 y = 0; y < 240u; y++) {
+            memset(&vram[y * PSX_VRAM_W], 0, 320u * sizeof(u16));
+        }
+        gpu_gp0_write(sys, 0x200000FFu);
+        for (int i = 0; i < 3; i++) {
+            gpu_gp0_write(sys, ((u32)v[i][0] & 0xFFFFu) | (((u32)v[i][1] & 0xFFFFu) << 16));
+        }
+        for (s32 y = 0; y < 240; y++) {
+            for (s32 x = 0; x < 320; x++) {
+                bool exp = ref_tri_covers(v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], x, y);
+                bool got = vram[(u32)y * PSX_VRAM_W + (u32)x] != 0u;
+                if (exp != got) {
+                    fprintf(stderr, "FAIL walker iter=%d (%d,%d)-(%d,%d)-(%d,%d) at (%d,%d): got=%d exp=%d\n",
+                            iter, (int)v[0][0], (int)v[0][1], (int)v[1][0], (int)v[1][1],
+                            (int)v[2][0], (int)v[2][1], (int)x, (int)y, (int)got, (int)exp);
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     memset(&s_sys, 0, sizeof(s_sys));
     psx_config_defaults(&s_sys.cfg, false);
@@ -376,6 +435,7 @@ int main(void) {
     if (test_max_span_culling_and_clip_offset(&s_sys) != 0) return 1;
     if (test_textures_clut_modulation_stp_texwin_flip(&s_sys) != 0) return 1;
     if (test_dithering_lines_and_mask(&s_sys) != 0) return 1;
+    if (test_triangle_walker_exactness(&s_sys) != 0) return 1;
 
     gpu_shutdown(&s_sys);
     arena_destroy(&s_sys.arena);

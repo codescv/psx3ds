@@ -383,20 +383,43 @@ static int test_dual_backend_contract(PsxSystem *sys) {
     gpu_gp0_write(sys, 0xE5000000u | (100u & 0x7FFu) | (((u32)(-50) & 0x7FFu) << 11));
     CHECK_EQ_U32(mock.env_calls, 2u, "E1 and E5 notify be->set_draw_env");
 
-    /* Emit untextured semi-transparent quad GP0(2Ah): should split into TWO PRIM_TRI with offset pre-applied! */
+    /* Emit untextured semi-transparent quad GP0(2Ah): ONE PRIM_QUAD with offset pre-applied! */
     gpu_gp0_write(sys, 0x2A112233u);
     gpu_gp0_write(sys, (10u) | (60u << 16));
     gpu_gp0_write(sys, (20u) | (60u << 16));
     gpu_gp0_write(sys, (10u) | (70u << 16));
     gpu_gp0_write(sys, (20u) | (70u << 16));
 
-    CHECK_EQ_U32(mock.draw_calls, 2u, "Quad splits into 2 PRIM_TRI calls");
-    CHECK_TRUE(mock.last_prims[0].kind == PRIM_TRI && mock.last_prims[1].kind == PRIM_TRI,
-               "Both split primitives have kind == PRIM_TRI");
+    CHECK_EQ_U32(mock.draw_calls, 1u, "Quad submitted as a single PRIM_QUAD draw call");
+    CHECK_TRUE(mock.last_prims[0].kind == PRIM_QUAD, "Quad primitive kind == PRIM_QUAD");
     CHECK_TRUE(mock.last_prims[0].v[0].x == 110 && mock.last_prims[0].v[0].y == 10,
-               "Backend receives pre-offset vertex coordinates");
+               "Backend receives pre-offset vertex coordinates (v0)");
+    CHECK_TRUE(mock.last_prims[0].v[3].x == 120 && mock.last_prims[0].v[3].y == 20,
+               "Backend receives pre-offset vertex coordinates (v3, PSX Z-order)");
     CHECK_TRUE(mock.last_prims[0].abr == 1u && (mock.last_prims[0].flags & PF_SEMI) != 0u,
                "Untextured semi-transparent prim carries E1 abr");
+
+    /* Quad whose (1,2,3) half exceeds |dx| > 1023 -> only the (0,1,2) half survives as PRIM_TRI */
+    gpu_gp0_write(sys, 0xE5000000u); /* offset (0, 0) */
+    mock.draw_calls = 0u;
+    gpu_gp0_write(sys, 0x28FFFFFFu);
+    gpu_gp0_write(sys, (0u)   | (0u << 16));
+    gpu_gp0_write(sys, (10u)  | (0u << 16));
+    gpu_gp0_write(sys, (0u)   | (10u << 16));
+    gpu_gp0_write(sys, ((u32)(-1020) & 0xFFFFu) | (10u << 16)); /* v3.x = -1020 -> dx(v1,v3)=1030 */
+    CHECK_EQ_U32(mock.draw_calls, 1u, "Half-culled quad emits exactly one primitive");
+    CHECK_TRUE(mock.last_prims[0].kind == PRIM_TRI &&
+               mock.last_prims[0].v[0].x == 0 && mock.last_prims[0].v[1].x == 10,
+               "Surviving (0,1,2) half submitted as PRIM_TRI");
+
+    /* Quad where both halves are culled -> zero primitives */
+    mock.draw_calls = 0u;
+    gpu_gp0_write(sys, 0x28FFFFFFu);
+    gpu_gp0_write(sys, ((u32)(-1000) & 0xFFFFu) | (0u << 16));
+    gpu_gp0_write(sys, (1000u) | (0u << 16));
+    gpu_gp0_write(sys, ((u32)(-1000) & 0xFFFFu) | (10u << 16));
+    gpu_gp0_write(sys, (5u)    | (10u << 16));
+    CHECK_EQ_U32(mock.draw_calls, 0u, "Fully culled quad emits zero primitives");
 
     /* C0h VRAM->CPU read MUST call sync_to_shadow BEFORE reading shadow VRAM */
     gpu_gp0_write(sys, 0xC0000000u);

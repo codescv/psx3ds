@@ -399,6 +399,90 @@ gpu_soft_span_gouraud_abr_armv6:
     .size gpu_soft_span_gouraud_abr_armv6, . - gpu_soft_span_gouraud_abr_armv6
 
 /* ==========================================================================
+ * 4b. void gpu_soft_span_gouraud_dither_opaque_armv6(u16 *dst, u32 count,
+ *        s32 r_q16, s32 g_q16, s32 b_q16, s32 dr_q16, s32 dg_q16, s32 db_q16,
+ *        u32 dither_pack, u16 mask_or)
+ *    r0=dst, r1=count, r2=r, r3=g, [sp+0]=b, [sp+4]=dr, [sp+8]=dg, [sp+12]=db,
+ *    [sp+16]=dither_pack, [sp+20]=mask_or
+ *
+ *    Per pixel (bit-identical to gpu_soft_span_general):
+ *      d  = SXTB(pack); pack = ROR(pack, 8)
+ *      c8 = USAT8(c_q16 ASR 16); c5 = USAT5((c8 + d) ASR 3)
+ *    Dual-pixel PKHBT + 32-bit STR on word-aligned destinations.
+ * ========================================================================== */
+/* GDITH_PIX out, t: compute one dithered 15-bit pixel into \out (clobbers \t),
+ * consuming r10 = d and stepping r2..r4 by r5..r7 */
+.macro GDITH_PIX out, t
+    usat    \out, #8, r2, asr #16
+    usat    \t,   #8, r3, asr #16
+    add     \out, \out, r10
+    add     \t,   \t,   r10
+    usat    \out, #5, \out, asr #3
+    usat    \t,   #5, \t,   asr #3
+    orr     \out, \out, \t, lsl #5
+    usat    \t,   #8, r4, asr #16
+    add     r2, r2, r5
+    add     \t,   \t,   r10
+    add     r3, r3, r6
+    usat    \t,   #5, \t,   asr #3
+    add     r4, r4, r7
+    orr     \out, \out, \t, lsl #10
+.endm
+
+    .align 2
+    .global gpu_soft_span_gouraud_dither_opaque_armv6
+    .type gpu_soft_span_gouraud_dither_opaque_armv6, %function
+gpu_soft_span_gouraud_dither_opaque_armv6:
+    cmp     r1, #0
+    bxeq    lr
+    push    {r4, r5, r6, r7, r8, r9, r10, r11, lr}
+    ldr     r4, [sp, #36]                   /* b_q16 */
+    ldr     r5, [sp, #40]                   /* dr_q16 */
+    ldr     r6, [sp, #44]                   /* dg_q16 */
+    ldr     r7, [sp, #48]                   /* db_q16 */
+    ldr     r8, [sp, #52]                   /* dither_pack */
+    ldrh    r9, [sp, #56]                   /* mask_or */
+    orr     r9, r9, r9, lsl #16             /* mask_or in both halfwords */
+
+    tst     r0, #2
+    beq     .Lgdith_aligned
+    sxtb    r10, r8
+    mov     r8, r8, ror #8
+    GDITH_PIX r11, r12
+    orr     r11, r11, r9
+    strh    r11, [r0], #2
+    subs    r1, r1, #1
+    beq     .Lgdith_done
+
+.Lgdith_aligned:
+    subs    r1, r1, #2
+    blo     .Lgdith_tail
+.Lgdith_pair_loop:
+    sxtb    r10, r8
+    mov     r8, r8, ror #8
+    GDITH_PIX r11, r12
+    sxtb    r10, r8
+    mov     r8, r8, ror #8
+    GDITH_PIX r12, lr
+    pkhbt   r11, r11, r12, lsl #16
+    orr     r11, r11, r9
+    str     r11, [r0], #4
+    subs    r1, r1, #2
+    bhs     .Lgdith_pair_loop
+
+.Lgdith_tail:
+    adds    r1, r1, #2
+    beq     .Lgdith_done
+    sxtb    r10, r8
+    GDITH_PIX r11, r12
+    orr     r11, r11, r9
+    strh    r11, [r0]
+
+.Lgdith_done:
+    pop     {r4, r5, r6, r7, r8, r9, r10, r11, pc}
+    .size gpu_soft_span_gouraud_dither_opaque_armv6, . - gpu_soft_span_gouraud_dither_opaque_armv6
+
+/* ==========================================================================
  * 5. Textured Raw Opaque Spans (UADD16 8.8 UV stepping)
  * ========================================================================== */
     .align 2

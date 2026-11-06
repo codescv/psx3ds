@@ -12,6 +12,14 @@
  * -------------------------------------------------------------------------- */
 extern u32 g_gpu_rgb555_to_888[32768];
 
+/* --------------------------------------------------------------------------
+ * Pre-rotated Sony 4x4 dither rows packed as 4 signed bytes:
+ *   g_gpu_dither_pack[y & 3][x & 3] byte k = dither[y & 3][(x + k) & 3]
+ * Span kernels consume byte 0 (sign-extended) per pixel then rotate right by 8.
+ * Initialized idempotently by gpu_soft_span_init_tables().
+ * -------------------------------------------------------------------------- */
+extern u32 g_gpu_dither_pack[4][4];
+
 void gpu_soft_span_init_tables(void);
 
 /* --------------------------------------------------------------------------
@@ -69,6 +77,24 @@ void gpu_soft_span_gouraud_abr_c(u16 *dst, u32 count,
                                  s32 dr_q16, s32 dg_q16, s32 db_q16,
                                  u32 abr, u16 mask_or);
 
+/* Dithered Gouraud opaque span: per pixel c8 = clamp(c_q16 >> 16, 0, 255),
+ * c5 = clamp((c8 + d) >> 3, 0, 31) with d = (s8)(dither_pack & 0xFF), then
+ * dither_pack = ror(dither_pack, 8). Bit-identical to gpu_soft_span_general. */
+void gpu_soft_span_gouraud_dither_opaque_c(u16 *dst, u32 count,
+                                           s32 r_q16, s32 g_q16, s32 b_q16,
+                                           s32 dr_q16, s32 dg_q16, s32 db_q16,
+                                           u32 dither_pack, u16 mask_or);
+
+/*
+ * Unflipped (step_u == +1) sprite row blitters for PRIM_RECT (no mask check, no TexWindow).
+ * `tex_row` points to `&vram[(ty_base + v) * 1024 + tx_base]`; `u0` is the starting U
+ * (wraps mod 256 inside the texpage). 4bpp unpacks 4 texels per 16-bit load and 8bpp 2.
+ * `rgb_mod` (0x00BBGGRR) applies (tex * c) >> 7 clamped to 31 unless `raw` is set.
+ * Opaque only (no ABR); texel 0x0000 is skipped, texel STP bit is preserved.
+ */
+void gpu_soft_sprite_row_c(u16 *dst, u32 count, const u16 *tex_row, const u16 *clut,
+                           u32 u0, u32 depth, bool raw, u32 rgb_mod, u16 mask_or);
+
 /*
  * Affine non-windowed textured spans using 8.8 dual-packed UV (`uv = (v_q8 << 16) | u_q8`,
  * stepped via `UADD16` on ARMv6K so U and V wrap independently mod 256 in one instruction).
@@ -125,6 +151,11 @@ void gpu_soft_span_gouraud_abr_armv6(u16 *dst, u32 count,
                                      s32 dr_q16, s32 dg_q16, s32 db_q16,
                                      u32 abr, u16 mask_or);
 
+void gpu_soft_span_gouraud_dither_opaque_armv6(u16 *dst, u32 count,
+                                               s32 r_q16, s32 g_q16, s32 b_q16,
+                                               s32 dr_q16, s32 dg_q16, s32 db_q16,
+                                               u32 dither_pack, u16 mask_or);
+
 void gpu_soft_span_tex4_raw_opaque_armv6(u16 *dst, u32 count, const u16 *tex_base,
                                          const u16 *clut, u32 uv_pack, u32 duv_pack, u16 mask_or);
 void gpu_soft_span_tex8_raw_opaque_armv6(u16 *dst, u32 count, const u16 *tex_base,
@@ -161,6 +192,7 @@ void gpu_soft_span_tex16_mod_flat_abr_armv6(u16 *dst, u32 count, const u16 *tex_
 #  define gpu_soft_span_flat_abr               gpu_soft_span_flat_abr_armv6
 #  define gpu_soft_span_gouraud_opaque         gpu_soft_span_gouraud_opaque_armv6
 #  define gpu_soft_span_gouraud_abr            gpu_soft_span_gouraud_abr_armv6
+#  define gpu_soft_span_gouraud_dither_opaque  gpu_soft_span_gouraud_dither_opaque_armv6
 #  define gpu_soft_span_tex4_raw_opaque        gpu_soft_span_tex4_raw_opaque_armv6
 #  define gpu_soft_span_tex8_raw_opaque        gpu_soft_span_tex8_raw_opaque_armv6
 #  define gpu_soft_span_tex16_raw_opaque       gpu_soft_span_tex16_raw_opaque_armv6
@@ -175,6 +207,7 @@ void gpu_soft_span_tex16_mod_flat_abr_armv6(u16 *dst, u32 count, const u16 *tex_
 #  define gpu_soft_span_flat_abr               gpu_soft_span_flat_abr_c
 #  define gpu_soft_span_gouraud_opaque         gpu_soft_span_gouraud_opaque_c
 #  define gpu_soft_span_gouraud_abr            gpu_soft_span_gouraud_abr_c
+#  define gpu_soft_span_gouraud_dither_opaque  gpu_soft_span_gouraud_dither_opaque_c
 #  define gpu_soft_span_tex4_raw_opaque        gpu_soft_span_tex4_raw_opaque_c
 #  define gpu_soft_span_tex8_raw_opaque        gpu_soft_span_tex8_raw_opaque_c
 #  define gpu_soft_span_tex16_raw_opaque       gpu_soft_span_tex16_raw_opaque_c
