@@ -2,7 +2,7 @@
 # =============================================================================
 # psx3ds Toolchain & Verification Environment Setup
 # Usage:
-#   source /usr/local/google/home/chii/Developer/psx3ds/tools/env.sh
+#   source tools/env.sh
 # =============================================================================
 
 # Resolve repository root regardless of current working directory
@@ -16,7 +16,7 @@ else
 fi
 
 export PSX3DS_ROOT="$(cd "$(dirname "$_PSX3DS_ENV_FILE")/.." && pwd)"
-export PSX3DS_SDK_ROOT="${PSX3DS_SDK_ROOT:-/usr/local/google/home/chii/.local/psx3ds-sdk}"
+export PSX3DS_SDK_ROOT="${PSX3DS_SDK_ROOT:-$HOME/.local/psx3ds-sdk}"
 
 # 1. Official Nintendo 3DS Homebrew SDK (devkitPro / devkitARM / libctru / citro3d)
 export DEVKITPRO="$PSX3DS_SDK_ROOT/devkitpro"

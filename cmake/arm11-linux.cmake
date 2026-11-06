@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR arm)
 
-set(_psx3ds_sdk_default "/usr/local/google/home/chii/.local/psx3ds-sdk")
+set(_psx3ds_sdk_default "$ENV{HOME}/.local/psx3ds-sdk")
 if(DEFINED ENV{PSX3DS_SDK_ROOT})
     set(_psx3ds_sdk_default "$ENV{PSX3DS_SDK_ROOT}")
 endif()

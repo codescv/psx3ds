@@ -1,0 +1,129 @@
+name: Build & Test (Host ASan + Nintendo 3DS .3dsx/.cia)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Host x86_64 (ASan + UBSan + ROM Gates)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build gcc g++ python3
+
+      - name: Configure & build x86_64 CLI + unit tests (ASan + UBSan, -Werror)
+        run: |
+          cmake -S . -B build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPSX3DS_ENABLE_ASAN=ON \
+            -DCMAKE_C_FLAGS="-Werror"
+          cmake --build build-host -j"$(nproc)"
+
+      - name: Verify CLI version & run CTest suite
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-host/psx3ds-cli --version
+          ctest --test-dir build-host --output-on-failure -j"$(nproc)"
+
+      - name: Run OpenBIOS + PS-X compliance smoke gate
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-host/psx3ds-cli \
+            --bios tests/roms/bios/openbios.bin \
+            --exe tests/roms/benchmarks/Cube.exe \
+            --cpu cached \
+            --frames 60 \
+            --dump-ppm /tmp/cube_ci.ppm
+          test -s /tmp/cube_ci.ppm
+
+  nintendo-3ds:
+    name: Nintendo 3DS (.3dsx + .cia + .cci)
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
+    steps:
+      - name: Configure safe git directory in container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host tools, 3DS portlibs, makerom & bannertool
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl unzip tar xz-utils cmake ninja-build python3 zip
+          (dkp-pacman -Syu --noconfirm --needed \
+            3ds-dev 3ds-pkg-config 3ds-cmake \
+            3ds-zlib 3ds-xz 3ds-zstd 3ds-flac || \
+           pacman -Syu --noconfirm --needed \
+            3ds-dev 3ds-pkg-config 3ds-cmake \
+            3ds-zlib 3ds-xz 3ds-zstd 3ds-flac)
+
+          tmpd="$(mktemp -d)"
+          curl -fsSL -o "$tmpd/makerom.zip" \
+            "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.19.0/makerom-v0.19.0-ubuntu_x86_64.zip"
+          unzip -q "$tmpd/makerom.zip" -d "$tmpd/mk"
+          install -m 0755 "$(find "$tmpd/mk" -name makerom -type f | head -n1)" /opt/devkitpro/tools/bin/makerom
+
+          curl -fsSL -o "$tmpd/bannertool.tar.gz" \
+            "https://github.com/carstene1ns/3ds-bannertool/releases/download/1.2.3/bannertool-1.2.3-linux.tar.gz"
+          tar -xzf "$tmpd/bannertool.tar.gz" -C "$tmpd"
+          install -m 0755 "$(find "$tmpd" -name bannertool -type f | head -n1)" /opt/devkitpro/tools/bin/bannertool
+          rm -rf "$tmpd"
+
+      - name: Build Nintendo 3DS Release (.3dsx, .cia, .cci, .smdh)
+        env:
+          DEVKITPRO: /opt/devkitpro
+          DEVKITARM: /opt/devkitpro/devkitARM
+        run: |
+          export PATH="/opt/devkitpro/tools/bin:/opt/devkitpro/devkitARM/bin:$PATH"
+          cmake -S . -B build-3ds -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/3DS.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-3ds -j"$(nproc)"
+          ls -lh build-3ds/psx3ds.3dsx build-3ds/psx3ds.cia build-3ds/psx3ds.cci build-3ds/psx3ds.smdh
+
+      - name: Stage release artifacts & SHA-256 checksums
+        run: |
+          mkdir -p dist/sdmc/3ds/psx3ds dist/sdmc/cia dist/sdmc/psx3ds/bios
+          cp build-3ds/psx3ds.3dsx build-3ds/psx3ds.smdh dist/sdmc/3ds/psx3ds/
+          cp build-3ds/psx3ds.cia dist/sdmc/cia/
+          cp tests/roms/bios/openbios.bin tests/roms/bios/LICENSE.openbios dist/sdmc/psx3ds/bios/
+          cp README.md LICENSE dist/sdmc/
+
+          cp build-3ds/psx3ds.cia build-3ds/psx3ds.3dsx build-3ds/psx3ds.cci build-3ds/psx3ds.smdh dist/
+          (cd dist/sdmc && zip -qr ../psx3ds-3ds-sdpack.zip .)
+          rm -rf dist/sdmc
+          (cd dist && sha256sum psx3ds.cia psx3ds.3dsx psx3ds.cci psx3ds.smdh psx3ds-3ds-sdpack.zip > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload Nintendo 3DS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: psx3ds-3ds-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            dist/psx3ds.cia
+            dist/psx3ds.3dsx
+            dist/psx3ds.cci
+            dist/psx3ds.smdh
+            dist/psx3ds-3ds-sdpack.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 # PSX3DS Cross-Compilation Toolchain & Verification Harness Guide
 
-This document specifies the exact compiler toolchains, Nintendo 3DS SDK libraries, ARM11v6K QEMU execution harness, headless Azahar `.3dsx` runner, and open-source PS1 test ROM suite configured on this host (`x86_64` Debian GNU/Linux rodete, 24 cores).
+This document specifies the exact compiler toolchains, Nintendo 3DS SDK libraries, ARM11v6K QEMU execution harness, headless Azahar `.3dsx`/`.cci` runner, and open-source PS1 test ROM suite configured on an `x86_64` Debian/Ubuntu GNU/Linux host.
 
 ---
 
@@ -9,15 +9,15 @@ This document specifies the exact compiler toolchains, Nintendo 3DS SDK librarie
 Source [`tools/env.sh`](../tools/env.sh) at the start of every build or test session:
 
 ```bash
-source /usr/local/google/home/chii/Developer/psx3ds/tools/env.sh
+source tools/env.sh
 ```
 
 Exported environment variables:
 
 | Variable | Value / Purpose |
 |----------|-----------------|
-| `PSX3DS_ROOT` | `/usr/local/google/home/chii/Developer/psx3ds` |
-| `PSX3DS_SDK_ROOT` | `/usr/local/google/home/chii/.local/psx3ds-sdk` |
+| `PSX3DS_ROOT` | Repository root directory (auto-resolved from `tools/env.sh`) |
+| `PSX3DS_SDK_ROOT` | `${PSX3DS_SDK_ROOT:-$HOME/.local/psx3ds-sdk}` |
 | `DEVKITPRO` | `$PSX3DS_SDK_ROOT/devkitpro` |
 | `DEVKITARM` | `$DEVKITPRO/devkitARM` |
 | `CTR_CMAKE_TOOLCHAIN_FILE` | `$DEVKITPRO/cmake/3DS.cmake` |
@@ -34,7 +34,7 @@ Exported environment variables:
 
 ## 2. Installed Tool Versions & Locations
 
-All user-space SDK binaries are cleanly self-contained under `/usr/local/google/home/chii/.local/psx3ds-sdk`:
+All user-space SDK binaries are cleanly self-contained under `${PSX3DS_SDK_ROOT:-$HOME/.local/psx3ds-sdk}`:
 
 | Component | Binary / Library | Version | Purpose |
 |-----------|------------------|---------|---------|
@@ -43,7 +43,7 @@ All user-space SDK binaries are cleanly self-contained under `/usr/local/google/
 | 3DS Cross-Compiler | `arm-none-eabi-gcc` / `g++` | `devkitARM` GCC `16.1.0` | Official Nintendo 3DS bare-metal / Horizon OS compiler + patched `newlib` |
 | 3DS OS & GPU SDK | `libctru`, `citro3d`, `citro2d` | `libctru 2.7+`, `citro3d 1.7+` | Horizon OS services, `ndsp` audio, `citro3d` PICA200 GPU driver |
 | PICA200 Shader Assembler | `picasso` | `2.7.2` | Compiles `.pica` vertex/geometry shaders to `.shbin` |
-| 3DS Packaging Tools | `3dsxtool`, `smdhtool`, `3dsxdump`, `mkromfs3ds`, `tex3ds`, `bin2s`, `3dslink` | `3dstools` / `tex3ds 2.3.0` | `.elf` -> `.3dsx` conversion, SMDH icons/metadata, RomFS, textures, binary embedding |
+| 3DS Packaging Tools | `3dsxtool`, `smdhtool`, `makerom`, `bannertool`, `3dsxdump`, `mkromfs3ds`, `tex3ds`, `bin2s`, `3dslink` | `3dstools` / `makerom 0.19.0` / `bannertool 1.2.3` | `.elf` -> `.3dsx`/`.cia`/`.cci` conversion, Home Menu banner/audio, SMDH icons/metadata, RomFS, textures, binary embedding |
 | ARM11 Linux Cross-Compiler | `arm-linux-gnueabihf-gcc` / `g++` | Bootlin `2026.08-1` GCC `15.3.0` (`armv6-eabihf` glibc) | Compiles ARM11v6K + VFPv2 Linux test binaries & `arm_jit` unit harnesses |
 | ARM11 User-Mode Emulator | `qemu-arm` (`qemu-arm-static`) | QEMU `11.1.2` | Executes ARM11 MPCore (`-cpu arm11mpcore`) JIT & ARMv6 SIMD code on `x86_64` |
 | 3DS System Emulator | `azahar`, `azahar-headless` | Azahar `2126.2` (`xvfb-run` + Mesa `llvmpipe` OpenGL 4.6) | Headless end-to-end `.3dsx` + PICA200 shader + `sdmc:/` integration tests |

@@ -1,0 +1,174 @@
+# =============================================================================
+# PSX3DS v0.2.0 — Nintendo 3DS Universal CIA / CCI ROM Spec File (RSF)
+# Compatible with BOTH Old 3DS (64 MB / 268 MHz) and New 3DS (124 MB / 804 MHz)
+# Unlocks hardware W^X dual-mapped RW+RX JIT (`SVC 0x70`), Core 1 SPU, Core 2
+# CD-ROM/CHD async prefetch, and New 3DS C-Stick + ZL/ZR (`ir:rst` / `qtm:s`).
+# =============================================================================
+
+BasicInfo:
+  Title                   : "PSX3DS"
+  CompanyCode             : "00"
+  ProductCode             : "CTR-P-PSX3"
+  ContentType             : Application
+  Logo                    : Nintendo
+
+TitleInfo:
+  Category                : Application
+  UniqueId                : 0xf853d
+  # TitleID low-byte variation = 0x00 -> Program ID 000400000F853D00
+  # (CIA TMD semantic version v0.2.0 is encoded via makerom -major 0 -minor 2 -micro 0)
+  Version                 : 0
+
+Option:
+  UseOnSD                 : true
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  EnableCrypt             : $(APP_ENCRYPTED)
+  EnableCompress          : true
+
+AccessControlInfo:
+  CoreVersion             : 2
+  DescVersion             : 2
+  ReleaseKernelMajor      : "02"
+  ReleaseKernelMinor      : "33"
+
+  # Direct SD card R/W for BIOS, PS1 BIN/CUE/ISO/CHD/PBP/EXE ROMs, savestates & memcards
+  UseExtSaveData          : false
+  FileSystemAccess:
+   - DirectSdmc
+   - DirectSdmcWrite
+   - Debug
+
+  MemoryType              : Application
+  # Universal O3DS + N3DS memory configuration:
+  #  - Old 3DS uses SystemMode: 64MB (paired with auto `small_mem` 26 MB arena)
+  #  - New 3DS unlocks SystemModeExt: 124MB + 804 MHz ARM11 + 2 MB L2 + Core 2
+  SystemMode              : 64MB
+  SystemModeExt           : 124MB
+  CpuSpeed                : 804MHz
+  EnableL2Cache           : true
+  CanAccessCore2          : true
+
+  IdealProcessor          : 0
+  AffinityMask            : 1
+  # Application main-thread priority offset (+32 -> kernel prio 0x30 = 48)
+  Priority                : 16
+  MaxCpu                  : 0x9E
+  HandleTableSize         : 0x200
+  ResourceLimitCategory   : Application
+
+  # Map 3DS DSP Code/Data RAM (required by libctru ndsp audio!) & RO VRAM
+  MemoryMapping:
+   - 1ff00000-1ff7ffff
+   - 1f000000-1f5fffff:r
+
+  # Full libctru + ARM11 W^X Dual-Mapped JIT (`SVC 0x70`) + Data/I-Cache SVCs
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    OpenProcess: 51
+    OpenThread: 52
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetThreadId: 55
+    GetResourceLimit: 56
+    GetResourceLimitLimitValues: 57
+    GetResourceLimitCurrentValues: 58
+    GetThreadContext: 59
+    Break: 60
+    OutputDebugString: 61
+    ControlPerformanceCounter: 62
+    InvalidateInstructionCacheRange: 75
+    InvalidateEntireInstructionCache: 76
+    InvalidateProcessDataCache: 82
+    StoreProcessDataCache: 83
+    FlushProcessDataCache: 84
+    ControlProcessMemory: 112
+    MapProcessMemory: 113
+    UnmapProcessMemory: 114
+    Backdoor: 123
+    QueryProcessMemory: 125
+
+  # Horizon OS service handles (exact case-sensitive names verified against libctru)
+  ServiceAccessControl:
+   - APT:U
+   - APT:A
+   - apt:U
+   - ac:u
+   - am:net
+   - cfg:u
+   - cfg:s
+   - csnd:SND
+   - dsp::DSP
+   - hb:ndsp
+   - err:f
+   - fs:USER
+   - gsp::Gpu
+   - gsp::Lcd
+   - hid:USER
+   - hid:SPVR
+   - ir:USER
+   - ir:u
+   - ir:rst
+   - mcu::HWC
+   - ndm:u
+   - ptm:u
+   - ptm:sysm
+   - qtm:s
+   - qtm:u
+   - soc:U
+   - ssl:C
+   - http:C
+
+SystemControlInfo:
+  SaveDataSize            : 0KB
+  RemasterVersion         : 0
+  StackSize               : 0x40000
+  JumpId                  : 0x000400000f853d00L

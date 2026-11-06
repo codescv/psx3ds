@@ -329,6 +329,8 @@ int main(int argc, char **argv) {
 
     CtrHwInfo hw;
     ctr_threads_init_hardware(&hw);
+    plat_log("[main_3ds] psx3ds v%s starting (n3ds=%d, cpu=%u MHz)\n",
+             PSX3DS_VERSION_STR, (int)hw.is_n3ds, (unsigned)hw.cpu_mhz);
 
     gfxInitDefault();
     C3D_Init(0x40000u);

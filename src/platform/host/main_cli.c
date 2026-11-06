@@ -9,7 +9,9 @@
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
+            "psx3ds v" PSX3DS_VERSION_STR " — PlayStation 1 Emulator\n"
             "Usage: %s [options]\n"
+            "  --version, -V             Print psx3ds version and exit\n"
             "  --bios <path>             Path to 512KB PS1 BIOS or openbios.bin (default: auto)\n"
             "  --hle                     Use built-in BIOS-less HLE bootstrap & kernel\n"
             "  --exe <path>              Load and execute PS-X EXE binary\n"
@@ -353,6 +355,9 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
             print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(a, "--version") == 0 || strcmp(a, "-V") == 0) {
+            printf("psx3ds v%s\n", PSX3DS_VERSION_STR);
             return 0;
         } else if (strcmp(a, "--bios") == 0 && i + 1 < argc) {
             bios_arg = argv[++i];
