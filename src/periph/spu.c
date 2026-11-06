@@ -128,6 +128,55 @@ PSX_INLINE s32 spu_asr15(s64 x) {
     return (s32)(x >> 15);
 }
 
+/* --------------------------------------------------------------------------
+ * Core 0 / Core 1 serialization (ARMv6K LDREX/STREX via __atomic, no ARMv7 dmb)
+ * -------------------------------------------------------------------------- */
+static inline void spu_lock(PsxSpu *spu) {
+    u32 spins = 0u;
+    while (__atomic_exchange_n(&spu->render_lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        if (++spins >= 64u) {
+            plat_yield(); /* holder may be a time-sliced SysCore thread */
+            spins = 0u;
+        }
+    }
+}
+
+static inline bool spu_trylock(PsxSpu *spu) {
+    return __atomic_exchange_n(&spu->render_lock, 1u, __ATOMIC_ACQUIRE) == 0u;
+}
+
+static inline void spu_unlock(PsxSpu *spu) {
+    __atomic_store_n(&spu->render_lock, 0u, __ATOMIC_RELEASE);
+}
+
+/* IRQ9 assertion: Core 1 (and Core-0 batch renders) latch it; Core 0 delivers it */
+static void spu_raise_irq9(PsxSystem *sys) {
+    PsxSpu *spu = &sys->spu;
+    if (spu->defer_irq != 0u) {
+        __atomic_store_n(&spu->irq_pending, 1u, __ATOMIC_RELEASE);
+    } else {
+        irq_raise(sys, IRQ_SPU);
+    }
+}
+
+/* Core 0 only */
+static void spu_deliver_pending_irq(PsxSystem *sys) {
+    PsxSpu *spu = &sys->spu;
+    if (__atomic_load_n(&spu->irq_pending, __ATOMIC_ACQUIRE) != 0u &&
+        __atomic_exchange_n(&spu->irq_pending, 0u, __ATOMIC_ACQ_REL) != 0u) {
+        irq_raise(sys, IRQ_SPU);
+    }
+}
+
+u32 spu_cmd_backlog(const PsxSystem *sys) {
+    if (!sys) {
+        return 0u;
+    }
+    u32 h = __atomic_load_n(&sys->spu.cmd_head, __ATOMIC_ACQUIRE);
+    u32 t = __atomic_load_n(&sys->spu.cmd_tail, __ATOMIC_ACQUIRE);
+    return h - t;
+}
+
 static void spu_update_stat(PsxSpu *spu) {
     u32 mode = (spu->spucnt >> 4) & 3u;
     u32 st   = spu->spucnt & 0x003Fu;
@@ -155,7 +204,7 @@ void spu_check_irq_addr(PsxSystem *sys, u32 byte_addr) {
         if ((spu->spustat & (1u << 6)) == 0u) {
             spu->spustat |= (1u << 6);
             spu->regs[(PSX_REG_SPUSTAT - PSX_REG_SPU_BASE) >> 1] = (u16)spu->spustat;
-            irq_raise(sys, IRQ_SPU);
+            spu_raise_irq9(sys);
         }
     }
 }
@@ -177,7 +226,7 @@ void spu_check_irq_range(PsxSystem *sys, u32 byte_addr, u32 len) {
     if (hit && (spu->spustat & (1u << 6)) == 0u) {
         spu->spustat |= (1u << 6);
         spu->regs[(PSX_REG_SPUSTAT - PSX_REG_SPU_BASE) >> 1] = (u16)spu->spustat;
-        irq_raise(sys, IRQ_SPU);
+        spu_raise_irq9(sys);
     }
 }
 
@@ -581,11 +630,13 @@ static bool spu_cmd_push(PsxSystem *sys, u16 reg, u16 val) {
     return true;
 }
 
+/* Core 0: apply every queued register write (drops queued ADVANCE time) */
 static void spu_drain_all_cmds(PsxSystem *sys) {
     PsxSpu *spu = &sys->spu;
     if (!spu->cmd_ring) {
         return;
     }
+    spu_lock(spu);
     u32 slot = 0u;
     while (spsc_begin_pop(&spu->cmd_head, &spu->cmd_tail, PSX_SPU_CMD_CAP, &slot)) {
         SpuCmd cmd = spu->cmd_ring[slot];
@@ -594,6 +645,14 @@ static void spu_drain_all_cmds(PsxSystem *sys) {
             spu_apply_reg16(sys, cmd.reg, cmd.val);
         }
     }
+    spu_unlock(spu);
+}
+
+/* Core 0: apply one register write immediately, serialized against Core 1 */
+static void spu_apply_reg16_locked(PsxSystem *sys, u32 off, u16 val) {
+    spu_lock(&sys->spu);
+    spu_apply_reg16(sys, off, val);
+    spu_unlock(&sys->spu);
 }
 
 static void spu_write_reg16_mmio(PsxSystem *sys, u32 off, u16 val) {
@@ -612,7 +671,7 @@ static void spu_write_reg16_mmio(PsxSystem *sys, u32 off, u16 val) {
             /* Switching into sample-exact IRQ9 mode: drain queued commands first */
             spu_drain_all_cmds(sys);
         }
-        spu_apply_reg16(sys, off, val);
+        spu_apply_reg16_locked(sys, off, val);
         return;
     }
 
@@ -625,7 +684,7 @@ static void spu_write_reg16_mmio(PsxSystem *sys, u32 off, u16 val) {
         /* Ring full (e.g. single-threaded test without Core 1 consumer): render & apply */
         spu_render_batch(sys, PSX_SPU_BATCH_FRAMES);
         if (!spu_cmd_push(sys, (u16)off, val)) {
-            spu_apply_reg16(sys, off, val);
+            spu_apply_reg16_locked(sys, off, val);
         }
     }
 }
@@ -701,6 +760,7 @@ void spu_dma_write_words(PsxSystem *sys, const u32 *src, u32 n) {
     if (!spu->ram || !src || n == 0u) {
         return;
     }
+    spu_lock(spu);
     for (u32 i = 0u; i < n; i++) {
         u32 w = src[i];
         spu_ram_write16(sys, spu->xfer_addr, (u16)(w & 0xFFFFu));
@@ -708,6 +768,7 @@ void spu_dma_write_words(PsxSystem *sys, const u32 *src, u32 n) {
         spu_ram_write16(sys, spu->xfer_addr, (u16)(w >> 16));
         spu->xfer_addr = (spu->xfer_addr + 2u) & 0x7FFFEu;
     }
+    spu_unlock(spu);
 }
 
 u32 spu_dma_read_words(PsxSystem *sys, u32 *dst, u32 n) {
@@ -715,6 +776,7 @@ u32 spu_dma_read_words(PsxSystem *sys, u32 *dst, u32 n) {
     if (!spu->ram || !dst || n == 0u) {
         return 0u;
     }
+    spu_lock(spu);
     for (u32 i = 0u; i < n; i++) {
         u32 lo = spu_ram_read16(sys, spu->xfer_addr);
         spu->xfer_addr = (spu->xfer_addr + 2u) & 0x7FFFEu;
@@ -722,6 +784,7 @@ u32 spu_dma_read_words(PsxSystem *sys, u32 *dst, u32 n) {
         spu->xfer_addr = (spu->xfer_addr + 2u) & 0x7FFFEu;
         dst[i] = lo | (hi << 16);
     }
+    spu_unlock(spu);
     return n;
 }
 
@@ -730,16 +793,22 @@ void spu_push_xa(PsxSystem *sys, const s16 *stereo, u32 frames) {
         return;
     }
     PsxSpu *spu = &sys->spu;
+    /*
+     * SPSC producer (Core 0): xa_r belongs to the renderer (possibly Core 1). On overflow
+     * the incoming samples are dropped instead of advancing the consumer cursor.
+     */
+    u32 w = spu->xa_w;
+    u32 r = __atomic_load_n(&spu->xa_r, __ATOMIC_ACQUIRE);
     for (u32 i = 0u; i < frames; i++) {
-        /* Drop oldest sample on ring overflow so continuous CD audio never stalls */
-        if ((spu->xa_w - spu->xa_r) >= 4096u) {
-            spu->xa_r++;
+        if ((w - r) >= 4096u) {
+            break;
         }
-        u32 idx = spu->xa_w & 4095u;
+        u32 idx = w & 4095u;
         spu->xa_ring[0][idx] = stereo[i * 2u + 0u];
         spu->xa_ring[1][idx] = stereo[i * 2u + 1u];
-        spu->xa_w++;
+        w++;
     }
+    __atomic_store_n(&spu->xa_w, w, __ATOMIC_RELEASE);
 }
 
 static void spu_step_noise(PsxSpu *spu, SpuExt *ext) {
@@ -822,8 +891,10 @@ static void spu_render_frames_core(PsxSystem *sys, u32 frames) {
         return;
     }
 
-    s16 batch_pcm[64 * 2];
-    u32 batch_fill = 0u;
+    u32 xa_w  = __atomic_load_n(&spu->xa_w, __ATOMIC_ACQUIRE);
+    u32 xa_r  = spu->xa_r;
+    u32 ring_w = spu->out_w;
+    u32 ring_r = __atomic_load_n(&spu->out_r, __ATOMIC_ACQUIRE);
 
     for (u32 f = 0u; f < frames; f++) {
         bool spu_on   = (spu->spucnt & (1u << 15)) != 0u;
@@ -911,11 +982,11 @@ static void spu_render_frames_core(PsxSystem *sys, u32 frames) {
 
         /* Pop one 44.1 kHz stereo frame from CD-DA / XA ring */
         s16 cd_raw_l = 0, cd_raw_r = 0;
-        if (spu->xa_r != spu->xa_w) {
-            u32 xidx = spu->xa_r & 4095u;
+        if (xa_r != xa_w) {
+            u32 xidx = xa_r & 4095u;
             cd_raw_l = spu->xa_ring[0][xidx];
             cd_raw_r = spu->xa_ring[1][xidx];
-            spu->xa_r++;
+            xa_r++;
         }
 
         if (cd_en) {
@@ -969,35 +1040,29 @@ static void spu_render_frames_core(PsxSystem *sys, u32 frames) {
             out_r = spu_sat16((mix_r * (s32)ext->cur_main_r) >> 15);
         }
 
-        /* Push into SPU stereo out_ring */
+        /*
+         * Single output path: SPSC stereo out_ring (producer = renderer). The consumer is
+         * psx_drain_sync_spu_ring() (sync mode, Core 0) or the NDSP feeder (async, Core 1),
+         * which forward each frame exactly once. On overflow the newest frame is dropped.
+         */
         if (spu->out_ring && spu->out_cap > 0u) {
-            if ((spu->out_w - spu->out_r) >= spu->out_cap) {
-                spu->out_r++;
+            if ((ring_w - ring_r) >= spu->out_cap) {
+                ring_r = __atomic_load_n(&spu->out_r, __ATOMIC_ACQUIRE);
             }
-            u32 oidx = spu->out_w & (spu->out_cap - 1u);
-            spu->out_ring[oidx * 2u + 0u] = out_l;
-            spu->out_ring[oidx * 2u + 1u] = out_r;
-            spu->out_w++;
-        }
-
-        batch_pcm[batch_fill * 2u + 0u] = out_l;
-        batch_pcm[batch_fill * 2u + 1u] = out_r;
-        batch_fill++;
-        if (batch_fill == 64u) {
-            plat_audio_push(batch_pcm, batch_fill);
-            batch_fill = 0u;
+            if ((ring_w - ring_r) < spu->out_cap) {
+                u32 oidx = ring_w & (spu->out_cap - 1u);
+                spu->out_ring[oidx * 2u + 0u] = out_l;
+                spu->out_ring[oidx * 2u + 1u] = out_r;
+                ring_w++;
+            }
         }
     }
 
-    if (batch_fill > 0u) {
-        plat_audio_push(batch_pcm, batch_fill);
-    }
+    __atomic_store_n(&spu->xa_r, xa_r, __ATOMIC_RELEASE);
+    __atomic_store_n(&spu->out_w, ring_w, __ATOMIC_RELEASE);
 }
 
-PSX_HOT void spu_render_batch(PsxSystem *sys, u32 frames) {
-    if (!sys || frames == 0u) {
-        return;
-    }
+static void spu_render_batch_locked(PsxSystem *sys, u32 frames) {
     PsxSpu *spu = &sys->spu;
     u32 remaining = frames;
 
@@ -1036,9 +1101,71 @@ PSX_HOT void spu_render_batch(PsxSystem *sys, u32 frames) {
     sys->stats.spu_batches++;
 }
 
+PSX_HOT void spu_render_batch(PsxSystem *sys, u32 frames) {
+    if (!sys || frames == 0u) {
+        return;
+    }
+    PsxSpu *spu = &sys->spu;
+    spu_lock(spu);
+    spu->defer_irq = 1u;
+    spu_render_batch_locked(sys, frames);
+    spu->defer_irq = 0u;
+    spu_unlock(spu);
+    spu_deliver_pending_irq(sys);
+}
+
+PSX_HOT u32 spu_render_queued_async(PsxSystem *sys, u32 max_frames) {
+    if (!sys || max_frames == 0u) {
+        return 0u;
+    }
+    PsxSpu *spu = &sys->spu;
+    if (!spu->cmd_ring || !spu_trylock(spu)) {
+        return 0u;
+    }
+    spu->defer_irq = 1u;
+
+    u32 done = 0u;
+    u32 slot = 0u;
+    while (done < max_frames &&
+           spsc_begin_pop(&spu->cmd_head, &spu->cmd_tail, PSX_SPU_CMD_CAP, &slot)) {
+        SpuCmd cmd = spu->cmd_ring[slot];
+        if (cmd.reg == SPU_CMD_REG_ADVANCE) {
+            u32 adv  = cmd.val;
+            u32 room = max_frames - done;
+            if (adv <= room) {
+                spsc_commit_pop(&spu->cmd_tail);
+                if (adv > 0u) {
+                    spu_render_frames_core(sys, adv);
+                    done += adv;
+                }
+            } else {
+                spu->cmd_ring[slot].val = (u16)(adv - room);
+                spu_render_frames_core(sys, room);
+                done += room;
+                break;
+            }
+        } else {
+            spsc_commit_pop(&spu->cmd_tail);
+            if (cmd.reg < 0x400u) {
+                spu_apply_reg16(sys, cmd.reg, cmd.val);
+            }
+        }
+    }
+    if (done > 0u) {
+        sys->stats.spu_batches++;
+    }
+
+    spu->defer_irq = 0u;
+    spu_unlock(spu);
+    return done;
+}
+
 void spu_event_cb(PsxSystem *sys, u32 late_cycles) {
     PsxSpu *spu = &sys->spu;
     spu->batch_tick = sched_now(sys) - late_cycles;
+
+    /* Deliver any IRQ9 latched by the Core 1 renderer */
+    spu_deliver_pending_irq(sys);
 
     if (!spu->async_mode || spu->irq_enabled) {
         spu_render_batch(sys, PSX_SPU_BATCH_FRAMES);
@@ -1161,6 +1288,8 @@ void spu_state(PsxSystem *sys, StateIO *st) {
         spu->out_r      = 0u;
         spu->xa_w       = 0u;
         spu->xa_r       = 0u;
+        spu->irq_pending = 0u;
+        spu->defer_irq  = 0u;
         spu->async_mode = sys->cfg.spu_async;
         spsc_index_reset(&spu->cmd_head, &spu->cmd_tail);
     }

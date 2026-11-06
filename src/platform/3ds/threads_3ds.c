@@ -4,6 +4,9 @@
 
 #include "plat_3ds_internal.h"
 
+/* CD readahead producer step (src/periph/cdrom_readahead.c, declared in periph_internal.h) */
+u32 cdrom_ra_pump(PsxSystem *sys, u32 max_sectors);
+
 struct PlatThread {
     Thread t;
     int    actual_core;
@@ -112,26 +115,32 @@ void plat_yield(void) {
     svcSleepThread(0);
 }
 
+/*
+ * Core 1: 500 us cadence (2 kHz) comfortably covers 44.1 kHz in 64-frame render chunks;
+ * ctr_audio_step_core1() itself only renders time Core 0 has already queued.
+ */
 static void spu_core1_worker(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
     while (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) != 0) {
         if (sys && !__atomic_load_n(&sys->quit, __ATOMIC_ACQUIRE)) {
             ctr_audio_step_core1(sys);
         }
-        plat_sleep_us(2000u);
+        plat_sleep_us(500u);
     }
 }
 
+/*
+ * Core 2 (N3DS) / Core 1 (O3DS): pump the CD readahead ring directly so the loop exits
+ * as soon as g_workers_running drops (no dependency on sys->quit).
+ */
 static void cd_core2_worker(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
     while (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) != 0) {
+        u32 n = 0u;
         if (sys && !__atomic_load_n(&sys->quit, __ATOMIC_ACQUIRE)) {
-            cdrom_readahead_thread(sys);
+            n = cdrom_ra_pump(sys, 8u);
         }
-        if (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) == 0) {
-            break;
-        }
-        plat_sleep_us(4000u);
+        plat_sleep_us(n != 0u ? 500u : 2000u);
     }
 }
 
@@ -171,12 +180,8 @@ void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw) {
         !g_spu_worker && !g_cd_worker) {
         return;
     }
+    (void)sys;
     __atomic_store_n(&g_workers_running, 0, __ATOMIC_RELEASE);
-    bool saved_quit = false;
-    if (sys) {
-        saved_quit = sys->quit;
-        __atomic_store_n(&sys->quit, true, __ATOMIC_RELEASE);
-    }
     if (g_spu_worker) {
         plat_thread_join(g_spu_worker);
         g_spu_worker = NULL;
@@ -184,9 +189,6 @@ void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw) {
     if (g_cd_worker) {
         plat_thread_join(g_cd_worker);
         g_cd_worker = NULL;
-    }
-    if (sys) {
-        __atomic_store_n(&sys->quit, saved_quit, __ATOMIC_RELEASE);
     }
     if (hw) {
         hw->spu_core1_active = false;

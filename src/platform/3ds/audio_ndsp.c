@@ -7,8 +7,10 @@
 /*
  * Nintendo 3DS NDSP Triple-Buffered 44.1 kHz Stereo PCM16 Audio Backend
  *  - Uses linearMemAlign wave buffers + DSP_FlushDataCache before ndspChnWaveBufAdd
- *  - Fed asynchronously on Core 1 from PsxSpu out_ring / async batch renderer,
- *    plus lock-free SPSC staging ring for direct plat_audio_push() calls
+ *  - Async SPU (Core 1): renders only Core-0-queued emulated time, then drains the
+ *    PsxSpu out_ring (SPSC consumer) — every SPU frame reaches NDSP exactly once
+ *  - Sync SPU: Core 0 forwards out_ring via plat_audio_push() into a lock-free SPSC
+ *    staging ring that Core 1 drains (out_ring is never touched from Core 1 then)
  *  - Degrades cleanly to silent audio if sdmc:/3ds/dspfirm.cdc is missing
  */
 
@@ -18,6 +20,12 @@
 #define CTR_NDSP_BUF_FRAMES     735u /* 44100 / 60 = 735 stereo frames (16.67 ms) */
 #define CTR_NDSP_RING_FRAMES    8192u
 #define CTR_NDSP_RING_MASK      (CTR_NDSP_RING_FRAMES - 1u)
+
+/* Core 1 async rendering: keep ~3 NDSP buffers (~50 ms) of rendered audio queued */
+#define CTR_SPU_TARGET_FRAMES   (CTR_NDSP_BUF_FRAMES * 3u)
+#define CTR_SPU_CHUNK_FRAMES    64u    /* frames rendered per render-lock hold */
+#define CTR_SPU_MAX_CHUNKS      48u    /* bound per Core 1 step (~3072 frames) */
+#define CTR_SPU_PRESSURE_CMDS   1024u  /* render past the target if Core 0 queue backs up */
 
 static bool        g_ndsp_ready = false;
 static PsxSystem  *g_bound_sys = NULL;
@@ -90,12 +98,21 @@ void ctr_audio_bind_system(PsxSystem *sys) {
     __atomic_store_n(&g_bound_sys, sys, __ATOMIC_RELEASE);
 }
 
+static u32 spu_out_queued(const PsxSystem *sys) {
+    if (!sys || !sys->spu.out_ring || sys->spu.out_cap == 0u) {
+        return 0u;
+    }
+    u32 sw = __atomic_load_n(&sys->spu.out_w, __ATOMIC_ACQUIRE);
+    u32 sr = __atomic_load_n(&sys->spu.out_r, __ATOMIC_ACQUIRE);
+    return sw - sr;
+}
+
 u32 ctr_audio_queued_frames(void) {
     u32 w = __atomic_load_n(&g_push_w, __ATOMIC_ACQUIRE);
     u32 r = __atomic_load_n(&g_push_r, __ATOMIC_ACQUIRE);
     u32 n = w - r;
     PsxSystem *sys = __atomic_load_n(&g_bound_sys, __ATOMIC_ACQUIRE);
-    if (sys && sys->spu.out_ring && sys->spu.out_cap > 0u) {
+    if (sys && sys->spu.async_mode && sys->spu.out_ring && sys->spu.out_cap > 0u) {
         u32 sw = __atomic_load_n(&sys->spu.out_w, __ATOMIC_ACQUIRE);
         u32 sr = __atomic_load_n(&sys->spu.out_r, __ATOMIC_ACQUIRE);
         n += (sw - sr);
@@ -106,8 +123,8 @@ u32 ctr_audio_queued_frames(void) {
 static u32 pop_samples(PsxSystem *sys, s16 *dst, u32 want_frames) {
     u32 got = 0u;
 
-    /* 1. Drain SPU output ring if populated (async or sync SPU ring) */
-    if (sys && sys->spu.out_ring && sys->spu.out_cap > 0u) {
+    /* 1. Async SPU only: drain the out_ring (sync mode forwards it via plat_audio_push) */
+    if (sys && sys->spu.async_mode && sys->spu.out_ring && sys->spu.out_cap > 0u) {
         u32 sw = __atomic_load_n(&sys->spu.out_w, __ATOMIC_ACQUIRE);
         u32 sr = sys->spu.out_r;
         if ((sw - sr) > sys->spu.out_cap) {
@@ -146,12 +163,24 @@ void ctr_audio_step_core1(PsxSystem *sys) {
         sys = __atomic_load_n(&g_bound_sys, __ATOMIC_ACQUIRE);
     }
 
-    /* In async SPU mode, render pending SPU command batches on Core 1 */
-    if (sys && sys->spu.async_mode) {
-        u32 sw = __atomic_load_n(&sys->spu.out_w, __ATOMIC_ACQUIRE);
-        u32 sr = __atomic_load_n(&sys->spu.out_r, __ATOMIC_ACQUIRE);
-        if ((sw - sr) < CTR_NDSP_BUF_FRAMES * 2u) {
-            spu_render_batch(sys, PSX_SPU_BATCH_FRAMES);
+    /*
+     * Async SPU: render ONLY emulated time Core 0 already queued (never free-run silence,
+     * e.g. while paused in the ROM picker), in short lock holds, until ~3 NDSP buffers are
+     * queued — or keep going while Core 0's command ring is backing up.
+     */
+    if (sys && sys->spu.async_mode && !sys->spu.irq_enabled) {
+        for (u32 chunk = 0u; chunk < CTR_SPU_MAX_CHUNKS; chunk++) {
+            u32 backlog = spu_cmd_backlog(sys);
+            if (backlog == 0u) {
+                break;
+            }
+            if (spu_out_queued(sys) >= CTR_SPU_TARGET_FRAMES && backlog < CTR_SPU_PRESSURE_CMDS) {
+                break;
+            }
+            if (spu_render_queued_async(sys, CTR_SPU_CHUNK_FRAMES) == 0u &&
+                spu_cmd_backlog(sys) == backlog) {
+                break; /* Core 0 holds the render lock: retry next step */
+            }
         }
     }
 

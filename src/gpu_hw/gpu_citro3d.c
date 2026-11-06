@@ -5,6 +5,7 @@
 #include "psx3ds/system.h"
 #include "psx_gpu_shbin.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,16 +17,26 @@
 typedef struct GpuHwVertex {
     s16 pos[2]; /* v0: GPU_SHORT x 2 (VRAM or screen X, Y) */
     s16 uv[2];  /* v1: GPU_SHORT x 2 (texel U, V) */
-    u8  col[4]; /* v2: GPU_UNSIGNED_BYTE x 4 (R, G, B, A in 0..255) */
-    u8  aux[4]; /* v3: GPU_UNSIGNED_BYTE x 4 (tex_mode, abr, flags, pad) */
+    u8  col[4]; /* v2: GPU_UNSIGNED_BYTE x 4 (R, G, B, A: 255 = textured, 0 = untextured) */
 } GpuHwVertex;
 
-_Static_assert(sizeof(GpuHwVertex) == 16, "GpuHwVertex must be 16 bytes");
+_Static_assert(sizeof(GpuHwVertex) == 12, "GpuHwVertex must be 12 bytes");
 
+/*
+ * Fused TEV modes (primitives & fills of the VRAM pass):
+ *   HW_TEX_FUSED     stage 0: rgb = clamp(tex * vtx * 2) (PS1 128 = 1.0x), a = tex.a
+ *   HW_TEX_FUSED_RAW stage 0: rgb = tex (bit-exact raw texture), a = tex.a
+ *   both             stage 1: rgb = lerp(vtx.rgb, stage0.rgb, vtx.a), a = lerp(1, stage0.a, vtx.a)
+ * Vertex alpha 255 selects the textured path and 0 plain vertex colour, so untextured
+ * primitives (HW_TEX_ANY + HW_SLOT_ANY) join either fused batch without a state change.
+ * HW_TEX_RAW is a plain texture REPLACE used for bit-exact VRAM upload blits / present.
+ */
 typedef enum GpuHwTexMode {
-    HW_TEX_NONE     = 0,
-    HW_TEX_RAW      = 1,
-    HW_TEX_MODULATE = 2
+    HW_TEX_NONE      = 0,
+    HW_TEX_RAW       = 1,
+    HW_TEX_FUSED     = 2,
+    HW_TEX_FUSED_RAW = 3,
+    HW_TEX_ANY       = 4  /* untextured wildcard: adopts the batch's fused mode */
 } GpuHwTexMode;
 
 typedef enum GpuHwAlphaMode {
@@ -40,11 +51,12 @@ enum {
     HW_SLOT_NONE   = -1,
     HW_SLOT_UPLOAD = -2,
     HW_SLOT_VRAM   = -3,
-    HW_SLOT_DISP24 = -4
+    HW_SLOT_DISP24 = -4,
+    HW_SLOT_ANY    = -5  /* untextured: joins any bound texture (white 8x8 if none) */
 };
 
 typedef struct GpuHwBatchKey {
-    s16 tex_slot;     /* HW_SLOT_* or 0..63 texcache slot index */
+    s16 tex_slot;     /* HW_SLOT_* or 0..63 texcache slot index (HW_SLOT_ANY = wildcard) */
     u8  tex_mode;     /* GpuHwTexMode */
     u8  alpha_mode;   /* GpuHwAlphaMode */
     u8  abr;          /* 0..3 (canonicalized to 0 when opaque) */
@@ -77,6 +89,15 @@ typedef struct GpuHwState {
 
     C3D_Tex           disp24_tex;
     bool              disp24_tex_ready;
+
+    C3D_Tex           white_tex;
+    bool              white_tex_ready;
+    u8                cur_tev;        /* GpuHwTexMode currently programmed, 0xFF = unknown */
+    u32               gpu_frame_id;   /* incremented at every C3D_FrameBegin */
+
+    /* Lifetime batch-break diagnostics (logged once at destroy) */
+    u32               brk_slot, brk_alpha, brk_abr, brk_scissor, brk_other;
+    u32               n_cpu_upload, n_readback, n_stall, n_ring_wrap, n_draw_calls, n_presents;
 
     u16              *readback_buf;
 
@@ -181,7 +202,7 @@ static void mark_cpu_dirty(GpuHwState *st, u16 x, u16 y, u16 w, u16 h) {
  * -------------------------------------------------------------------------- */
 static void bind_current_ring(GpuHwState *st) {
     BufInfo_Init(&st->buf_info);
-    BufInfo_Add(&st->buf_info, st->vbo_ring[st->cur_ring], sizeof(GpuHwVertex), 4, 0x3210);
+    BufInfo_Add(&st->buf_info, st->vbo_ring[st->cur_ring], sizeof(GpuHwVertex), 3, 0x210);
     C3D_SetBufInfo(&st->buf_info);
 }
 
@@ -191,18 +212,38 @@ static void configure_common_pipeline(GpuHwState *st) {
     bind_current_ring(st);
     C3D_CullFace(GPU_CULL_NONE);
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+    st->cur_tev = 0xFFu; /* force TEV re-programming on next batch */
+}
 
-    /* Ensure TEV stages 1..3 are clean passthroughs */
-    for (int stage = 1; stage < 4; ++stage) {
-        C3D_TexEnvInit(C3D_GetTexEnv(stage));
+/*
+ * C3D_FrameBegin(0) blocks until every previously submitted GX command list has been
+ * consumed by the PICA200, so after begin_frame() all earlier frames' vertex rings and
+ * textures are free to be rewritten.
+ */
+static void begin_frame(GpuHwState *st, u8 flags) {
+    C3D_FrameBegin(flags);
+    st->in_frame = true;
+    st->on_vram_rt = false;
+    st->gpu_frame_id++;
+    if (st->gpu_frame_id == 0u) {
+        st->gpu_frame_id = 1u;
     }
+    gpu_texcache_set_frame(&st->texcache, st->gpu_frame_id);
+}
+
+/* Submit the open frame (if any) and wait until the GPU has consumed it */
+static void restart_frame_and_wait(GpuHwState *st) {
+    if (st->in_frame) {
+        C3D_FrameEnd(0);
+        st->in_frame = false;
+        st->on_vram_rt = false;
+    }
+    begin_frame(st, 0);
 }
 
 static void ensure_vram_pass_open(GpuHwState *st) {
     if (!st->in_frame) {
-        C3D_FrameBegin(0);
-        st->in_frame = true;
-        st->on_vram_rt = false;
+        begin_frame(st, 0);
     }
     if (!st->on_vram_rt) {
         C3D_FrameDrawOn(st->vram_rt);
@@ -246,7 +287,7 @@ static void set_abr_blend_state(u8 abr) {
 }
 
 static void set_opaque_blend_state(void) {
-    C3D_ColorLogicOp(GPU_LOGICOP_COPY);
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
 }
 
 static void apply_stencil_state(GpuHwState *st, u8 stencil_mode) {
@@ -290,33 +331,54 @@ static void set_uv_transform(GpuHwState *st, float inv_w, float inv_h, bool flip
     }
 }
 
-static void configure_tev_mode(GpuHwTexMode mode) {
-    C3D_TexEnv *env = C3D_GetTexEnv(0);
-    C3D_TexEnvInit(env);
-    if (mode == HW_TEX_NONE) {
-        C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-        C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
-        C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
-        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
-        C3D_TexEnvScale(env, C3D_Both, GPU_TEVSCALE_1);
-    } else if (mode == HW_TEX_RAW) {
-        C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-        C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
-        C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
-        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
-        C3D_TexEnvScale(env, C3D_Both, GPU_TEVSCALE_1);
-    } else {
-        /* PS1 texture modulation: out_rgb = clamp(tex_rgb * vtx_rgb * 2.0, 0, 1) (128 => 1.0x) */
-        C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-        C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
-        C3D_TexEnvFunc(env, C3D_RGB, GPU_MODULATE);
-        C3D_TexEnvScale(env, C3D_RGB, GPU_TEVSCALE_2);
-
-        C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-        C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
-        C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
-        C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_1);
+static void configure_tev_mode(GpuHwState *st, GpuHwTexMode mode) {
+    if (st->cur_tev == (u8)mode) {
+        return;
     }
+    st->cur_tev = (u8)mode;
+
+    C3D_TexEnv *env0 = C3D_GetTexEnv(0);
+    C3D_TexEnv *env1 = C3D_GetTexEnv(1);
+    C3D_TexEnvInit(env0);
+    C3D_TexEnvInit(env1);
+    C3D_TexEnvInit(C3D_GetTexEnv(2));
+    C3D_TexEnvInit(C3D_GetTexEnv(3));
+
+    if (mode == HW_TEX_RAW) {
+        C3D_TexEnvSrc(env0, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+        C3D_TexEnvOpRgb(env0, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
+        C3D_TexEnvOpAlpha(env0, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
+        C3D_TexEnvFunc(env0, C3D_Both, GPU_REPLACE);
+        C3D_TexEnvScale(env0, C3D_Both, GPU_TEVSCALE_1);
+        return;
+    }
+
+    C3D_TexEnvSrc(env0, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpRgb(env0, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
+    if (mode == HW_TEX_FUSED_RAW) {
+        /* Stage 0: raw texture (exact, no modulation rounding) */
+        C3D_TexEnvFunc(env0, C3D_RGB, GPU_REPLACE);
+        C3D_TexEnvScale(env0, C3D_RGB, GPU_TEVSCALE_1);
+    } else {
+        /* Stage 0: PS1 texture modulation out_rgb = clamp(tex_rgb * vtx_rgb * 2.0) (128 => 1.0x) */
+        C3D_TexEnvFunc(env0, C3D_RGB, GPU_MODULATE);
+        C3D_TexEnvScale(env0, C3D_RGB, GPU_TEVSCALE_2);
+    }
+    C3D_TexEnvSrc(env0, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpAlpha(env0, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
+    C3D_TexEnvFunc(env0, C3D_Alpha, GPU_REPLACE);
+    C3D_TexEnvScale(env0, C3D_Alpha, GPU_TEVSCALE_1);
+
+    /* Stage 1: per-vertex select (vtx.a = 255 textured, 0 untextured) via INTERPOLATE */
+    C3D_TexEnvSrc(env1, C3D_RGB, GPU_PREVIOUS, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpRgb(env1, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_ALPHA);
+    C3D_TexEnvFunc(env1, C3D_RGB, GPU_INTERPOLATE);
+    C3D_TexEnvScale(env1, C3D_RGB, GPU_TEVSCALE_1);
+    C3D_TexEnvSrc(env1, C3D_Alpha, GPU_PREVIOUS, GPU_CONSTANT, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpAlpha(env1, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
+    C3D_TexEnvFunc(env1, C3D_Alpha, GPU_INTERPOLATE);
+    C3D_TexEnvScale(env1, C3D_Alpha, GPU_TEVSCALE_1);
+    C3D_TexEnvColor(env1, 0xFFFFFFFFu);
 }
 
 static void flush_batch(GpuHwState *st) {
@@ -348,22 +410,22 @@ static void flush_batch(GpuHwState *st) {
         C3D_SetScissor(GPU_SCISSOR_NORMAL, k->sc_x0, fb_y0, k->sc_x1, fb_y1);
     }
 
-    if (k->tex_mode != HW_TEX_NONE) {
-        if (k->tex_slot >= 0 && k->tex_slot < (s16)GPU_HW_TEXCACHE_SLOTS) {
-            C3D_Tex *tex = (C3D_Tex *)st->texcache.slots[k->tex_slot].hw_tex;
-            C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST);
-            C3D_TexBind(0, tex);
-            set_uv_transform(st, 1.0f / 256.0f, 1.0f / 256.0f, true);
-        } else if (k->tex_slot == HW_SLOT_UPLOAD) {
-            C3D_TexSetFilter(&st->upload_tex, GPU_NEAREST, GPU_NEAREST);
-            C3D_TexBind(0, &st->upload_tex);
-            set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
-        }
-    } else {
+    if (k->tex_slot >= 0 && k->tex_slot < (s16)GPU_HW_TEXCACHE_SLOTS) {
+        C3D_Tex *tex = (C3D_Tex *)st->texcache.slots[k->tex_slot].hw_tex;
+        C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST);
+        C3D_TexBind(0, tex);
         set_uv_transform(st, 1.0f / 256.0f, 1.0f / 256.0f, true);
+    } else if (k->tex_slot == HW_SLOT_UPLOAD) {
+        C3D_TexSetFilter(&st->upload_tex, GPU_NEAREST, GPU_NEAREST);
+        C3D_TexBind(0, &st->upload_tex);
+        set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
+    } else {
+        /* untextured-only batch: vertex alpha 0 ignores the (white) texture sample */
+        C3D_TexBind(0, &st->white_tex);
+        set_uv_transform(st, 1.0f / 8.0f, 1.0f / 8.0f, true);
     }
 
-    configure_tev_mode((GpuHwTexMode)k->tex_mode);
+    configure_tev_mode(st, k->tex_mode == HW_TEX_ANY ? HW_TEX_FUSED : (GpuHwTexMode)k->tex_mode);
     apply_stencil_state(st, k->stencil_mode);
 
     GSPGPU_FlushDataCache(&st->vbo_ring[st->cur_ring][st->batch_first],
@@ -377,6 +439,7 @@ static void flush_batch(GpuHwState *st) {
             C3D_AlphaTest(false, GPU_ALWAYS, 0);
             set_opaque_blend_state();
             C3D_DrawArrays(GPU_TRIANGLES, first, count);
+            st->n_draw_calls++;
             if (st->sys) st->sys->stats.gpu_batches++;
             break;
 
@@ -384,6 +447,7 @@ static void flush_batch(GpuHwState *st) {
             C3D_AlphaTest(true, GPU_GREATER, 0);
             set_opaque_blend_state();
             C3D_DrawArrays(GPU_TRIANGLES, first, count);
+            st->n_draw_calls++;
             if (st->sys) st->sys->stats.gpu_batches++;
             break;
 
@@ -391,6 +455,7 @@ static void flush_batch(GpuHwState *st) {
             C3D_AlphaTest(false, GPU_ALWAYS, 0);
             set_abr_blend_state(k->abr);
             C3D_DrawArrays(GPU_TRIANGLES, first, count);
+            st->n_draw_calls++;
             if (st->sys) st->sys->stats.gpu_batches++;
             break;
 
@@ -398,6 +463,7 @@ static void flush_batch(GpuHwState *st) {
             C3D_AlphaTest(true, GPU_GREATER, 0);
             set_abr_blend_state(k->abr);
             C3D_DrawArrays(GPU_TRIANGLES, first, count);
+            st->n_draw_calls++;
             if (st->sys) st->sys->stats.gpu_batches++;
             break;
 
@@ -411,6 +477,7 @@ static void flush_batch(GpuHwState *st) {
             C3D_AlphaTest(true, GPU_EQUAL, 0x80);
             set_abr_blend_state(k->abr);
             C3D_DrawArrays(GPU_TRIANGLES, first, count);
+            st->n_draw_calls += 2u;
             if (st->sys) st->sys->stats.gpu_batches += 2u;
             break;
     }
@@ -419,32 +486,67 @@ static void flush_batch(GpuHwState *st) {
     st->batch_count = 0u;
 }
 
-static bool batch_keys_equal(const GpuHwBatchKey *a, const GpuHwBatchKey *b) {
-    return a->tex_slot == b->tex_slot &&
-           a->tex_mode == b->tex_mode &&
-           a->alpha_mode == b->alpha_mode &&
+/*
+ * Returns true when primitive key b can be appended to the open batch a. Untextured
+ * primitives (HW_SLOT_ANY) join any texture; an untextured-only batch adopts the first
+ * concrete texture slot appended to it (its vertices never sample the texture).
+ */
+static bool batch_keys_merge(GpuHwBatchKey *a, const GpuHwBatchKey *b) {
+    bool same = a->alpha_mode == b->alpha_mode &&
            a->abr == b->abr &&
            a->stencil_mode == b->stencil_mode &&
            a->sc_x0 == b->sc_x0 &&
            a->sc_y0 == b->sc_y0 &&
            a->sc_x1 == b->sc_x1 &&
            a->sc_y1 == b->sc_y1;
+    if (!same) {
+        return false;
+    }
+    /* Untextured primitive joins any fused batch (vertex alpha 0 ignores the texture) */
+    if (b->tex_slot == HW_SLOT_ANY && b->tex_mode == HW_TEX_ANY) {
+        return a->tex_mode != HW_TEX_RAW;
+    }
+    if (a->tex_slot == b->tex_slot && a->tex_mode == b->tex_mode) {
+        return true;
+    }
+    /* Untextured-only batch adopts the first textured primitive's slot and fused mode */
+    if (a->tex_slot == HW_SLOT_ANY && a->tex_mode == HW_TEX_ANY && b->tex_slot >= 0) {
+        a->tex_slot = b->tex_slot;
+        a->tex_mode = b->tex_mode;
+        return true;
+    }
+    return false;
 }
 
 static GpuHwVertex *alloc_batch_verts(GpuHwState *st, const GpuHwBatchKey *key, u32 count) {
     if (count == 0u || count > GPU_HW_VTX_RING_VERTS) {
         return NULL;
     }
-    if (st->has_batch_key && !batch_keys_equal(&st->batch_key, key)) {
+    if (st->has_batch_key && st->batch_count > 0u && !batch_keys_merge(&st->batch_key, key)) {
+        const GpuHwBatchKey *a = &st->batch_key;
+        if (a->sc_x0 != key->sc_x0 || a->sc_y0 != key->sc_y0 ||
+            a->sc_x1 != key->sc_x1 || a->sc_y1 != key->sc_y1) {
+            st->brk_scissor++;
+        } else if (a->alpha_mode != key->alpha_mode) {
+            st->brk_alpha++;
+        } else if (a->abr != key->abr) {
+            st->brk_abr++;
+        } else if (a->tex_slot != key->tex_slot) {
+            st->brk_slot++;
+        } else {
+            st->brk_other++;
+        }
         flush_batch(st);
     }
 
     if (st->ring_pos + count > GPU_HW_VTX_RING_VERTS) {
-        /* Ring full mid-frame: flush & execute current frame slice so persistent vram_rt keeps all draws */
+        /*
+         * Ring full mid-frame: submit the current frame slice (persistent vram_rt keeps all
+         * draws), switch rings, and wait for the GPU so the other ring is free to rewrite.
+         */
         flush_batch(st);
         if (st->in_frame) {
             C3D_FrameEnd(0);
-            C3D_FrameSync();
             st->in_frame = false;
             st->on_vram_rt = false;
         }
@@ -452,6 +554,8 @@ static GpuHwVertex *alloc_batch_verts(GpuHwState *st, const GpuHwBatchKey *key, 
         st->ring_pos = 0u;
         st->batch_first = 0u;
         st->batch_count = 0u;
+        st->n_ring_wrap++;
+        begin_frame(st, 0);
     }
 
     if (st->batch_count == 0u) {
@@ -467,7 +571,7 @@ static GpuHwVertex *alloc_batch_verts(GpuHwState *st, const GpuHwBatchKey *key, 
 }
 
 static inline void write_hw_vtx(GpuHwVertex *dst, s16 x, s16 y, s16 u, s16 v,
-                                u8 r, u8 g, u8 b, u8 a, u8 tm, u8 abr) {
+                                u8 r, u8 g, u8 b, u8 a) {
     dst->pos[0] = x;
     dst->pos[1] = y;
     dst->uv[0]  = u;
@@ -476,10 +580,6 @@ static inline void write_hw_vtx(GpuHwVertex *dst, s16 x, s16 y, s16 u, s16 v,
     dst->col[1] = g;
     dst->col[2] = b;
     dst->col[3] = a;
-    dst->aux[0] = tm;
-    dst->aux[1] = abr;
-    dst->aux[2] = 0u;
-    dst->aux[3] = 0u;
 }
 
 /* --------------------------------------------------------------------------
@@ -509,14 +609,10 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
         return;
     }
 
+    /* Submit pending draws and wait until any prior upload_tex sampling has completed */
+    st->n_cpu_upload++;
     flush_batch(st);
-    if (st->in_frame) {
-        /* Ensure any prior upload_tex draw has completed before mutating upload_tex.data */
-        C3D_FrameEnd(0);
-        C3D_FrameSync();
-        st->in_frame = false;
-        st->on_vram_rt = false;
-    }
+    restart_frame_and_wait(st);
 
     u16 ux0 = (u16)(st->cpu_dx0 & ~7u);
     u16 uy0 = (u16)(st->cpu_dy0 & ~7u);
@@ -563,12 +659,12 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
         if (v != NULL) {
             s16 x0 = (s16)ux0, y0 = (s16)uy0;
             s16 x1 = (s16)ux1, y1 = (s16)uy1;
-            write_hw_vtx(&v[0], x0, y0, x0, y0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&v[1], x1, y0, x1, y0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&v[2], x0, y1, x0, y1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&v[3], x1, y0, x1, y0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&v[4], x1, y1, x1, y1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&v[5], x0, y1, x0, y1, 255, 255, 255, 255, HW_TEX_RAW, 0);
+            write_hw_vtx(&v[0], x0, y0, x0, y0, 255, 255, 255, 255);
+            write_hw_vtx(&v[1], x1, y0, x1, y0, 255, 255, 255, 255);
+            write_hw_vtx(&v[2], x0, y1, x0, y1, 255, 255, 255, 255);
+            write_hw_vtx(&v[3], x1, y0, x1, y0, 255, 255, 255, 255);
+            write_hw_vtx(&v[4], x1, y1, x1, y1, 255, 255, 255, 255);
+            write_hw_vtx(&v[5], x0, y1, x0, y1, 255, 255, 255, 255);
             flush_batch(st);
         }
     }
@@ -589,13 +685,18 @@ static void hw_sync_to_shadow(void *self, u16 x, u16 y, u16 w, u16 h) {
         return;
     }
 
+    /*
+     * Submit pending draws and leave the frame CLOSED: C3D_SyncTextureCopy() outside a
+     * frame first waits for (and clears) the GX queue, i.e. for the PICA200 to finish
+     * rendering into vram_tex, and then performs the copy synchronously.
+     */
+    st->n_readback++;
     flush_batch(st);
     if (st->in_frame) {
         C3D_FrameEnd(0);
         st->in_frame = false;
         st->on_vram_rt = false;
     }
-    C3D_FrameSync();
 
     if (st->readback_buf == NULL) {
         st->readback_buf = (u16 *)linearMemAlign(GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16), 0x80);
@@ -713,7 +814,6 @@ static void hw_reset(void *self) {
     flush_batch(st);
     if (st->in_frame) {
         C3D_FrameEnd(0);
-        C3D_FrameSync();
         st->in_frame = false;
         st->on_vram_rt = false;
     }
@@ -831,8 +931,9 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
     }
 
     GpuTexWindowKey tw_key = { 0u, 0u, 0u, 0u };
-    s16 tex_slot_idx = HW_SLOT_NONE;
+    s16 tex_slot_idx = HW_SLOT_ANY;
     GpuTexAlphaClass alpha_cls = GPU_TEX_ALPHA_ALL_OPAQUE;
+    bool slot_rgba8 = false;
 
     if (textured && st->sys && st->sys->gpu.vram) {
         resolve_tex_window(env, u_coords, v_coords, uv_count, &tw_key);
@@ -854,42 +955,67 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
             }
         }
 
+        /*
+         * Open the frame BEFORE any texcache decode: begin_frame() waits for the previous
+         * frame's GPU work, and cur_frame protects slots already referenced this frame.
+         */
+        ensure_vram_pass_open(st);
         const GpuTexSlot *slot = gpu_texcache_lookup(&st->texcache, st->sys->gpu.vram,
                                                      p->texpage, p->tex_depth, p->clut,
                                                      &tw_key, &st->sys->stats, NULL);
+        if (slot == NULL && st->texcache.stalled) {
+            /* Every active slot is sampled by unsubmitted draws: submit, wait, retry */
+            st->n_stall++;
+            flush_batch(st);
+            restart_frame_and_wait(st);
+            slot = gpu_texcache_lookup(&st->texcache, st->sys->gpu.vram,
+                                       p->texpage, p->tex_depth, p->clut,
+                                       &tw_key, &st->sys->stats, NULL);
+        }
         if (slot == NULL || slot->hw_tex == NULL) {
             return;
         }
         tex_slot_idx = (s16)(slot - st->texcache.slots);
+        slot_rgba8 = slot->is_rgba8;
         alpha_cls = (GpuTexAlphaClass)slot->alpha_class;
+
+        /* Per-primitive STP classification over the sampled UV box (8x8-tile masks) */
+        if (semi && alpha_cls != GPU_TEX_ALPHA_ALL_OPAQUE && uv_count > 0u) {
+            s32 u_lo = u_coords[0], u_hi = u_coords[0];
+            s32 v_lo = v_coords[0], v_hi = v_coords[0];
+            for (u32 i = 1u; i < uv_count; ++i) {
+                if (u_coords[i] < u_lo) u_lo = u_coords[i];
+                if (u_coords[i] > u_hi) u_hi = u_coords[i];
+                if (v_coords[i] < v_lo) v_lo = v_coords[i];
+                if (v_coords[i] > v_hi) v_hi = v_coords[i];
+            }
+            alpha_cls = gpu_tex_tiles_classify(&slot->tiles, u_lo, v_lo, u_hi, v_hi);
+            if (alpha_cls == GPU_TEX_ALPHA_MIXED && !slot_rgba8) {
+                alpha_cls = GPU_TEX_ALPHA_ALL_STP; /* 1-bit alpha: STP split unavailable */
+            }
+        }
     } else if (textured) {
         return;
     }
 
-    GpuHwTexMode tex_mode = HW_TEX_NONE;
-    if (textured) {
-        tex_mode = raw_tex ? HW_TEX_RAW : HW_TEX_MODULATE;
-    }
-
-    GpuHwAlphaMode alpha_mode = HW_ALPHA_OPAQUE_NOTEST;
-    if (!textured) {
-        alpha_mode = semi ? HW_ALPHA_SEMI_NOTEST : HW_ALPHA_OPAQUE_NOTEST;
-    } else if (!semi || alpha_cls == GPU_TEX_ALPHA_ALL_OPAQUE) {
+    /*
+     * Unified alpha modes: untextured vertices emit alpha 255 from TEV stage 1, so they pass
+     * the "alpha > 0" test and share OPAQUE_MASKED / SEMI_ALL_STP batches with textures.
+     */
+    GpuHwAlphaMode alpha_mode;
+    if (!semi || (textured && alpha_cls == GPU_TEX_ALPHA_ALL_OPAQUE)) {
         alpha_mode = HW_ALPHA_OPAQUE_MASKED;
-    } else if (alpha_cls == GPU_TEX_ALPHA_ALL_STP) {
+    } else if (!textured || alpha_cls == GPU_TEX_ALPHA_ALL_STP) {
         alpha_mode = HW_ALPHA_SEMI_ALL_STP;
     } else {
         alpha_mode = HW_ALPHA_SEMI_MIXED;
     }
-
-    bool uses_blend = (alpha_mode == HW_ALPHA_SEMI_NOTEST ||
-                       alpha_mode == HW_ALPHA_SEMI_ALL_STP ||
-                       alpha_mode == HW_ALPHA_SEMI_MIXED);
+    bool uses_blend = (alpha_mode == HW_ALPHA_SEMI_ALL_STP || alpha_mode == HW_ALPHA_SEMI_MIXED);
 
     GpuHwBatchKey key;
     memset(&key, 0, sizeof(key));
-    key.tex_slot     = (tex_mode == HW_TEX_NONE) ? HW_SLOT_NONE : tex_slot_idx;
-    key.tex_mode     = (u8)tex_mode;
+    key.tex_slot     = textured ? tex_slot_idx : HW_SLOT_ANY;
+    key.tex_mode     = (u8)(!textured ? HW_TEX_ANY : (raw_tex ? HW_TEX_FUSED_RAW : HW_TEX_FUSED));
     key.alpha_mode   = (u8)alpha_mode;
     key.abr          = uses_blend ? (u8)(p->abr & 3u) : 0u;
     key.stencil_mode = st->has_stencil ? (u8)(((env->check_mask & 1u) << 1) | (env->set_mask & 1u)) : 0u;
@@ -898,9 +1024,12 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
     key.sc_x1        = (u16)cx1;
     key.sc_y1        = (u16)cy1;
 
+    /* Raw textures use the exact REPLACE fused mode (vertex RGB unused) */
+    u8 va = textured ? 255u : 0u;
+    bool per_vtx_col = gouraud && !raw_tex;
     u8 r0 = p->v[0].r, g0 = p->v[0].g, b0 = p->v[0].b;
-    if (tex_mode == HW_TEX_RAW) {
-        r0 = g0 = b0 = 128u;
+    if (raw_tex) {
+        r0 = g0 = b0 = 255u;
     }
 
     switch ((GpuPrimKind)p->kind) {
@@ -911,11 +1040,10 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
             GpuHwVertex *v = alloc_batch_verts(st, &key, 3u);
             if (!v) return;
             for (u32 i = 0; i < 3u; ++i) {
-                u8 vr = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].r : r0;
-                u8 vg = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].g : g0;
-                u8 vb = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].b : b0;
-                write_hw_vtx(&v[i], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i],
-                             vr, vg, vb, 255u, (u8)tex_mode, key.abr);
+                u8 vr = per_vtx_col ? p->v[i].r : r0;
+                u8 vg = per_vtx_col ? p->v[i].g : g0;
+                u8 vb = per_vtx_col ? p->v[i].b : b0;
+                write_hw_vtx(&v[i], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i], vr, vg, vb, va);
             }
             s32 bx0 = p->v[0].x, bx1 = p->v[0].x, by0 = p->v[0].y, by1 = p->v[0].y;
             for (u32 i = 1u; i < 3u; ++i) {
@@ -938,26 +1066,18 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
             if (!v) return;
 
             u32 out_i = 0u;
-            const u32 idx0[3] = { 0u, 1u, 2u };
-            const u32 idx1[3] = { 1u, 2u, 3u };
-            if (ok0) {
-                for (u32 k = 0; k < 3u; ++k) {
-                    u32 i = idx0[k];
-                    u8 vr = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].r : r0;
-                    u8 vg = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].g : g0;
-                    u8 vb = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].b : b0;
-                    write_hw_vtx(&v[out_i++], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i],
-                                 vr, vg, vb, 255u, (u8)tex_mode, key.abr);
+            static const u8 k_quad_idx[2][3] = { { 0u, 1u, 2u }, { 1u, 2u, 3u } };
+            for (u32 t = 0u; t < 2u; ++t) {
+                if ((t == 0u && !ok0) || (t == 1u && !ok1)) {
+                    continue;
                 }
-            }
-            if (ok1) {
                 for (u32 k = 0; k < 3u; ++k) {
-                    u32 i = idx1[k];
-                    u8 vr = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].r : r0;
-                    u8 vg = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].g : g0;
-                    u8 vb = (gouraud && tex_mode != HW_TEX_RAW) ? p->v[i].b : b0;
+                    u32 i = k_quad_idx[t][k];
+                    u8 vr = per_vtx_col ? p->v[i].r : r0;
+                    u8 vg = per_vtx_col ? p->v[i].g : g0;
+                    u8 vb = per_vtx_col ? p->v[i].b : b0;
                     write_hw_vtx(&v[out_i++], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i],
-                                 vr, vg, vb, 255u, (u8)tex_mode, key.abr);
+                                 vr, vg, vb, va);
                 }
             }
             s32 bx0 = p->v[0].x, bx1 = p->v[0].x, by0 = p->v[0].y, by1 = p->v[0].y;
@@ -984,12 +1104,12 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
             GpuHwVertex *v = alloc_batch_verts(st, &key, 6u);
             if (!v) return;
 
-            write_hw_vtx(&v[0], x0, y0, u_coords[0], v_coords[0], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
-            write_hw_vtx(&v[1], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
-            write_hw_vtx(&v[2], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
-            write_hw_vtx(&v[3], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
-            write_hw_vtx(&v[4], x1, y1, u_coords[3], v_coords[3], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
-            write_hw_vtx(&v[5], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, 255u, (u8)tex_mode, key.abr);
+            write_hw_vtx(&v[0], x0, y0, u_coords[0], v_coords[0], r0, g0, b0, va);
+            write_hw_vtx(&v[1], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, va);
+            write_hw_vtx(&v[2], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, va);
+            write_hw_vtx(&v[3], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, va);
+            write_hw_vtx(&v[4], x1, y1, u_coords[3], v_coords[3], r0, g0, b0, va);
+            write_hw_vtx(&v[5], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, va);
 
             mark_gpu_bbox_clipped(st, x0, y0, x1, y1,
                                   key.sc_x0, key.sc_y0, key.sc_x1, key.sc_y1);
@@ -1025,12 +1145,12 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
                 }
                 s16 xA = e0.x, yA = e0.y;
                 s16 xB = (s16)(e1.x + 1), yB = e1.y;
-                write_hw_vtx(&v[0], xA, yA,            0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[1], xB, yB,            0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[2], xA, (s16)(yA + 1), 0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[3], xB, yB,            0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[4], xB, (s16)(yB + 1), 0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[5], xA, (s16)(yA + 1), 0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
+                write_hw_vtx(&v[0], xA, yA,            0, 0, e0.r, e0.g, e0.b, 0u);
+                write_hw_vtx(&v[1], xB, yB,            0, 0, e1.r, e1.g, e1.b, 0u);
+                write_hw_vtx(&v[2], xA, (s16)(yA + 1), 0, 0, e0.r, e0.g, e0.b, 0u);
+                write_hw_vtx(&v[3], xB, yB,            0, 0, e1.r, e1.g, e1.b, 0u);
+                write_hw_vtx(&v[4], xB, (s16)(yB + 1), 0, 0, e1.r, e1.g, e1.b, 0u);
+                write_hw_vtx(&v[5], xA, (s16)(yA + 1), 0, 0, e0.r, e0.g, e0.b, 0u);
             } else {
                 if (e0.y > e1.y) {
                     GpuVertex tmp = e0;
@@ -1039,12 +1159,12 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
                 }
                 s16 xA = e0.x, yA = e0.y;
                 s16 xB = e1.x, yB = (s16)(e1.y + 1);
-                write_hw_vtx(&v[0], xA,            yA, 0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[1], (s16)(xA + 1), yA, 0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[2], xB,            yB, 0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[3], (s16)(xA + 1), yA, 0, 0, e0.r, e0.g, e0.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[4], (s16)(xB + 1), yB, 0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
-                write_hw_vtx(&v[5], xB,            yB, 0, 0, e1.r, e1.g, e1.b, 255u, HW_TEX_NONE, key.abr);
+                write_hw_vtx(&v[0], xA,            yA, 0, 0, e0.r, e0.g, e0.b, 0u);
+                write_hw_vtx(&v[1], (s16)(xA + 1), yA, 0, 0, e0.r, e0.g, e0.b, 0u);
+                write_hw_vtx(&v[2], xB,            yB, 0, 0, e1.r, e1.g, e1.b, 0u);
+                write_hw_vtx(&v[3], (s16)(xA + 1), yA, 0, 0, e0.r, e0.g, e0.b, 0u);
+                write_hw_vtx(&v[4], (s16)(xB + 1), yB, 0, 0, e1.r, e1.g, e1.b, 0u);
+                write_hw_vtx(&v[5], xB,            yB, 0, 0, e1.r, e1.g, e1.b, 0u);
             }
 
             s32 bx0 = p->v[0].x < p->v[1].x ? p->v[0].x : p->v[1].x;
@@ -1066,9 +1186,9 @@ static void emit_fill_subrect(GpuHwState *st, u16 x, u16 y, u16 w, u16 h, u8 r, 
 
     GpuHwBatchKey key;
     memset(&key, 0, sizeof(key));
-    key.tex_slot     = HW_SLOT_NONE;
-    key.tex_mode     = HW_TEX_NONE;
-    key.alpha_mode   = HW_ALPHA_OPAQUE_NOTEST;
+    key.tex_slot     = HW_SLOT_ANY;
+    key.tex_mode     = HW_TEX_ANY;
+    key.alpha_mode   = HW_ALPHA_OPAQUE_MASKED;
     key.abr          = 0u;
     key.stencil_mode = 0u; /* GP0(02h) ignores check_mask and clears mask bit */
     key.sc_x0        = 0u;
@@ -1076,17 +1196,36 @@ static void emit_fill_subrect(GpuHwState *st, u16 x, u16 y, u16 w, u16 h, u8 r, 
     key.sc_x1        = GPU_HW_VRAM_W;
     key.sc_y1        = GPU_HW_VRAM_H;
 
+    /*
+     * GP0(02h) ignores the drawing area, but a fill lying entirely inside the current
+     * drawing area renders identically under that scissor, so it can share the batch of
+     * the primitives that follow it (typical per-frame "clear + draw" sequence).
+     */
+    s32 cx0 = st->cur_env.clip_x0 < 0 ? 0 : st->cur_env.clip_x0;
+    s32 cy0 = st->cur_env.clip_y0 < 0 ? 0 : st->cur_env.clip_y0;
+    s32 cx1 = (s32)st->cur_env.clip_x1 + 1;
+    s32 cy1 = (s32)st->cur_env.clip_y1 + 1;
+    if (cx1 > (s32)GPU_HW_VRAM_W) cx1 = (s32)GPU_HW_VRAM_W;
+    if (cy1 > (s32)GPU_HW_VRAM_H) cy1 = (s32)GPU_HW_VRAM_H;
+    if ((s32)x >= cx0 && (s32)y >= cy0 &&
+        (s32)x + (s32)w <= cx1 && (s32)y + (s32)h <= cy1) {
+        key.sc_x0 = (u16)cx0;
+        key.sc_y0 = (u16)cy0;
+        key.sc_x1 = (u16)cx1;
+        key.sc_y1 = (u16)cy1;
+    }
+
     GpuHwVertex *v = alloc_batch_verts(st, &key, 6u);
     if (!v) return;
 
     s16 x0 = (s16)x, y0 = (s16)y;
     s16 x1 = (s16)(x + w), y1 = (s16)(y + h);
-    write_hw_vtx(&v[0], x0, y0, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
-    write_hw_vtx(&v[1], x1, y0, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
-    write_hw_vtx(&v[2], x0, y1, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
-    write_hw_vtx(&v[3], x1, y0, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
-    write_hw_vtx(&v[4], x1, y1, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
-    write_hw_vtx(&v[5], x0, y1, 0, 0, r, g, b, 255u, HW_TEX_NONE, 0);
+    write_hw_vtx(&v[0], x0, y0, 0, 0, r, g, b, 0u);
+    write_hw_vtx(&v[1], x1, y0, 0, 0, r, g, b, 0u);
+    write_hw_vtx(&v[2], x0, y1, 0, 0, r, g, b, 0u);
+    write_hw_vtx(&v[3], x1, y0, 0, 0, r, g, b, 0u);
+    write_hw_vtx(&v[4], x1, y1, 0, 0, r, g, b, 0u);
+    write_hw_vtx(&v[5], x0, y1, 0, 0, r, g, b, 0u);
 }
 
 static void hw_fill_rect(void *self, u16 x, u16 y, u16 w, u16 h, u32 bgr24) {
@@ -1225,11 +1364,19 @@ static bool should_skip_display(GpuHwState *st) {
     return st->skip_counter != 0u;
 }
 
+static void log_batch_diagnostics(const GpuHwState *st);
+
 static void hw_present(void *self, const GpuDisplay *d) {
     GpuHwState *st = (GpuHwState *)self;
     if (!st) {
         return;
     }
+    ++st->n_presents;
+#if defined(GPU_HW_DIAG_FILE)
+    if ((st->n_presents % 60u) == 0u) {
+        log_batch_diagnostics(st);
+    }
+#endif
 
     u16 vx   = (d && d->vram_x < GPU_HW_VRAM_W) ? d->vram_x : 0u;
     u16 vy   = (d && d->vram_y < GPU_HW_VRAM_H) ? d->vram_y : 0u;
@@ -1262,8 +1409,7 @@ static void hw_present(void *self, const GpuDisplay *d) {
     }
 
     if (!st->in_frame) {
-        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        st->in_frame = true;
+        begin_frame(st, C3D_FRAME_SYNCDRAW);
     }
 
     C3D_RenderTargetClear(st->top_rt, C3D_CLEAR_COLOR, 0x000000FFu, 0u);
@@ -1276,7 +1422,7 @@ static void hw_present(void *self, const GpuDisplay *d) {
         C3D_StencilTest(false, GPU_ALWAYS, 0, 0xFF, 0x00);
         C3D_AlphaTest(false, GPU_ALWAYS, 0);
         set_opaque_blend_state();
-        configure_tev_mode(HW_TEX_RAW);
+        configure_tev_mode(st, HW_TEX_RAW);
 
         C3D_Mtx proj_top;
         Mtx_OrthoTilt(&proj_top, 0.0f, 400.0f, 240.0f, 0.0f, -1.0f, 1.0f, true);
@@ -1307,17 +1453,18 @@ static void hw_present(void *self, const GpuDisplay *d) {
                 set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
 
                 s16 u0 = 0, v0 = 0, u1 = (s16)hres, v1 = (s16)vres;
-                write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-                write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-                write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-                write_hw_vtx(&dv[3], dx1, dy0, u1, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-                write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-                write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
+                write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255);
+                write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255);
+                write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255);
+                write_hw_vtx(&dv[3], dx1, dy0, u1, v0, 255, 255, 255, 255);
+                write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255);
+                write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255);
 
                 GSPGPU_FlushDataCache(dv, 6u * sizeof(GpuHwVertex));
                 C3D_DrawArrays(GPU_TRIANGLES, (int)st->ring_pos, 6);
                 st->ring_pos += 6u;
-                if (st->sys) st->sys->stats.gpu_batches++;
+                st->n_draw_calls++;
+            if (st->sys) st->sys->stats.gpu_batches++;
             }
         } else {
             /*
@@ -1331,16 +1478,17 @@ static void hw_present(void *self, const GpuDisplay *d) {
 
             s16 u0 = (s16)vx, v0 = (s16)vy;
             s16 u1 = (s16)(vx + hres), v1 = (s16)(vy + vres);
-            write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&dv[3], dx1, dy0, u1, v0, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
-            write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255, HW_TEX_RAW, 0);
+            write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255);
+            write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255);
+            write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255);
+            write_hw_vtx(&dv[3], dx1, dy0, u1, v0, 255, 255, 255, 255);
+            write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255);
+            write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255);
 
             GSPGPU_FlushDataCache(dv, 6u * sizeof(GpuHwVertex));
             C3D_DrawArrays(GPU_TRIANGLES, (int)st->ring_pos, 6);
             st->ring_pos += 6u;
+            st->n_draw_calls++;
             if (st->sys) st->sys->stats.gpu_batches++;
         }
     }
@@ -1356,11 +1504,37 @@ static void hw_present(void *self, const GpuDisplay *d) {
     st->has_batch_key = false;
 }
 
+static void log_batch_diagnostics(const GpuHwState *st) {
+#if defined(GPU_HW_DIAG_FILE)
+    FILE *df = fopen(GPU_HW_DIAG_FILE, "w");
+    if (df) {
+        fprintf(df, "presents=%u gpu_frames=%u draw_calls=%u scissor=%u alpha=%u abr=%u slot=%u other=%u "
+                "cpu_uploads=%u readbacks=%u stalls=%u ring_wraps=%u tex_slots=%u rgba8=%d\n",
+                (unsigned)st->n_presents, (unsigned)st->gpu_frame_id, (unsigned)st->n_draw_calls,
+                (unsigned)st->brk_scissor, (unsigned)st->brk_alpha, (unsigned)st->brk_abr,
+                (unsigned)st->brk_slot, (unsigned)st->brk_other,
+                (unsigned)st->n_cpu_upload, (unsigned)st->n_readback, (unsigned)st->n_stall,
+                (unsigned)st->n_ring_wrap, (unsigned)st->texcache.max_slots,
+                (int)st->texcache.allow_rgba8);
+        fclose(df);
+    }
+#endif
+    plat_log("[gpu_citro3d] presents=%u gpu_frames=%u draw_calls=%u breaks{scissor=%u alpha=%u abr=%u "
+             "slot=%u other=%u} cpu_uploads=%u readbacks=%u stalls=%u ring_wraps=%u tex_slots=%u rgba8=%d\n",
+             (unsigned)st->n_presents, (unsigned)st->gpu_frame_id, (unsigned)st->n_draw_calls,
+             (unsigned)st->brk_scissor, (unsigned)st->brk_alpha, (unsigned)st->brk_abr,
+             (unsigned)st->brk_slot, (unsigned)st->brk_other,
+             (unsigned)st->n_cpu_upload, (unsigned)st->n_readback, (unsigned)st->n_stall,
+             (unsigned)st->n_ring_wrap, (unsigned)st->texcache.max_slots,
+             (int)st->texcache.allow_rgba8);
+}
+
 static void hw_destroy(void *self) {
     GpuHwState *st = (GpuHwState *)self;
     if (!st) {
         return;
     }
+    log_batch_diagnostics(st);
     if (st->in_frame) {
         flush_batch(st);
         C3D_FrameEnd(0);
@@ -1377,6 +1551,10 @@ static void hw_destroy(void *self) {
     if (st->disp24_tex_ready) {
         C3D_TexDelete(&st->disp24_tex);
         st->disp24_tex_ready = false;
+    }
+    if (st->white_tex_ready) {
+        C3D_TexDelete(&st->white_tex);
+        st->white_tex_ready = false;
     }
     if (st->upload_tex_ready) {
         C3D_TexDelete(&st->upload_tex);
@@ -1460,7 +1638,7 @@ PsxResult gpu_hw_backend_create(PsxSystem *sys, const GpuBackend **be, void **se
     AttrInfo_AddLoader(&st->attr_info, 0, GPU_SHORT, 2);
     AttrInfo_AddLoader(&st->attr_info, 1, GPU_SHORT, 2);
     AttrInfo_AddLoader(&st->attr_info, 2, GPU_UNSIGNED_BYTE, 4);
-    AttrInfo_AddLoader(&st->attr_info, 3, GPU_UNSIGNED_BYTE, 4);
+    st->cur_tev = 0xFFu;
 
     for (u32 i = 0; i < GPU_HW_VTX_RING_COUNT; ++i) {
         st->vbo_ring[i] = (GpuHwVertex *)linearMemAlign(
@@ -1495,6 +1673,17 @@ PsxResult gpu_hw_backend_create(PsxSystem *sys, const GpuBackend **be, void **se
         return PSX_ERR_NOMEM;
     }
 
+    /* 8x8 opaque white texture bound by untextured-only batches */
+    if (!C3D_TexInit(&st->white_tex, 8u, 8u, GPU_RGBA5551)) {
+        hw_destroy(st);
+        return PSX_ERR_NOMEM;
+    }
+    st->white_tex_ready = true;
+    memset(st->white_tex.data, 0xFF, 8u * 8u * sizeof(u16));
+    GSPGPU_FlushDataCache(st->white_tex.data, 8u * 8u * sizeof(u16));
+    C3D_TexSetWrap(&st->white_tex, GPU_REPEAT, GPU_REPEAT);
+    C3D_TexSetFilter(&st->white_tex, GPU_NEAREST, GPU_NEAREST);
+
     st->top_rt = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, -1);
     if (!st->top_rt) {
         hw_destroy(st);
@@ -1505,7 +1694,12 @@ PsxResult gpu_hw_backend_create(PsxSystem *sys, const GpuBackend **be, void **se
     /* Unrotated 1024x512 PSX VRAM projection: z=0 maps to o_pos.z = -0.5 in [-1.0, 0.0] */
     Mtx_Ortho(&st->proj_vram, 0.0f, 1024.0f, 512.0f, 0.0f, -1.0f, 1.0f, true);
 
-    if (!gpu_texcache_init(&st->texcache, true)) {
+    /*
+     * Old 3DS (small_mem): RGBA5551-only pages (no RGBA8 MIXED split) and a 20-slot cap keep
+     * the texture cache at <= 2.5 MiB of LINEAR RAM; readback_buf / disp24_tex stay lazy.
+     */
+    if (!gpu_texcache_init(&st->texcache, !small_mem,
+                           small_mem ? GPU_HW_TEXCACHE_SLOTS_SMALL : GPU_HW_TEXCACHE_SLOTS)) {
         hw_destroy(st);
         return PSX_ERR_NOMEM;
     }

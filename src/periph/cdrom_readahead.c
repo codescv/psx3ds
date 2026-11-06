@@ -6,6 +6,25 @@
 #define CD_RA_LBA_MASK   0x00FFFFFFu
 #define CD_RA_EPOCH_STEP 0x01000000u
 
+/*
+ * cd_image_read_sector() is an fseek+fread pair on the shared image FILE*: the Core 2
+ * producer and the Core 0 miss path must never interleave inside it.
+ */
+static u32 g_cd_io_lock = 0u;
+
+static bool cd_read_sector_serialized(CdImage *img, u32 lba, u8 out_2352[2352]) {
+    u32 spins = 0u;
+    while (__atomic_exchange_n(&g_cd_io_lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        if (++spins >= 32u) {
+            plat_yield();
+            spins = 0u;
+        }
+    }
+    bool ok = cd_image_read_sector(img, lba, out_2352);
+    __atomic_store_n(&g_cd_io_lock, 0u, __ATOMIC_RELEASE);
+    return ok;
+}
+
 void cdrom_ra_init(PsxSystem *sys) {
     if (!sys) {
         return;
@@ -87,7 +106,7 @@ u32 cdrom_ra_pump(PsxSystem *sys, u32 max_sectors) {
             break;
         }
 
-        if (!cd_image_read_sector(img, lba, ra->buf[slot])) {
+        if (!cd_read_sector_serialized(img, lba, ra->buf[slot])) {
             break;
         }
         ra->lba[slot] = lba;
@@ -128,7 +147,7 @@ bool cdrom_ra_read_sector(PsxSystem *sys, u32 target_lba, u8 out_2352[2352]) {
 
     /* Cache miss: read target_lba directly and re-seed readahead at target_lba + 1 */
     sys->stats.cd_ra_misses++;
-    bool ok = cd_image_read_sector(img, target_lba, out_2352);
+    bool ok = cd_read_sector_serialized(img, target_lba, out_2352);
     if (ok && target_lba + 1u < img->total_lba) {
         cdrom_ra_seek(sys, target_lba + 1u);
     }

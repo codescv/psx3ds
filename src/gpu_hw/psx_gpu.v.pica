@@ -9,7 +9,6 @@
 .in v_pos v0
 .in v_uv  v1
 .in v_col v2
-.in v_aux v3
 
 .out o_pos position
 .out o_uv  texcoord0
@@ -24,8 +23,6 @@
     dp4 o_pos.w, proj[3], r0
     mul r1, uv_scale, v_uv
     add o_uv, uv_bias, r1
-    mul r2, consts.wwww, v_col
-    mul r3, consts.xxxx, v_aux
-    add o_col, r2, r3
+    mul o_col, consts.wwww, v_col
     end
 .end

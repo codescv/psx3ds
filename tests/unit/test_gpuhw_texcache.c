@@ -6,6 +6,8 @@
  *   4. 24bpp RGB display swizzling
  *   5. 64-slot strict LRU eviction, FNV-1a CLUT hash hits & palette-swap zero-redecode
  *   6. Dirty-rect partial & wrapped VRAM invalidation
+ *   7. Per-8x8-tile STP masks & per-primitive UV-box classification
+ *   8. Old 3DS small_mem 20-slot cap, MRU fast path & in-flight (current GPU frame) safety
  */
 
 #include "psx3ds/gpu_hw.h"
@@ -109,7 +111,7 @@ static int test_decoders_and_texwindow(u16 *vram) {
     vram[0] = 0x3210u;
     vram[(5u << 10) + 1u] = 0x0123u;
 
-    GpuTexAlphaClass cls4 = gpu_morton_decode_4bpp_8888(buf8888, vram, 0u, 0u, 0u, clut_y, NULL);
+    GpuTexAlphaClass cls4 = gpu_morton_decode_4bpp_8888(buf8888, vram, 0u, 0u, 0u, clut_y, NULL, NULL);
     CHECK(cls4 == GPU_TEX_ALPHA_MIXED, "4bpp MIXED alpha classification");
     CHECK(buf8888[gpu_morton_index(0u, 0u, 256u)] == 0x00000000u, "4bpp texel(0,0) == transparent");
     CHECK(buf8888[gpu_morton_index(1u, 0u, 256u)] == 0xFF0000FFu, "4bpp texel(1,0) == opaque red");
@@ -125,7 +127,7 @@ static int test_decoders_and_texwindow(u16 *vram) {
     /* u = 130 -> word offset 65 -> (960 + 65) & 1023 == 1! u = 131 -> high byte of word 1 */
     vram[(256u + 9u) * 1024u + 1u] = (u16)((200u << 8) | 42u);
 
-    GpuTexAlphaClass cls8 = gpu_morton_decode_8bpp_5551(buf5551, vram, 960u, 256u, 0u, 490u, NULL);
+    GpuTexAlphaClass cls8 = gpu_morton_decode_8bpp_5551(buf5551, vram, 960u, 256u, 0u, 490u, NULL, NULL);
     CHECK(cls8 == GPU_TEX_ALPHA_ALL_OPAQUE, "8bpp ALL_OPAQUE classification");
     CHECK(buf5551[gpu_morton_index(130u, 9u, 256u)] == gpu_psx_to_rgba5551(0x7C00u),
           "8bpp wrapped u=130 sample");
@@ -143,7 +145,7 @@ static int test_decoders_and_texwindow(u16 *vram) {
     }
     /* mask = 0x1E -> ~(0x1E * 8) = ~0xF0 (16px repeat); off = (2, 4) -> (16, 32) */
     GpuTexWindowKey tw = { .mask_x = 0x1Eu, .mask_y = 0x1Eu, .off_x = 0x02u, .off_y = 0x04u };
-    GpuTexAlphaClass cls15 = gpu_morton_decode_15bpp_5551(buf5551, vram, 128u, 0u, &tw);
+    GpuTexAlphaClass cls15 = gpu_morton_decode_15bpp_5551(buf5551, vram, 128u, 0u, &tw, NULL);
     CHECK(cls15 == GPU_TEX_ALPHA_ALL_STP, "15bpp ALL_STP classification");
     u16 expect_5_7 = gpu_psx_to_rgba5551((u16)(0x8000u | (7u << 5) | 5u));
     CHECK(buf5551[gpu_morton_index(5u, 7u, 256u)] == expect_5_7, "15bpp tw (5,7)");
@@ -171,7 +173,8 @@ static int test_texcache_lru_clut_and_invalidation(u16 *vram) {
     memset(&stats, 0, sizeof(stats));
     memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
 
-    CHECK(gpu_texcache_init(&tc, true), "gpu_texcache_init");
+    CHECK(gpu_texcache_init(&tc, true, 0u), "gpu_texcache_init");
+    CHECK(tc.max_slots == GPU_HW_TEXCACHE_SLOTS, "default 64 slots");
 
     /* Setup Page 0 (4bpp at 0,0) with Palette A at (0, 480) */
     u16 clut_a = (u16)(480u << 6);
@@ -283,6 +286,135 @@ static int test_texcache_lru_clut_and_invalidation(u16 *vram) {
     return 0;
 }
 
+
+static int test_tile_masks_classify(u16 *vram) {
+    u32 *buf8888 = (u32 *)malloc(GPU_HW_TEXPAGE_PIXELS * sizeof(u32));
+    u16 *buf5551 = (u16 *)malloc(GPU_HW_TEXPAGE_PIXELS * sizeof(u16));
+    GpuTexTileMasks tm, tm2;
+    CHECK(buf8888 != NULL && buf5551 != NULL, "alloc tile buffers");
+    memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+
+    /* CLUT: 0 transparent, 1 opaque red, 2 STP green, 3 STP black (0x8000) */
+    u16 clut_y = 500u;
+    vram[(clut_y << 10) + 1u] = 0x001Fu;
+    vram[(clut_y << 10) + 2u] = 0x83E0u;
+    vram[(clut_y << 10) + 3u] = 0x8000u;
+
+    /* 4bpp page at (0,0): texels u in [0,16) v in [0,8) = 1 (STP0); u in [64,72) v in [128,136) = 3 */
+    for (u32 v = 0; v < 8u; ++v) {
+        for (u32 u = 0; u < 16u; u += 4u) {
+            vram[(v << 10) + (u >> 2)] = 0x1111u;
+        }
+    }
+    for (u32 v = 128u; v < 136u; ++v) {
+        for (u32 u = 64u; u < 72u; u += 4u) {
+            vram[(v << 10) + (u >> 2)] = 0x3333u;
+        }
+    }
+    GpuTexAlphaClass cls = gpu_morton_decode_4bpp_8888(buf8888, vram, 0u, 0u, 0u, clut_y, NULL, &tm);
+    CHECK(cls == GPU_TEX_ALPHA_MIXED, "page MIXED overall");
+    CHECK(tm.stp0[0] == 0x3u && tm.stp1[0] == 0u, "row 0 tiles 0,1 STP0 only");
+    CHECK(tm.stp1[16] == (1u << 8) && tm.stp0[16] == 0u, "row 16 tile 8 STP1 (0x8000) only");
+    for (u32 r = 0; r < 32u; ++r) {
+        if (r != 0u && r != 16u) {
+            CHECK(tm.stp0[r] == 0u && tm.stp1[r] == 0u, "other rows empty");
+        }
+    }
+
+    /* Same decode via RGBA5551 path must produce identical tile masks */
+    (void)gpu_morton_decode_4bpp_5551(buf5551, vram, 0u, 0u, 0u, clut_y, NULL, &tm2);
+    CHECK(memcmp(&tm, &tm2, sizeof(tm)) == 0, "5551 & 8888 tile masks identical");
+
+    CHECK(gpu_tex_tiles_classify(&tm, 0, 0, 15, 7) == GPU_TEX_ALPHA_ALL_OPAQUE, "box over STP0 tiles");
+    CHECK(gpu_tex_tiles_classify(&tm, 64, 128, 71, 135) == GPU_TEX_ALPHA_ALL_STP, "box over STP1 tile");
+    CHECK(gpu_tex_tiles_classify(&tm, 200, 200, 230, 230) == GPU_TEX_ALPHA_ALL_OPAQUE, "empty box");
+    CHECK(gpu_tex_tiles_classify(&tm, 0, 0, 71, 135) == GPU_TEX_ALPHA_MIXED, "box spanning both");
+    CHECK(gpu_tex_tiles_classify(&tm, -20, -20, 300, 300) == GPU_TEX_ALPHA_MIXED, "full-span box");
+    /* Wrapped box u = 250..260 covers tile columns 31 and 0..0 -> STP0 tile 0 in row 0 */
+    CHECK(gpu_tex_tiles_classify(&tm, 250, 0, 260, 7) == GPU_TEX_ALPHA_ALL_OPAQUE, "wrapped u box");
+    /* Wrapped box v = 250..260 covers rows 31 and 0 -> row 0 STP0 only */
+    CHECK(gpu_tex_tiles_classify(&tm, 0, 250, 15, 260) == GPU_TEX_ALPHA_ALL_OPAQUE, "wrapped v box");
+
+    /* 15bpp + 8bpp masks */
+    memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+    vram[(9u << 10) + 512u + 17u] = 0x8001u; /* STP1 at (17, 9) of 15bpp page tp_x = 512 */
+    vram[(9u << 10) + 512u + 40u] = 0x0001u; /* STP0 at (40, 9) */
+    cls = gpu_morton_decode_15bpp_8888(buf8888, vram, 512u, 0u, NULL, &tm);
+    CHECK(cls == GPU_TEX_ALPHA_MIXED, "15bpp MIXED");
+    CHECK(tm.stp1[1] == (1u << 2) && tm.stp0[1] == (1u << 5), "15bpp tile bits");
+
+    free(buf8888);
+    free(buf5551);
+    return 0;
+}
+
+static int test_small_mem_mru_inflight(u16 *vram) {
+    GpuTexCache tc;
+    PsxStats stats;
+    bool hit = false;
+    memset(&stats, 0, sizeof(stats));
+    memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+
+    /* --- Old 3DS: 20-slot cap, RGBA5551 only --- */
+    CHECK(gpu_texcache_init(&tc, false, GPU_HW_TEXCACHE_SLOTS_SMALL), "init small_mem");
+    CHECK(tc.max_slots == 20u && !tc.allow_rgba8, "small_mem config");
+    vram[(400u << 10) + 1u] = 0x001Fu;
+    vram[(400u << 10) + 2u] = 0x8000u; /* MIXED CLUT -> still 5551 */
+    vram[0] = 0x2121u;
+    const GpuTexSlot *sm = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(400u << 6), NULL, &stats, &hit);
+    CHECK(sm != NULL && !sm->is_rgba8 && sm->pixel_bytes == GPU_HW_TEXPAGE_PIXELS * 2u,
+          "small_mem MIXED page stays RGBA5551");
+    for (u32 i = 0; i < 25u; ++i) {
+        u16 row_y = (u16)(300u + i);
+        vram[(row_y << 10) + 1u] = (u16)(0x0001u + i);
+        (void)gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(row_y << 6), NULL, &stats, &hit);
+        CHECK(!hit, "small_mem unique CLUT miss");
+    }
+    for (u32 i = 20u; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+        CHECK(!tc.slots[i].valid && tc.slots[i].pixels == NULL, "slots >= 20 never used");
+    }
+    gpu_texcache_shutdown(&tc);
+
+    /* --- MRU fast path --- */
+    memset(&stats, 0, sizeof(stats));
+    CHECK(gpu_texcache_init(&tc, true, 0u), "init full");
+    const GpuTexSlot *a = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(300u << 6), NULL, &stats, &hit);
+    const GpuTexSlot *b = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(301u << 6), NULL, &stats, &hit);
+    CHECK(a != NULL && b != NULL && a != b, "two slots");
+    CHECK(tc.mru == (u32)(b - tc.slots), "mru tracks last slot");
+    const GpuTexSlot *b2 = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(301u << 6), NULL, &stats, &hit);
+    CHECK(b2 == b && hit, "mru hit");
+    gpu_texcache_shutdown(&tc);
+
+    /* --- In-flight safety: 4-slot cache, every slot referenced in frame 7 --- */
+    memset(&stats, 0, sizeof(stats));
+    CHECK(gpu_texcache_init(&tc, true, 4u), "init 4 slots");
+    gpu_texcache_set_frame(&tc, 7u);
+    const GpuTexSlot *f[4];
+    for (u32 i = 0; i < 4u; ++i) {
+        f[i] = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)((300u + i) << 6), NULL, &stats, &hit);
+        CHECK(f[i] != NULL && f[i]->last_frame == 7u, "slot stamped with frame");
+    }
+    u32 gen0 = f[0]->decode_gen;
+    /* Texel rewrite of page 0 while frame 7 is still unsubmitted: must NOT re-decode in place */
+    vram[0] = 0x3333u;
+    gpu_texcache_invalidate_vram(&tc, 0u, 0u, 4u, 1u);
+    const GpuTexSlot *st5 = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(300u << 6), NULL, &stats, &hit);
+    CHECK(st5 == NULL && tc.stalled, "all slots in flight -> stall");
+    CHECK(f[0]->decode_gen == gen0, "in-flight slot pixels untouched");
+
+    /* Backend submits + waits -> next frame: lookup succeeds and re-decodes */
+    gpu_texcache_set_frame(&tc, 8u);
+    const GpuTexSlot *st6 = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(300u << 6), NULL, &stats, &hit);
+    CHECK(st6 != NULL && !hit && !tc.stalled && st6->last_frame == 8u, "retry after frame advance");
+
+    /* Mixed in-flight: a frame-8 slot is never chosen as victim while older ones exist */
+    const GpuTexSlot *n1 = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(310u << 6), NULL, &stats, &hit);
+    CHECK(n1 != NULL && n1 != st6, "new page avoids in-flight victim");
+    gpu_texcache_shutdown(&tc);
+    return 0;
+}
+
 int main(void) {
     u16 *vram = (u16 *)calloc(GPU_HW_VRAM_W * GPU_HW_VRAM_H, sizeof(u16));
     CHECK(vram != NULL, "calloc 1 MiB shadow VRAM");
@@ -290,7 +422,9 @@ int main(void) {
     if (test_morton_bijection() != 0 ||
         test_pixel_conversions() != 0 ||
         test_decoders_and_texwindow(vram) != 0 ||
-        test_texcache_lru_clut_and_invalidation(vram) != 0) {
+        test_texcache_lru_clut_and_invalidation(vram) != 0 ||
+        test_tile_masks_classify(vram) != 0 ||
+        test_small_mem_mru_inflight(vram) != 0) {
         free(vram);
         return 1;
     }
