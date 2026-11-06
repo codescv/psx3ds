@@ -429,6 +429,7 @@ typedef struct JitRegAlloc {
 
 void jit_regalloc_reset(void);
 void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out);
+void jit_scan_block_limit(const PsxSystem *sys, u32 start_pc, u32 max_insns, JitScanResult *out);
 void jit_ra_init(JitRegAlloc *ra, const JitScanResult *scan);
 
 /* Read MIPS GPR into an ArmReg (returns cached slot reg, or loads into fallback_scratch) */

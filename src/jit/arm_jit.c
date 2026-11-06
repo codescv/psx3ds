@@ -672,81 +672,72 @@ typedef enum BrTermKind {
     BR_INDIRECT_REG
 } BrTermKind;
 
-static JitBlock *jit_compile_internal(PsxSystem *sys, u32 start_pc, u32 depth, u32 *budget) {
-    JitState *j = &sys->jit;
-    if (!j->blocks || !j->mem.rw || !j->mem.rx || j->mem.mode == JIT_MEM_NONE) {
-        return NULL;
-    }
-    if (jit_is_pinned_pc(sys, start_pc)) {
-        return NULL;
-    }
-    bool is_ram = jit_pc_is_ram(sys, start_pc);
-    bool is_bios = !is_ram && jit_pc_is_bios(start_pc);
-    if (!is_ram && !is_bios) {
-        return NULL;
-    }
-    if (j->n_blocks >= j->max_blocks ||
-        (size_t)(j->code_end - j->code_ptr) < JIT_MAX_BLOCK_BYTES) {
-        return NULL;
-    }
+#define JIT_NOINLINE __attribute__((noinline))
 
-    JitBlock *existing = jit_find_live_block(sys, start_pc);
-    if (existing && existing->pc == start_pc) {
-        return existing;
-    }
+/* Single-threaded Core-0 compiler scratch in .bss (eliminates 16.5 KiB recursive stack frames on 3DS) */
+static JitScanResult g_scan_scratch;
+static Emitter       g_emit_scratch;
+static ColdStub      g_stubs_scratch[JIT_MAX_COLD_STUBS];
 
-    JitScanResult scan;
-    jit_scan_block(sys, start_pc, &scan);
-    if (scan.ends_step_one) {
-        return NULL;
+static JIT_NOINLINE bool jit_prescan_eager_targets(const PsxSystem *sys, u32 start_pc,
+                                                   u16 out_pages[2], u32 out_targets[2],
+                                                   u32 *out_n_targets) {
+    *out_n_targets = 0u;
+    jit_scan_block(sys, start_pc, &g_scan_scratch);
+    if (g_scan_scratch.ends_step_one) {
+        return false;
     }
+    out_pages[0] = g_scan_scratch.ram_pages[0];
+    out_pages[1] = g_scan_scratch.ram_pages[1];
 
-    /* Eagerly compile intra-page static branch targets BEFORE emitting this block
-     * so forward if/else diamonds and helper calls direct-link in 1 instruction! */
-    if (scan.has_branch && !scan.ends_unlinked &&
-        (scan.block_flags & JB_ENDS_LOAD_DS) == 0u && scan.n_insns >= 2u) {
-        const JitDecodedInsn *br = &scan.insns[scan.n_insns - 2u];
+    if (g_scan_scratch.has_branch && !g_scan_scratch.ends_unlinked &&
+        (g_scan_scratch.block_flags & JB_ENDS_LOAD_DS) == 0u &&
+        g_scan_scratch.n_insns >= 2u) {
+        const JitDecodedInsn *br = &g_scan_scratch.insns[g_scan_scratch.n_insns - 2u];
         u32 br_op = br->raw >> 26;
         u32 simm = (u32)(s32)(s16)(br->raw & 0xFFFFu);
         if (br_op == 0x02u || br_op == 0x03u) {
-            u32 tgt = ((br->pc + 4u) & 0xF0000000u) | ((br->raw & 0x03FFFFFFu) << 2);
-            jit_try_eager_target(sys, start_pc, scan.ram_pages, tgt, depth, budget);
+            out_targets[0] = ((br->pc + 4u) & 0xF0000000u) | ((br->raw & 0x03FFFFFFu) << 2);
+            *out_n_targets = 1u;
         } else if (br_op == 0x01u || (br_op >= 0x04u && br_op <= 0x07u)) {
-            u32 tgt_t = (br->pc + 4u) + (simm << 2);
-            u32 tgt_f = br->pc + 8u;
-            jit_try_eager_target(sys, start_pc, scan.ram_pages, tgt_t, depth, budget);
-            jit_try_eager_target(sys, start_pc, scan.ram_pages, tgt_f, depth, budget);
+            out_targets[0] = (br->pc + 4u) + (simm << 2);
+            out_targets[1] = br->pc + 8u;
+            *out_n_targets = 2u;
         }
-    } else if (!scan.has_branch && !scan.ends_unlinked) {
-        u32 last_raw = scan.insns[scan.n_insns - 1u].raw;
+    } else if (!g_scan_scratch.has_branch && !g_scan_scratch.ends_unlinked &&
+               (g_scan_scratch.block_flags & JB_ENDS_LOAD_DS) == 0u &&
+               g_scan_scratch.n_insns >= 1u) {
+        u32 last_raw = g_scan_scratch.insns[g_scan_scratch.n_insns - 1u].raw;
         bool is_trap = ((last_raw >> 26) == 0u) &&
                        (((last_raw & 63u) == 0x0Cu) || ((last_raw & 63u) == 0x0Du));
         if (!is_trap) {
-            u32 ft = start_pc + scan.n_insns * 4u;
-            jit_try_eager_target(sys, start_pc, scan.ram_pages, ft, depth, budget);
+            out_targets[0] = start_pc + g_scan_scratch.n_insns * 4u;
+            *out_n_targets = 1u;
         }
     }
+    return true;
+}
 
-    /* Re-verify space after any eager child compilations */
-    if (j->n_blocks >= j->max_blocks ||
-        (size_t)(j->code_end - j->code_ptr) < JIT_MAX_BLOCK_BYTES) {
+static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_pc,
+                                                     bool is_ram, u32 max_insns) {
+    JitState *j = &sys->jit;
+    jit_scan_block_limit(sys, start_pc, max_insns, &g_scan_scratch);
+    if (g_scan_scratch.ends_step_one) {
         return NULL;
     }
-    existing = jit_find_live_block(sys, start_pc);
-    if (existing && existing->pc == start_pc) {
-        return existing;
-    }
+
+#define scan  g_scan_scratch
+#define e     g_emit_scratch
+#define stubs g_stubs_scratch
 
     u8 *rw_begin = j->code_ptr;
     ptrdiff_t rw_to_rx = j->mem.rx - j->mem.rw;
 
-    Emitter e;
     arm_emit_reset_dual(&e, rw_begin, rw_to_rx, JIT_MAX_BLOCK_BYTES);
 
     JitRegAlloc ra;
     jit_ra_init(&ra, &scan);
 
-    ColdStub stubs[JIT_MAX_COLD_STUBS];
     u32 n_stubs = 0u;
 
     u16 lbl_seg_mismatch = arm_label_create(&e);
@@ -1759,6 +1750,80 @@ emit_tails:
     sys->stats.jit_code_bytes = (u32)(j->code_ptr - j->mem.rw);
 
     return b;
+
+#undef stubs
+#undef e
+#undef scan
+}
+
+static JIT_NOINLINE JitBlock *jit_emit_block_leaf(PsxSystem *sys, u32 start_pc, bool is_ram) {
+    u32 max_insns = JIT_MAX_BLOCK_INSNS;
+    for (;;) {
+        JitBlock *b = jit_emit_block_one_try(sys, start_pc, is_ram, max_insns);
+        if (b) {
+            return b;
+        }
+        if (g_scan_scratch.ends_step_one) {
+            return NULL;
+        }
+        u32 min_insns = g_scan_scratch.has_branch ? 2u : 1u;
+        if (g_scan_scratch.n_insns <= min_insns) {
+            return NULL;
+        }
+        max_insns = g_scan_scratch.n_insns / 2u;
+        if (max_insns < min_insns) {
+            max_insns = min_insns;
+        }
+    }
+}
+
+static JIT_NOINLINE JitBlock *jit_compile_internal(PsxSystem *sys, u32 start_pc, u32 depth, u32 *budget) {
+    JitState *j = &sys->jit;
+    if (!j->blocks || !j->mem.rw || !j->mem.rx || j->mem.mode == JIT_MEM_NONE) {
+        return NULL;
+    }
+    if (jit_is_pinned_pc(sys, start_pc)) {
+        return NULL;
+    }
+    bool is_ram = jit_pc_is_ram(sys, start_pc);
+    bool is_bios = !is_ram && jit_pc_is_bios(start_pc);
+    if (!is_ram && !is_bios) {
+        return NULL;
+    }
+    if (j->n_blocks >= j->max_blocks ||
+        (size_t)(j->code_end - j->code_ptr) < JIT_MAX_BLOCK_BYTES) {
+        return NULL;
+    }
+
+    JitBlock *existing = jit_find_live_block(sys, start_pc);
+    if (existing && existing->pc == start_pc) {
+        return existing;
+    }
+
+    u16 parent_pages[2] = { JIT_PAGE_NONE, JIT_PAGE_NONE };
+    u32 eager_targets[2] = { 0u, 0u };
+    u32 n_eager = 0u;
+    if (!jit_prescan_eager_targets(sys, start_pc, parent_pages, eager_targets, &n_eager)) {
+        return NULL;
+    }
+
+    /* Eagerly compile intra-page static branch targets BEFORE emitting this block
+     * so forward if/else diamonds and helper calls direct-link in 1 instruction! */
+    for (u32 k = 0u; k < n_eager; ++k) {
+        jit_try_eager_target(sys, start_pc, parent_pages, eager_targets[k], depth, budget);
+    }
+
+    /* Re-verify space after any eager child compilations */
+    if (j->n_blocks >= j->max_blocks ||
+        (size_t)(j->code_end - j->code_ptr) < JIT_MAX_BLOCK_BYTES) {
+        return NULL;
+    }
+    existing = jit_find_live_block(sys, start_pc);
+    if (existing && existing->pc == start_pc) {
+        return existing;
+    }
+
+    return jit_emit_block_leaf(sys, start_pc, is_ram);
 }
 
 /* ============================================================================
@@ -1881,6 +1946,9 @@ void jit_run(PsxSystem *sys) {
 
         int rc = jit_enter(c);
         c->in_jit = 0u;
+        if (c->in_delay_slot == 0u) {
+            c->next_pc = c->pc + 4u;
+        }
 
         if (rc == PSX_EXIT_STEP_ONE) {
             if (c->cycles_left > 0 && !sys->quit && !sys->frame_done) {

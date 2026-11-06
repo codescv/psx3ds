@@ -1633,7 +1633,7 @@ static void stub_step_one_impl(PsxSystem *sys) {
     u32 cur_btaken = c->branch_taken;
 
     u32 op_pc = pc;
-    u32 next_pc = cur_ds ? (cur_btaken ? cur_bt : c->next_pc) : (pc + 4u);
+    u32 next_pc = cur_ds ? (cur_btaken ? cur_bt : c->next_pc) : c->next_pc;
 
     u32 insn = jit_fetch32_wrap(c, op_pc);
     if (c->pc != op_pc) {
@@ -2017,11 +2017,17 @@ static void stub_step_one_impl(PsxSystem *sys) {
     c->load_delay_reg = (new_ld_reg != 0u) ? new_ld_reg : 0u;
     c->load_delay_val = (new_ld_reg != 0u) ? new_ld_val : 0u;
     c->pc = next_pc;
+    if (c->in_delay_slot == 0u) {
+        c->next_pc = next_pc + 4u;
+    }
 }
 
 void jit_step_one_wrap(PsxSystem *sys) {
     if (!sys) {
         return;
+    }
+    if (sys->cpu.in_delay_slot == 0u) {
+        sys->cpu.next_pc = sys->cpu.pc + 4u;
     }
     sys->stats.step_one_fallbacks++;
     if (!jit_core_is_stub()) {
@@ -2034,6 +2040,9 @@ void jit_step_one_wrap(PsxSystem *sys) {
 void jit_step_until_clean_wrap(PsxSystem *sys) {
     if (!sys) {
         return;
+    }
+    if (sys->cpu.in_delay_slot == 0u) {
+        sys->cpu.next_pc = sys->cpu.pc + 4u;
     }
     if (!jit_core_is_stub()) {
         sys->stats.step_one_fallbacks++;
@@ -2739,6 +2748,7 @@ void cpu_cached_run(PsxSystem *sys) {
                     sys->stats.idle_skips++;
                     c->gpr[op->rt] = 0u;
                     c->pc = b->pc + 12u;
+                    c->next_pc = c->pc + 4u;
                     continue;
                 }
             }
@@ -3405,5 +3415,8 @@ void cpu_cached_run(PsxSystem *sys) {
 #undef CACHED_FAULT
 #undef CACHED_DISPATCH
 
+    if (c->in_delay_slot == 0u) {
+        c->next_pc = c->pc + 4u;
+    }
     c->exit_reason = PSX_EXIT_EVENTS;
 }

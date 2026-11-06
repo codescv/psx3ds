@@ -134,14 +134,27 @@ static bool scan_insn_reads_gpr(u32 insn, u32 reg) {
     return (rs == reg) || (rt == reg);
 }
 
-static u32 scan_estimate_arm_words(u32 insn) {
+static u32 scan_estimate_arm_words(const PsxSystem *sys, u32 start_pc, u32 insn) {
     u32 op = insn >> 26;
     u32 rs = (insn >> 21) & 31u;
+    u32 fn = insn & 63u;
     if (op == 0x12u && (rs & 0x10u) != 0u) {
         return 240u; /* Inline RTPT/MVMVA worst-case + overflow stubs + literals */
     }
     if (op >= 0x20u && op <= 0x3Bu) {
-        return 32u;  /* Fastmem + slow_stub + abort_stub */
+        /* KUSEG / jit_check_kuc loads & stores emit fastmem + KUc/align STUB_EXC +
+         * STUB_MEM_LOAD/STORE + abort_tail + literals (~52-60 ARM words worst-case) */
+        if (start_pc < 0x80000000u || sys->cfg.jit_check_kuc) {
+            return 64u;
+        }
+        return 48u;
+    }
+    if (op == 0x08u || (op == 0x00u && (fn == 0x20u || fn == 0x22u))) {
+        return 26u; /* ADDI / ADD / SUB emit overflow STUB_EXC */
+    }
+    if ((op >= 0x10u && op <= 0x13u) ||
+        (op == 0x00u && (fn == 0x1Au || fn == 0x1Bu))) {
+        return 24u; /* COP0..COP3 moves/checks & DIV/DIVU helper calls */
     }
     return 10u;
 }
@@ -459,37 +472,51 @@ static void scan_propagate_insn(const PsxSystem *sys, JitDecodedInsn *dec,
     kval[0] = 0u;
 }
 
-/* Peek static branch targets when delay slot is a load (ARCHITECTURE.md §5.7) */
-static void scan_check_ds_load(const PsxSystem *sys, JitScanResult *out) {
-    if (!out->has_branch || out->n_insns < 2u) {
+/* Peek static branch or fallthrough targets when block ends with a pending load (ARCHITECTURE.md §5.7) */
+static void scan_check_ds_load(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
+    if (out->n_insns == 0u) {
         return;
     }
-    const JitDecodedInsn *br = &out->insns[out->n_insns - 2u];
-    const JitDecodedInsn *ds = &out->insns[out->n_insns - 1u];
 
     u32 ld_rt = 0u;
-    if (!scan_is_delayed_load(ds->raw, &ld_rt) || ld_rt == 0u) {
-        return;
-    }
-
-    u32 op = br->raw >> 26;
-    if (op == 0u || out->ends_unlinked) {
-        /* JR / JALR or RFE/MTC0: indirect / unlinked target -> must preserve load_delay */
-        out->block_flags |= JB_ENDS_LOAD_DS;
-        return;
-    }
-
-    u32 simm = (u32)(s32)(s16)(br->raw & 0xFFFFu);
     u32 targets[2];
     u32 n_targets = 0u;
 
-    if (op == 0x02u || op == 0x03u) { /* J / JAL */
-        targets[0] = ((br->pc + 4u) & 0xF0000000u) | ((br->raw & 0x03FFFFFFu) << 2);
-        n_targets = 1u;
+    if (out->has_branch) {
+        if (out->n_insns < 2u) {
+            return;
+        }
+        const JitDecodedInsn *br = &out->insns[out->n_insns - 2u];
+        const JitDecodedInsn *ds = &out->insns[out->n_insns - 1u];
+        if (!scan_is_delayed_load(ds->raw, &ld_rt) || ld_rt == 0u) {
+            return;
+        }
+        u32 op = br->raw >> 26;
+        if (op == 0u || out->ends_unlinked) {
+            /* JR / JALR or RFE/MTC0: indirect / unlinked target -> must preserve load_delay */
+            out->block_flags |= JB_ENDS_LOAD_DS;
+            return;
+        }
+        u32 simm = (u32)(s32)(s16)(br->raw & 0xFFFFu);
+        if (op == 0x02u || op == 0x03u) { /* J / JAL */
+            targets[0] = ((br->pc + 4u) & 0xF0000000u) | ((br->raw & 0x03FFFFFFu) << 2);
+            n_targets = 1u;
+        } else {
+            targets[0] = (br->pc + 4u) + (simm << 2);
+            targets[1] = br->pc + 8u;
+            n_targets = 2u;
+        }
     } else {
-        targets[0] = (br->pc + 4u) + (simm << 2);
-        targets[1] = br->pc + 8u;
-        n_targets = 2u;
+        const JitDecodedInsn *last = &out->insns[out->n_insns - 1u];
+        if (!scan_is_delayed_load(last->raw, &ld_rt) || ld_rt == 0u) {
+            return;
+        }
+        if (out->ends_unlinked) {
+            out->block_flags |= JB_ENDS_LOAD_DS;
+            return;
+        }
+        targets[0] = start_pc + out->n_insns * 4u;
+        n_targets = 1u;
     }
 
     u16 trial_pages[2] = { out->ram_pages[0], out->ram_pages[1] };
@@ -648,7 +675,12 @@ static void scan_detect_loops(const PsxSystem *sys, u32 start_pc, JitScanResult 
     out->block_flags |= JB_IDLE_LOOP;
 }
 
-void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
+void jit_scan_block_limit(const PsxSystem *sys, u32 start_pc, u32 max_insns, JitScanResult *out) {
+    if (max_insns == 0u) {
+        max_insns = 1u;
+    } else if (max_insns > JIT_MAX_BLOCK_INSNS) {
+        max_insns = JIT_MAX_BLOCK_INSNS;
+    }
     memset(out, 0, sizeof(*out));
     out->ram_pages[0] = JIT_PAGE_NONE;
     out->ram_pages[1] = JIT_PAGE_NONE;
@@ -668,7 +700,7 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
     }
 
     u32 est_words = 32u;
-    for (u32 i = 0u; i < JIT_MAX_BLOCK_INSNS; ++i) {
+    for (u32 i = 0u; i < max_insns; ++i) {
         u32 cur_pc = start_pc + i * 4u;
         if (i > 0u && jit_is_pinned_pc(sys, cur_pc)) {
             break;
@@ -689,7 +721,7 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
             break;
         }
 
-        u32 cost = scan_estimate_arm_words(insn);
+        u32 cost = scan_estimate_arm_words(sys, start_pc, insn);
         if (i > 0u && (est_words + cost > 700u)) {
             break;
         }
@@ -708,8 +740,9 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
             bool ds_region_ok = start_is_ram
                 ? (jit_pc_is_ram(sys, ds_pc) && !jit_is_pinned_pc(sys, ds_pc))
                 : jit_pc_is_bios(ds_pc);
+            bool ds_limit_ok = (i == 0u) ? (i + 1u < JIT_MAX_BLOCK_INSNS) : (i + 1u < max_insns);
             u32 ds_insn = 0u;
-            if (!ds_region_ok || (i + 1u >= JIT_MAX_BLOCK_INSNS) || !scan_peek32(sys, ds_pc, &ds_insn)) {
+            if (!ds_region_ok || !ds_limit_ok || !scan_peek32(sys, ds_pc, &ds_insn)) {
                 if (i == 0u) {
                     out->ends_step_one = true;
                     out->n_insns = 1u;
@@ -726,8 +759,8 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
                 break;
             }
 
-            u32 ds_cost = scan_estimate_arm_words(ds_insn);
-            if (i > 0u && (est_words + cost + ds_cost > 920u)) {
+            u32 ds_cost = scan_estimate_arm_words(sys, start_pc, ds_insn);
+            if (i > 0u && (est_words + cost + ds_cost > 820u)) {
                 break;
             }
 
@@ -824,8 +857,8 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
     out->n_mem_ops = mem_ops;
     out->total_cycles = jit_scale_cycles(&sys->cfg, out->n_insns, mem_ops);
 
-    /* Check delay-slot load target safety & loop skipping */
-    scan_check_ds_load(sys, out);
+    /* Check delay-slot / fallthrough load target safety & loop skipping */
+    scan_check_ds_load(sys, start_pc, out);
     scan_detect_loops(sys, start_pc, out);
 
     /* Pass 2: Rank top-7 MIPS GPRs (1..31) by score = reads + 2 * writes */
@@ -849,6 +882,10 @@ void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
         out->slot_to_mips[s] = (s8)best_reg;
         out->mips_to_slot[best_reg] = (s8)s;
     }
+}
+
+void jit_scan_block(const PsxSystem *sys, u32 start_pc, JitScanResult *out) {
+    jit_scan_block_limit(sys, start_pc, JIT_MAX_BLOCK_INSNS, out);
 }
 
 /* ============================================================================
