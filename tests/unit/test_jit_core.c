@@ -533,6 +533,30 @@ static int test_block_cache_lifecycle(PsxSystem *sys) {
                "tab_ram reset to jit_compile_stub");
 
     jit_flush_all(sys);
+
+    /* Verify append-only flush on HLE Dynarmic (JIT_MEM_RWX_INPLACE && !luma_icache_svc) */
+    if (sys->jit.mem.size >= 0x200000u) {
+        JitMemMode saved_mode = sys->jit.mem.mode;
+        bool saved_luma = sys->jit.mem.luma_icache_svc;
+        sys->jit.mem.mode = JIT_MEM_RWX_INPLACE;
+        sys->jit.mem.luma_icache_svc = false;
+
+        sys->jit.code_ptr = sys->jit.mem.rw + 100u;
+        jit_flush_all(sys);
+        CHECK_TRUE(sys->jit.code_ptr == sys->jit.mem.rw + 128u,
+                   "RWX_INPLACE(!luma) flush advances code_ptr to 32B boundary when >=1 MiB free");
+        CHECK_TRUE(sys->stats.jit_code_bytes == 128u,
+                   "stats.jit_code_bytes matches append-only code_ptr offset");
+
+        sys->jit.code_ptr = sys->jit.code_end - 0x80000u; /* < 1 MiB headroom */
+        jit_flush_all(sys);
+        CHECK_TRUE(sys->jit.code_ptr == sys->jit.mem.rw && sys->stats.jit_code_bytes == 0u,
+                   "RWX_INPLACE(!luma) flush rewinds to mem.rw when <1 MiB free");
+
+        sys->jit.mem.mode = saved_mode;
+        sys->jit.mem.luma_icache_svc = saved_luma;
+        jit_flush_all(sys);
+    }
     return 0;
 }
 

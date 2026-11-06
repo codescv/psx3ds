@@ -189,7 +189,17 @@ void jit_flush_all(PsxSystem *sys) {
     }
 
     j->n_blocks = 0u;
-    j->code_ptr = j->mem.rw;
+    if (j->mem.mode == JIT_MEM_RWX_INPLACE && !j->mem.luma_icache_svc &&
+        j->code_ptr != NULL && j->code_end > j->code_ptr) {
+        u8 *aligned = (u8 *)(((uintptr_t)j->code_ptr + 31u) & ~(uintptr_t)31u);
+        if (j->code_end > aligned && (size_t)(j->code_end - aligned) >= 0x100000u) {
+            j->code_ptr = aligned;
+        } else {
+            j->code_ptr = j->mem.rw;
+        }
+    } else {
+        j->code_ptr = j->mem.rw;
+    }
     j->generation++;
 
     void *stub = (void *)jit_compile_stub;
@@ -211,7 +221,9 @@ void jit_flush_all(PsxSystem *sys) {
     }
 
     sys->stats.jit_blocks_live = 0u;
-    sys->stats.jit_code_bytes = 0u;
+    sys->stats.jit_code_bytes = (j->mem.rw && j->code_ptr >= j->mem.rw)
+                                    ? (u32)(j->code_ptr - j->mem.rw)
+                                    : 0u;
     sys->stats.jit_flushes++;
     sys->stats.jit_mem_mode = (u32)j->mem.mode;
 }
