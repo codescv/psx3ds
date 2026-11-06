@@ -334,6 +334,13 @@ void jit_flush_all(PsxSystem *sys) {
         if (j->code_end > aligned && (size_t)(j->code_end - aligned) >= 0x100000u) {
             j->code_ptr = aligned;
         } else {
+            /* Out of never-executed space. Rewinding over bytes that once held executed
+             * native code would let an HLE host (Azahar/Dynarmic) run stale translations,
+             * so retire native code; cached-interpreter blocks are plain data. */
+            if (j->native_emitted != 0u && j->native_exhausted == 0u) {
+                j->native_exhausted = 1u;
+                plat_log("[jit] RWX_INPLACE code space exhausted: native JIT -> cached interpreter\n");
+            }
             j->code_ptr = j->mem.rw;
         }
     } else {

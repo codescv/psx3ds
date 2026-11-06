@@ -60,6 +60,11 @@ typedef struct JitState {
     u8           *code_ptr;
     u8           *code_end;
     u32           generation;
+    /* Sticky: HLE RWX_INPLACE (no icache SVC) ran out of append-only code space;
+     * rewinding would execute stale host translations, so native JIT is retired
+     * and jit_run() delegates to the cached interpreter (data-only buffer reuse). */
+    u32           native_exhausted;
+    u32           native_emitted;   /* sticky: >= 1 native ARM block was ever committed */
     /* Sub-page SMC filter: bit k of page_code_mask[p] set => some live (or recently
      * killed) block's guest code / peeked target word lies in 64-byte line k of
      * 4 KiB physical RAM page p. Conservative superset; cleared on page wipe. */
