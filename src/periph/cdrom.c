@@ -630,7 +630,7 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
                 cd->cur_lba = cd->seek_lba;
                 cd->state   = CD_STATE_IDLE;
                 if (cd_disc_present(cd) && cd->cur_lba < cd->img->total_lba) {
-                    if (cd_image_read_sector(cd->img, cd->cur_lba, cd->sector)) {
+                    if (cdrom_ra_peek_or_read_sector(sys, cd->cur_lba, cd->sector)) {
                         const CdTrack *t = cd_image_find_track(cd->img, cd->cur_lba);
                         if (!t || t->mode != CD_TRACK_AUDIO_2352) {
                             memcpy(cd->img->last_header, &cd->sector[12], 8u);

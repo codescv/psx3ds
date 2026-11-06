@@ -209,6 +209,7 @@ void cdrom_ra_init(PsxSystem *sys);
 void cdrom_ra_reset(PsxSystem *sys);
 void cdrom_ra_seek(PsxSystem *sys, u32 target_lba);
 bool cdrom_ra_read_sector(PsxSystem *sys, u32 target_lba, u8 out_2352[2352]);
+bool cdrom_ra_peek_or_read_sector(PsxSystem *sys, u32 target_lba, u8 out_2352[2352]);
 u32  cdrom_ra_pump(PsxSystem *sys, u32 max_sectors);
 
 u32  cdrom_mmio_read(PsxSystem *sys, u32 addr, u32 width);

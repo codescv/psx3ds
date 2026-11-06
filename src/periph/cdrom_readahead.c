@@ -154,6 +154,32 @@ bool cdrom_ra_read_sector(PsxSystem *sys, u32 target_lba, u8 out_2352[2352]) {
     return ok;
 }
 
+/*
+ * Consumer (Core 0 SeekL header latch): read target_lba without popping it from the SPSC
+ * readahead ring (so a following ReadN at target_lba stays a cache hit) and serialize any
+ * underlying FILE* seek+read against Core 2 cdrom_ra_pump().
+ */
+bool cdrom_ra_peek_or_read_sector(PsxSystem *sys, u32 target_lba, u8 out_2352[2352]) {
+    if (!sys || !out_2352) {
+        return false;
+    }
+    CdImage     *img = sys->cdrom.img;
+    CdReadahead *ra  = &sys->cdrom.ra;
+    if (!img || !img->loaded) {
+        memset(out_2352, 0, 2352u);
+        return false;
+    }
+
+    u32 slot = 0u;
+    if (ra->buf && ra->lba && ra->cap > 0u &&
+        spsc_begin_pop(&ra->head, &ra->tail, ra->cap, &slot) &&
+        ra->lba[slot] == target_lba) {
+        memcpy(out_2352, ra->buf[slot], 2352u);
+        return true;
+    }
+    return cd_read_sector_serialized(img, target_lba, out_2352);
+}
+
 void cdrom_readahead_thread(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
     if (!sys) {
