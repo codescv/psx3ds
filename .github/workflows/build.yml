@@ -70,12 +70,15 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl unzip tar xz-utils cmake ninja-build python3 zip
-          (dkp-pacman -Syu --noconfirm --needed \
-            3ds-dev 3ds-pkg-config 3ds-cmake \
-            3ds-zlib 3ds-xz 3ds-zstd 3ds-flac || \
-           pacman -Syu --noconfirm --needed \
-            3ds-dev 3ds-pkg-config 3ds-cmake \
-            3ds-zlib 3ds-xz 3ds-zstd 3ds-flac)
+          PM="$(command -v dkp-pacman || command -v pacman)"
+          "$PM" -Sy --noconfirm
+          "$PM" -S --noconfirm --needed \
+            libctru citro3d 3dstools picasso 3ds-cmake 3ds-pkg-config 3ds-zlib 3ds-flac
+          for pkg in 3ds-libzstd 3ds-zstd 3ds-liblzma 3ds-lzma 3ds-xz; do
+            if "$PM" -Si "$pkg" >/dev/null 2>&1; then
+              "$PM" -S --noconfirm --needed "$pkg" || true
+            fi
+          done
 
           tmpd="$(mktemp -d)"
           curl -fsSL -o "$tmpd/makerom.zip" \
