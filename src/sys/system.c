@@ -248,7 +248,16 @@ PsxResult psx_system_init(PsxSystem *sys, const PsxConfig *cfg) {
     }
 #endif
 
+    if (sys->cfg.small_mem && sys->cfg.jit_max_blocks > 32768u) {
+        sys->cfg.jit_max_blocks = 32768u;
+    }
+
     u32 arena_bytes = sys->cfg.small_mem ? PSX_ARENA_BYTES_O3DS : PSX_ARENA_BYTES_FULL;
+    if (sizeof(void *) > 4u) {
+        /* 64-bit host pointer tables (fm_r, fm_w, fm_w_isc_null, tab_ram, tab_bios, ibtc)
+         * are 2x wider than 32-bit ARM11v6K/3DS targets. */
+        arena_bytes += 20u * 1024u * 1024u;
+    }
     PsxResult arc = arena_init(&sys->arena, arena_bytes);
 #if PSX3DS_PLATFORM_3DS
     if (arc != PSX_OK && arena_bytes > PSX_ARENA_BYTES_MID) {

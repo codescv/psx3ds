@@ -57,7 +57,7 @@ if(PSX3DS_IS_3DS)
     # T1: Nintendo 3DS (.elf / .3dsx)
     set(PSX3DS_TARGET_C_FLAGS
         -O3
-        -flto
+        -flto=auto
         -fomit-frame-pointer
         -mfpu=vfpv2
         -marm
@@ -68,7 +68,7 @@ if(PSX3DS_IS_3DS)
         -marm
     )
     set(PSX3DS_TARGET_LINK_FLAGS
-        -flto
+        -flto=auto
         -Wl,--gc-sections
     )
     set(PSX3DS_TARGET_LIBS citro3d ctru m)
