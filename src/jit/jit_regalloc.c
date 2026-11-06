@@ -131,6 +131,16 @@ static bool scan_insn_reads_gpr(u32 insn, u32 reg) {
     }
     u32 rs = (insn >> 21) & 31u;
     u32 rt = (insn >> 16) & 31u;
+    if (op >= 0x10u && op <= 0x13u) {
+        /* COPz: only MTCz / CTCz read GPR rt; MFCz / CFCz to the same rt cancel the
+         * pending load (treated as a conflict, conservatively). COPz commands (e.g. GTE
+         * RTPT/NCDS: bits 25..16 are sf/mx/vx/cv opcode fields, NOT registers), BCzF/T
+         * and RFE touch no GPR at all. */
+        return (rs == 0x00u || rs == 0x02u || rs == 0x04u || rs == 0x06u) && (rt == reg);
+    }
+    if (op >= 0x30u) { /* LWCz / SWCz: base rs only (rt names a coprocessor register) */
+        return rs == reg;
+    }
     return (rs == reg) || (rt == reg);
 }
 
@@ -139,7 +149,8 @@ static u32 scan_estimate_arm_words(const PsxSystem *sys, u32 start_pc, u32 insn)
     u32 rs = (insn >> 21) & 31u;
     u32 fn = insn & 63u;
     if (op == 0x12u && (rs & 0x10u) != 0u) {
-        return 240u; /* Inline RTPT/MVMVA worst-case + overflow stubs + literals */
+        /* Inline GTE kernel worst-case (NCDT/NCCT/RTPT up to ~600 words) or C helper call */
+        return sys->cfg.jit_inline_gte ? jit_gte_inline_words(insn) : 24u;
     }
     if (op >= 0x20u && op <= 0x3Bu) {
         /* KUSEG / jit_check_kuc loads & stores emit fastmem + KUc/align STUB_EXC +
@@ -981,6 +992,17 @@ void jit_ra_flush_dirty(Emitter *e, JitRegAlloc *ra) {
 
 void jit_ra_spill_and_invalidate_all(Emitter *e, JitRegAlloc *ra) {
     for (u32 s = 0u; s < JIT_NUM_SLOTS; ++s) {
+        if (ra->slot_to_mips[s] > 0 && ra->state[s] == SLOT_DIRTY) {
+            u32 mips_reg = (u32)ra->slot_to_mips[s];
+            emit_str_imm(e, ARM_CC_AL, k_jit_slot_regs[s], JIT_REG_CPU,
+                         (s32)(PSX_OFF_GPR + mips_reg * 4u));
+        }
+        ra->state[s] = SLOT_UNLOADED;
+    }
+}
+
+void jit_ra_spill_and_invalidate_r4_r8(Emitter *e, JitRegAlloc *ra) {
+    for (u32 s = 0u; s < 5u; ++s) {
         if (ra->slot_to_mips[s] > 0 && ra->state[s] == SLOT_DIRTY) {
             u32 mips_reg = (u32)ra->slot_to_mips[s];
             emit_str_imm(e, ARM_CC_AL, k_jit_slot_regs[s], JIT_REG_CPU,

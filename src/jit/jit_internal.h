@@ -85,6 +85,8 @@ static inline u16 jit_scale_cycles(const PsxConfig *cfg, u32 n_insns, u32 n_mem_
 void jit_purge_ibtc(JitState *j);
 void jit_refresh_pins(PsxSystem *sys);
 bool jit_block_add_ram_page(PsxSystem *sys, u16 block_idx, u16 phys_page);
+/* Register a freshly built block's guest code lines in the sub-page SMC filter */
+void jit_block_mark_code(PsxSystem *sys, const JitBlock *b);
 
 /*
  * Core-stub compatibility layer (implemented in cpu_cached.c, compiled on all targets):

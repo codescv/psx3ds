@@ -446,12 +446,18 @@ void   jit_ra_emit_mask_spill(Emitter *e, const JitRegAlloc *ra, u8 dirty_mask);
 void   jit_ra_flush_dirty(Emitter *e, JitRegAlloc *ra);
 /* Spill all DIRTY slots AND mark ALL 7 slots UNLOADED (mandatory before inline GTE!) */
 void   jit_ra_spill_and_invalidate_all(Emitter *e, JitRegAlloc *ra);
+/* Spill DIRTY r4-r8 slots (0..4) and mark them UNLOADED; r12 / lr slots stay live (inline GTE) */
+void   jit_ra_spill_and_invalidate_r4_r8(Emitter *e, JitRegAlloc *ra);
 
 /* ============================================================================
  * Inline ARM11v6K GTE Emitter & Assembly Thunks (jit_gte.c, jit_thunks.S)
  * ============================================================================ */
 
 bool jit_emit_gte_inline(Emitter *e, u32 opcode);
+/* True iff jit_emit_gte_inline() would emit an inline kernel for this COP2 command */
+bool jit_can_inline_gte(u32 opcode);
+/* Worst-case ARM words emitted for a COP2 command (inline kernel or C helper call) */
+u32  jit_gte_inline_words(u32 opcode);
 void jit_emit_mfc2_inline(Emitter *e, u32 gte_reg, ArmReg dst);
 void jit_emit_cfc2_inline(Emitter *e, u32 gte_reg, ArmReg dst);
 void jit_emit_mtc2_inline(Emitter *e, u32 gte_reg, ArmReg src);
