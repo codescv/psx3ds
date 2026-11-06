@@ -60,6 +60,10 @@ typedef struct JitState {
     u8           *code_ptr;
     u8           *code_end;
     u32           generation;
+    /* Sub-page SMC filter: bit k of page_code_mask[p] set => some live (or recently
+     * killed) block's guest code / peeked target word lies in 64-byte line k of
+     * 4 KiB physical RAM page p. Conservative superset; cleared on page wipe. */
+    u64           page_code_mask[512];
 } JitState;
 
 /* Lifecycle & execution engines (built on ALL targets) */

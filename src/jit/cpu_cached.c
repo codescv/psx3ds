@@ -510,7 +510,7 @@ void jit_write32_slow_wrap(PsxCpu *c, u32 a, u32 v) {
         memcpy(&cur, sys->bus.ram + off, 4u);
         if (cur != v) {
             memcpy(sys->bus.ram + off, &v, 4u);
-            jit_invalidate_page(sys, off >> 12);
+            jit_invalidate_range(sys, off, 4u);
         }
         return;
     }
@@ -582,7 +582,7 @@ void jit_write16_slow_wrap(PsxCpu *c, u32 a, u32 v) {
         memcpy(&cur, sys->bus.ram + off, 2u);
         if (cur != v16) {
             memcpy(sys->bus.ram + off, &v16, 2u);
-            jit_invalidate_page(sys, off >> 12);
+            jit_invalidate_range(sys, off, 2u);
         }
         return;
     }
@@ -641,7 +641,7 @@ void jit_write8_slow_wrap(PsxCpu *c, u32 a, u32 v) {
         sys->stats.smc_traps++;
         if (sys->bus.ram[off] != v8) {
             sys->bus.ram[off] = v8;
-            jit_invalidate_page(sys, off >> 12);
+            jit_invalidate_range(sys, off, 1u);
         }
         return;
     }
@@ -2533,6 +2533,7 @@ static JitBlock *cached_compile_block(PsxSystem *sys, u32 start_pc) {
         if (p1 != p0) {
             (void)jit_block_add_ram_page(sys, b_idx, p1);
         }
+        jit_block_mark_code(sys, b);
         j->tab_ram[BLOCKTAB_RAM_IDX(start_pc)] = b;
     } else {
         j->tab_bios[BLOCKTAB_BIOS_IDX(start_pc)] = b;

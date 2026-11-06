@@ -292,7 +292,7 @@ void bus_dma_write_words(PsxSystem *sys, u32 phys, const u32 *src, u32 n) {
         store_le32(b->ram + off, src[i]);
         u32 page = off >> PSX_FM_SHIFT;
         if (b->code_page_refs[page] != 0u) {
-            jit_invalidate_page(sys, page);
+            jit_invalidate_range(sys, off, 4u);
         }
     }
 }
@@ -321,22 +321,18 @@ void bus_dma_fill_desc(PsxSystem *sys, u32 phys_last, u32 n) {
     }
     PsxBus *b = &sys->bus;
     u32 cur = phys_last & 0x1FFFFCu;
-    u32 last_inv_page = UINT32_MAX;
 
     for (u32 i = 0u; i < n - 1u; i++) {
         u32 next = (cur - 4u) & 0x1FFFFCu;
         store_le32(b->ram + cur, next);
-        u32 page = cur >> PSX_FM_SHIFT;
-        if (b->code_page_refs[page] != 0u && page != last_inv_page) {
-            jit_invalidate_page(sys, page);
-            last_inv_page = page;
+        if (b->code_page_refs[cur >> PSX_FM_SHIFT] != 0u) {
+            jit_invalidate_range(sys, cur, 4u);
         }
         cur = next;
     }
     store_le32(b->ram + cur, 0x00FFFFFFu);
-    u32 page = cur >> PSX_FM_SHIFT;
-    if (b->code_page_refs[page] != 0u && page != last_inv_page) {
-        jit_invalidate_page(sys, page);
+    if (b->code_page_refs[cur >> PSX_FM_SHIFT] != 0u) {
+        jit_invalidate_range(sys, cur, 4u);
     }
 }
 
@@ -505,16 +501,17 @@ static void bus_smc_ram_write(PsxSystem *sys, u32 off, u32 v, u32 width) {
         }
         if (trapped_code) {
             b->code_page_traps[page] = 0u;
-            jit_invalidate_page(sys, page);
+            /* Sub-page precise: only wipes the page if a live block's code overlaps */
+            jit_invalidate_range(sys, off, width);
         }
     } else if (trapped_code) {
-        /* Identical rewrite: skip invalidation; flip to VERIFY if over frame budget */
+        /*
+         * Identical rewrite: nothing to invalidate. The page MUST stay in
+         * PSX_PAGE_TRAP while any block references it: promoting it to a
+         * writable fastmem mapping would let later real code mutations bypass
+         * SMC detection entirely (stale translated code).
+         */
         b->code_page_traps[page]++;
-        if (b->code_page_traps[page] > sys->cfg.smc_trap_budget &&
-            b->code_page_mode[page] == (u8)PSX_PAGE_TRAP) {
-            b->code_page_mode[page] = (u8)PSX_PAGE_VERIFY;
-            fastmem_set_isolated(b, b->isolated);
-        }
     }
 }
 

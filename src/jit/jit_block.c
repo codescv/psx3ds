@@ -43,6 +43,144 @@ void jit_refresh_pins(PsxSystem *sys) {
     }
 }
 
+/* ============================================================================
+ * Sub-page (64-byte line) SMC filter
+ *
+ * Soundness contract: a RAM write [w, w+len) invalidates nothing iff no live
+ * block's guest instruction range (or statically peeked load-delay target word)
+ * overlaps it. When >= 1 block on page p overlaps, the WHOLE page p is wiped via
+ * jit_invalidate_page(), which also kills every direct-linked caller (arm_jit
+ * only emits `B entry` when target pages are a subset of caller pages, so any
+ * caller of a block living on p is itself on p).
+ * ============================================================================ */
+
+#define JIT_RAM_OFF_MASK ((u32)PSX_RAM_SIZE - 1u)
+
+static inline u64 jit_line_mask(u32 lo, u32 hi) {
+    u32 a = lo >> 6;
+    u32 b = hi >> 6;
+    u64 upper = (b >= 63u) ? ~0ULL : ((1ULL << (b + 1u)) - 1ULL);
+    u64 lower = (1ULL << a) - 1ULL;
+    return upper & ~lower;
+}
+
+/* Modular (2 MiB wrap-around) interval overlap; lengths must be < PSX_RAM_SIZE */
+static inline bool jit_ram_overlap(u32 a, u32 alen, u32 b, u32 blen) {
+    return (((b - a) & JIT_RAM_OFF_MASK) < alen) || (((a - b) & JIT_RAM_OFF_MASK) < blen);
+}
+
+static void jit_mask_mark(JitState *j, u32 phys, u32 bytes) {
+    phys &= JIT_RAM_OFF_MASK;
+    while (bytes > 0u) {
+        u32 p = (phys >> 12) & (PSX_RAM_PAGES - 1u);
+        u32 lo = phys & 0xFFFu;
+        u32 chunk = 4096u - lo;
+        if (chunk > bytes) {
+            chunk = bytes;
+        }
+        j->page_code_mask[p] |= jit_line_mask(lo, lo + chunk - 1u);
+        phys = (phys + chunk) & JIT_RAM_OFF_MASK;
+        bytes -= chunk;
+    }
+}
+
+static bool jit_peek_word(const PsxSystem *sys, u32 pc, u32 *out) {
+    if (jit_pc_is_ram(sys, pc)) {
+        if (!sys->bus.ram) {
+            return false;
+        }
+        memcpy(out, sys->bus.ram + (pc & JIT_RAM_OFF_MASK), 4u);
+        return true;
+    }
+    if (jit_pc_is_bios(pc)) {
+        if (!sys->bus.bios) {
+            return false;
+        }
+        memcpy(out, sys->bus.bios + ((pc & 0x1FFFFFFFu) - PSX_BIOS_PHYS), 4u);
+        return true;
+    }
+    return false;
+}
+
+/* Guest byte length of the block's own instruction words (+4 for a peeked fallthrough) */
+static inline u32 jit_block_code_len(const JitBlock *b) {
+    u32 n = (b->n_insns != 0u) ? (u32)b->n_insns : 1u;
+    u32 len = n * 4u;
+    if ((b->flags & (JB_PEEKED_TARGET | JB_CACHED_OP)) == JB_PEEKED_TARGET) {
+        len += 4u;
+    }
+    return len;
+}
+
+/*
+ * Static branch target peeked by scan_check_ds_load (RAM only). The branch word
+ * itself lies inside the block's own (trapped) range, so while the block is live
+ * the word in RAM is exactly the one the compiler saw.
+ */
+static bool jit_block_peek_branch_target(const PsxSystem *sys, const JitBlock *b, u32 *out_phys) {
+    if ((b->flags & (JB_PEEKED_TARGET | JB_CACHED_OP)) != JB_PEEKED_TARGET || b->n_insns < 2u) {
+        return false;
+    }
+    u32 br_pc = b->pc + ((u32)b->n_insns - 2u) * 4u;
+    u32 insn = 0u;
+    if (!jit_peek_word(sys, br_pc, &insn)) {
+        return false;
+    }
+    u32 op = insn >> 26;
+    u32 t;
+    if (op == 0x02u || op == 0x03u) {
+        t = ((br_pc + 4u) & 0xF0000000u) | ((insn & 0x03FFFFFFu) << 2);
+    } else if (op >= 0x01u && op <= 0x07u) {
+        t = (br_pc + 4u) + ((u32)(s32)(s16)(insn & 0xFFFFu) << 2);
+    } else {
+        return false;
+    }
+    if (!jit_pc_is_ram(sys, t)) {
+        return false;
+    }
+    *out_phys = t & JIT_RAM_OFF_MASK;
+    return true;
+}
+
+void jit_block_mark_code(PsxSystem *sys, const JitBlock *b) {
+    if (!sys || !b) {
+        return;
+    }
+    JitState *j = &sys->jit;
+    if (jit_pc_is_ram(sys, b->pc)) {
+        jit_mask_mark(j, b->pc & JIT_RAM_OFF_MASK, jit_block_code_len(b));
+    }
+    u32 t = 0u;
+    if (jit_block_peek_branch_target(sys, b, &t)) {
+        jit_mask_mark(j, t, 4u);
+    }
+}
+
+static bool jit_block_overlaps(const PsxSystem *sys, const JitBlock *b, u32 w, u32 wlen) {
+    if (jit_pc_is_ram(sys, b->pc) &&
+        jit_ram_overlap(b->pc & JIT_RAM_OFF_MASK, jit_block_code_len(b), w, wlen)) {
+        return true;
+    }
+    u32 t = 0u;
+    if (jit_block_peek_branch_target(sys, b, &t) && jit_ram_overlap(t, 4u, w, wlen)) {
+        return true;
+    }
+    return false;
+}
+
+static bool jit_page_has_overlap(const PsxSystem *sys, u32 p, u32 w, u32 wlen) {
+    const JitState *j = &sys->jit;
+    u16 cur = j->page_head[p];
+    while (cur != JIT_PAGE_NONE) {
+        const JitBlock *b = &j->blocks[cur];
+        if (jit_block_overlaps(sys, b, w, wlen)) {
+            return true;
+        }
+        cur = b->next_in_page[(b->phys_page[0] == (u16)p) ? 0 : 1];
+    }
+    return false;
+}
+
 bool jit_block_add_ram_page(PsxSystem *sys, u16 block_idx, u16 phys_page) {
     if (!sys || phys_page >= PSX_RAM_PAGES) {
         return false;
@@ -186,6 +324,7 @@ void jit_flush_all(PsxSystem *sys) {
         }
         sys->bus.code_page_refs[p] = 0u;
         j->page_head[p] = JIT_PAGE_NONE;
+        j->page_code_mask[p] = 0ULL;
     }
 
     j->n_blocks = 0u;
@@ -248,7 +387,12 @@ void jit_invalidate_page(PsxSystem *sys, u32 phys_page) {
         int slot = (b->phys_page[0] == (u16)phys_page) ? 0 : 1;
         u16 next = b->next_in_page[slot];
 
-        j->tab_ram[BLOCKTAB_RAM_IDX(b->pc)] = stub;
+        if (jit_pc_is_bios(b->pc) && j->tab_bios) {
+            /* BIOS block registered on this RAM page via a peeked load-delay target */
+            j->tab_bios[BLOCKTAB_BIOS_IDX(b->pc)] = stub;
+        } else {
+            j->tab_ram[BLOCKTAB_RAM_IDX(b->pc)] = stub;
+        }
 
         if ((b->flags & JB_DEAD) == 0u) {
             b->flags |= JB_DEAD;
@@ -284,6 +428,7 @@ void jit_invalidate_page(PsxSystem *sys, u32 phys_page) {
     }
 
     j->page_head[phys_page] = JIT_PAGE_NONE;
+    j->page_code_mask[phys_page] = 0ULL;
     jit_refresh_pins(sys);
     jit_purge_ibtc(j);
     jit_request_exit_wrap(sys);
@@ -307,15 +452,23 @@ void jit_invalidate_range(PsxSystem *sys, u32 phys, u32 bytes) {
         return;
     }
 
-    u32 start_off = phys & PSX_RAM_MASK;
-    u32 end_off = start_off + bytes - 1u;
-    u32 first_page = start_off >> 12;
-    u32 last_page = end_off >> 12;
-    for (u32 pg = first_page; pg <= last_page; ++pg) {
-        u32 p = pg & (PSX_RAM_PAGES - 1u);
-        if (j->page_head[p] != JIT_PAGE_NONE) {
+    u32 cur = phys & JIT_RAM_OFF_MASK;
+    u32 remaining = bytes;
+    while (remaining > 0u) {
+        u32 p = (cur >> 12) & (PSX_RAM_PAGES - 1u);
+        u32 lo = cur & 0xFFFu;
+        u32 chunk = 4096u - lo;
+        if (chunk > remaining) {
+            chunk = remaining;
+        }
+        /* O(1) reject: page holds no code, or no code line touched by this write */
+        if (j->page_head[p] != JIT_PAGE_NONE &&
+            (j->page_code_mask[p] & jit_line_mask(lo, lo + chunk - 1u)) != 0ULL &&
+            jit_page_has_overlap(sys, p, cur, chunk)) {
             jit_invalidate_page(sys, p);
         }
+        cur = (cur + chunk) & JIT_RAM_OFF_MASK;
+        remaining -= chunk;
     }
 }
 

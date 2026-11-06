@@ -506,6 +506,7 @@ static int test_block_cache_lifecycle(PsxSystem *sys) {
     JitBlock *b = &sys->jit.blocks[bidx];
     memset(b, 0, sizeof(*b));
     b->pc = 0x80010FF8u;
+    b->n_insns = 4u; /* 0x00010FF8..0x00011007 spans both pages */
     b->phys_page[0] = JIT_PAGE_NONE;
     b->phys_page[1] = JIT_PAGE_NONE;
     b->next_in_page[0] = JIT_PAGE_NONE;
@@ -519,6 +520,17 @@ static int test_block_cache_lifecycle(PsxSystem *sys) {
                "code_page_refs incremented on both pages");
     CHECK_TRUE(sys->bus.fm_w[0x80010u] == 0u && sys->bus.fm_w[0x80011u] == 0u,
                "fm_w write-protected on both pages");
+    jit_block_mark_code(sys, b);
+    CHECK_TRUE(sys->jit.page_code_mask[0x10u] == (1ULL << 63) &&
+                   sys->jit.page_code_mask[0x11u] == 1ULL,
+               "page_code_mask marks last line of 0x10 + first line of 0x11");
+
+    /* Data writes elsewhere on both code pages must NOT invalidate the block */
+    jit_invalidate_range(sys, 0x00010000u, 0xF00u);
+    jit_invalidate_range(sys, 0x00010FF4u, 4u);
+    jit_invalidate_range(sys, 0x00011008u, 0x100u);
+    CHECK_TRUE((b->flags & JB_DEAD) == 0u && sys->stats.smc_invalidations == 0u,
+               "non-overlapping same-page writes skip invalidation");
 
     /* Invalidate across page boundary via jit_invalidate_range */
     jit_invalidate_range(sys, 0x00010FFCu, 8u);
@@ -1150,6 +1162,81 @@ static int test_idle_and_counted_loops(void) {
     return 0;
 }
 
+/* ============================================================================
+ * Test 10a: Sub-page SMC filter — code + hot data on the SAME 4 KiB page
+ *   - 1000+ data stores (incl. one into the same 64-byte line as live code) must
+ *     NOT invalidate anything (previously: one full page wipe + recompile each);
+ *   - patching a direct-linked (same-page `B entry`) callee MUST invalidate both
+ *     caller and callee atomically and the next call MUST see the new code.
+ * ============================================================================ */
+static int test_diff_subpage_smc(void) {
+    const u32 base = 0x80010000u;
+    const u32 fn_va = 0x80010400u;
+    const u32 new_insn = M_ORI(R_V0, R_ZERO, 99u);
+
+    const u32 main_code[] = {
+        M_LUI(R_S7, 0x8001u),
+        M_ORI(R_S7, R_S7, 0x0800u),          /* data area on the SAME page */
+        M_LUI(R_S6, 0x8001u),
+        M_ORI(R_S6, R_S6, 0x0400u),          /* s6 = callee address */
+        M_JAL(fn_va),                        /* 1st call -> 11 */
+        M_NOP,
+        M_SW(R_V0, 0, R_S7),
+        M_ORI(R_T2, R_ZERO, 1000u),
+        /* loop: */
+        M_SW(R_T2, 4, R_S7),                 /* hot data store, same page */
+        M_SW(R_T2, 0x30, R_S6),              /* same 64-byte line as callee, no overlap */
+        M_ADDIU(R_T2, R_T2, -1),
+        M_BNE(R_T2, R_ZERO, -4),
+        M_NOP,
+        M_JAL(fn_va),                        /* 2nd call (direct-linked) -> 11 */
+        M_NOP,
+        M_SW(R_V0, 8, R_S7),
+        M_LUI(R_T1, (new_insn >> 16) & 0xFFFFu),
+        M_ORI(R_T1, R_T1, new_insn & 0xFFFFu),
+        M_SW(R_T1, 0, R_S6),                 /* patch callee code */
+        M_JAL(fn_va),                        /* 3rd call -> MUST return 99 */
+        M_NOP,
+        M_SW(R_V0, 12, R_S7),
+        /* halt */
+        M_BEQ(R_ZERO, R_ZERO, -1),
+        M_NOP
+    };
+    const u32 fn_code[] = {
+        M_ORI(R_V0, R_ZERO, 11u),
+        M_JR(R_RA),
+        M_NOP
+    };
+    const u32 n_main = (u32)(sizeof(main_code) / 4u);
+
+    for (int i = 0; i < 3; ++i) {
+        test_sys_prepare(&g_sys[i], base);
+        write_code(&g_sys[i], 0x10000u, main_code, n_main);
+        write_code(&g_sys[i], 0x10400u, fn_code, (u32)(sizeof(fn_code) / 4u));
+    }
+    u32 halt_va = base + (n_main - 2u) * 4u;
+    run_oracle_until_halt(&g_sys[0], halt_va, 100000u);
+    run_engine_until_halt(&g_sys[1], false, halt_va, 4096, 64u);
+    run_engine_until_halt(&g_sys[2], true,  halt_va, 4096, 64u);
+
+    CHECK_TRUE(compare_three_engines("subpage_smc", halt_va, 0x10800u, 4u) == 0,
+               "subpage_smc 3-engine agreement");
+    for (int eng = 1; eng <= 2; ++eng) {
+        CHECK_TRUE(read_ram32(&g_sys[eng], 0x10800u) == 11u &&
+                   read_ram32(&g_sys[eng], 0x10808u) == 11u &&
+                   read_ram32(&g_sys[eng], 0x1080Cu) == 99u,
+                   "subpage_smc callee returned 11, 11 then 99 after patch");
+        CHECK_TRUE(g_sys[eng].stats.smc_traps >= 2000u,
+                   "subpage_smc data stores on code page were trapped");
+        CHECK_TRUE(g_sys[eng].stats.smc_invalidations > 0u &&
+                   g_sys[eng].stats.smc_invalidations < 16u,
+                   "subpage_smc: 2000 data stores caused zero invalidations, code patch did");
+        CHECK_TRUE(g_sys[eng].jit.page_code_mask[0x10u] != 0ULL,
+                   "subpage_smc page_code_mask rebuilt after recompiles");
+    }
+    return 0;
+}
+
 /* Case I: Live Self-Modifying Code (SMC) */
 static int test_diff_live_smc(void) {
     const u32 base = 0x80010000u;
@@ -1510,6 +1597,7 @@ int main(void) {
     if (test_diff_segment_alias() != 0) return 1;
     if (test_idle_and_counted_loops() != 0) return 1;
     if (test_diff_live_smc() != 0) return 1;
+    if (test_diff_subpage_smc() != 0) return 1;
     if (test_diff_openbios_epilogue_and_next_pc() != 0) return 1;
     if (test_microbenchmark() != 0) return 1;
 

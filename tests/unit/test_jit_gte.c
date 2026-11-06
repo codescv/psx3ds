@@ -226,6 +226,16 @@ static int test_cop2_transfers_and_gpr_integrity(void) {
         M_NOP,
         M_SW(9u, 0, 23u),
 
+        /* Lighting / colour / projection kernels with 8 live GPRs: r12 / lr slots stay
+         * live (not spilled) across inline GTE, so any r12 / lr clobber corrupts $s* */
+        M_GTE(1u, 0u, 0u, 0u, 0u, 0x13u), /* NCDS */
+        M_GTE(1u, 0u, 0u, 0u, 1u, 0x3Fu), /* NCCT */
+        M_GTE(0u, 0u, 0u, 0u, 0u, 0x0Cu), /* OP   */
+        M_GTE(1u, 0u, 0u, 0u, 0u, 0x2Au), /* DPCT */
+        M_GTE(1u, 0u, 0u, 0u, 0u, 0x30u), /* RTPT */
+        M_GTE(1u, 0u, 0u, 0u, 1u, 0x1Cu), /* CC   */
+        M_GTE(1u, 0u, 0u, 0u, 0u, 0x20u), /* NCT  */
+
         /* 2. IRGB (d28) write -> ORGB (d29) read & IR1..3 check */
         M_ORI(8u, 0u, (29u << 10) | (15u << 5) | 3u),
         M_MTC2(8u, 28u),
@@ -451,13 +461,15 @@ static int test_differential_all_gte_opcodes(void) {
     memset(&init_cpu, 0, sizeof(init_cpu));
     u32 rng = 0xCAFE1234u;
 
-    /* 1. Test all 21 non-MVMVA commands across (sf=0..1, lm=0..1) x 24 states (890+ runs) */
+    /* 1. Test all 21 non-MVMVA commands across (sf=0..1, lm=0..1) x 256 states
+     *    (1,024 adversarial/random vectors per opcode, ~21.5k runs per engine) */
     for (u32 ci = 0u; ci < n_cmds; ++ci) {
         u8 cmd = k_cmds[ci];
+        u32 inline_before = g_sys[2].stats.gte_inline;
         for (u32 sf = 0u; sf <= 1u; ++sf) {
             for (u32 lm = 0u; lm <= 1u; ++lm) {
                 u32 op = M_GTE(sf, 0u, 0u, 0u, lm, cmd);
-                for (u32 trial = 0u; trial < 24u; ++trial) {
+                for (u32 trial = 0u; trial < 256u; ++trial) {
                     populate_random_gte_state(&init_cpu, &rng, trial & 1u);
                     if (run_single_gte_diff(op, &init_cpu, "gte_cmd_fuzz") != 0) {
                         return 1;
@@ -470,6 +482,16 @@ static int test_differential_all_gte_opcodes(void) {
                 }
             }
         }
+#if PSX3DS_HAVE_JIT
+        /* Every non-MVMVA command now has an inline ARM11v6K kernel (100% inline GTE) */
+        CHECK_TRUE(jit_can_inline_gte(M_GTE(0u, 0u, 0u, 0u, 0u, cmd)), "jit_can_inline_gte(cmd)");
+        if (g_sys[2].stats.gte_inline == inline_before) {
+            fprintf(stderr, "cmd 0x%02X never took the inline path\n", (unsigned)cmd);
+            return 1;
+        }
+#else
+        (void)inline_before;
+#endif
     }
 
     /* 2. Exhaustive MVMVA sweep: all 64 (sf, lm, mx=0..3, vx=0..3, cv=0..3) x 10 states (640 runs) */
@@ -500,6 +522,67 @@ static int test_differential_all_gte_opcodes(void) {
 #endif
     return 0;
 }
+
+/* ============================================================================
+ * Test 3b: Inline GTE code-size bound (scanner budget must never under-estimate)
+ * ============================================================================ */
+#if PSX3DS_HAVE_JIT
+static Emitter g_size_emit;
+static u32 g_size_buf[2048];
+
+static int test_gte_inline_code_size(void) {
+    u32 worst_all = 0u;
+    for (u32 cmd = 0u; cmd < 64u; ++cmd) {
+        u32 worst = 0u;
+        bool any = false;
+        for (u32 v = 0u; v < 256u; ++v) {
+            u32 op = M_GTE(v & 1u, (v >> 1) & 3u, (v >> 3) & 3u, (v >> 5) & 3u, (v >> 7) & 1u, cmd);
+            if (!jit_can_inline_gte(op)) {
+                continue;
+            }
+            arm_emit_reset(&g_size_emit, g_size_buf, (u32)sizeof(g_size_buf));
+            CHECK_TRUE(jit_emit_gte_inline(&g_size_emit, op), "jit_emit_gte_inline emitted");
+            u32 bytes = 0u;
+            CHECK_TRUE(arm_emit_finalize(&g_size_emit, &bytes), "arm_emit_finalize");
+            u32 words = bytes / 4u;
+            if (words > jit_gte_inline_words(op)) {
+                fprintf(stderr, "op=0x%08lX emits %lu words > estimate %lu\n", (unsigned long)op,
+                        (unsigned long)words, (unsigned long)jit_gte_inline_words(op));
+                return 1;
+            }
+            /* No r12 / lr writes inside inline kernels (cached GPR slots 5/6 stay live) */
+            for (u32 w = 0u; w < words; ++w) {
+                u32 ins = g_size_buf[w];
+                bool is_push_pop = ((ins & 0x0FFF0000u) == 0x092D0000u) ||
+                                   ((ins & 0x0FFF0000u) == 0x08BD0000u);
+                bool is_bl = ((ins & 0x0F000000u) == 0x0B000000u) ||
+                             ((ins & 0x0FFFFFF0u) == 0x012FFF30u);
+                bool dp = ((ins & 0x0C000000u) == 0u) && ((ins & 0x0FC000F0u) != 0x00000090u) &&
+                          ((ins & 0x0F8000F0u) != 0x00800090u) && ((ins & 0x0F900000u) != 0x01000000u);
+                u32 rd = (ins >> 12) & 15u;
+                if (dp && !is_push_pop && !is_bl && (rd == 12u || rd == 14u)) {
+                    /* Allowed only as `ldr r12, =fn` / `blx r12` far-call sequence inside emit_call */
+                    bool next_is_blx = (w + 1u < words) && ((g_size_buf[w + 1u] & 0x0FFFFFFFu) == 0x012FFF3Cu);
+                    if (!next_is_blx) {
+                        fprintf(stderr, "op=0x%08lX writes r%lu at word %lu (0x%08lX)\n",
+                                (unsigned long)op, (unsigned long)rd, (unsigned long)w, (unsigned long)ins);
+                        return 1;
+                    }
+                }
+            }
+            any = true;
+            if (words > worst) worst = words;
+        }
+        if (any) {
+            printf("  gte cmd 0x%02lX: max %lu words (budget %lu)\n", (unsigned long)cmd,
+                   (unsigned long)worst, (unsigned long)jit_gte_inline_words(M_GTE(0u, 0u, 0u, 0u, 0u, cmd)));
+            if (worst > worst_all) worst_all = worst;
+        }
+    }
+    CHECK_TRUE(worst_all * 4u + 512u < JIT_MAX_BLOCK_BYTES, "largest inline GTE kernel fits a block");
+    return 0;
+}
+#endif
 
 /* ============================================================================
  * Test 4: Geometry Pipeline Microbenchmark (`RTPT + NCLIP + AVSZ3 + MVMVA`)
@@ -630,6 +713,9 @@ int main(void) {
 
 #if PSX3DS_HAVE_JIT
     if (test_div_unr_asm() != 0) return 1;
+#endif
+#if PSX3DS_HAVE_JIT
+    if (test_gte_inline_code_size() != 0) return 1;
 #endif
     if (test_cop2_transfers_and_gpr_integrity() != 0) return 1;
     if (test_differential_all_gte_opcodes() != 0) return 1;

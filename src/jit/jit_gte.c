@@ -221,8 +221,10 @@ void jit_emit_ctc2_inline(Emitter *e, u32 gte_reg, ArmReg src) {
 /* ============================================================================
  * Inline ARM11v6K GTE Command Kernels (ARCHITECTURE.md §5.11)
  *
- * Precondition: caller invoked jit_ra_spill_and_invalidate_all(), so r0-r8,
- * r12, lr are free scratch. rFLAG lives in ARM_R8 across the kernel.
+ * Precondition: caller invoked jit_ra_spill_and_invalidate_r4_r8(), so r0-r8
+ * are free scratch. rFLAG lives in ARM_R8 across the kernel. Kernels NEVER
+ * touch r12 / lr (cached GPR slots 5 / 6 stay live); helper calls go through
+ * emit_call(), which preserves r12 / lr and AAPCS keeps r4-r8 intact.
  * ============================================================================ */
 
 #define GTE_REG_FLAG ARM_R8
@@ -482,10 +484,247 @@ static void gte_emit_rtp_vertex(Emitter *e, u32 v_idx, bool sf12, bool lm, bool 
     }
 }
 
+/* ============================================================================
+ * Shared lighting / colour building blocks (NCS/NCT/NCCS/NCCT/NCDS/NCDT/CC/CDP/
+ * DCPL/DPCS/DPCT/INTPL). All of them use only r0-r8 (rFLAG = r8): r12 / lr are
+ * NEVER touched, so the caller keeps cached GPR slots 5/6 live across kernels.
+ *
+ * Exactness argument (vs gte_exec_c): every translation / far-colour term that
+ * gets shifted left by 12 is first guarded to |x| < 2^30 (else the whole opcode
+ * bounces to the C reference before ANY state is modified). With that guard no
+ * 44-bit MAC accumulator can overflow, so FLAG bits 30..25 are provably zero and
+ * the remaining FLAG bits (IR / colour / SZ / SXY / MAC0 saturation) are computed
+ * exactly. Truncating (s32)(a >> sf) is reproduced by taking the low word of the
+ * 64-bit shifted accumulator, exactly like the C (s32) cast.
+ * ============================================================================ */
+
+#define GTE_VSRC_IR 3u
+#define GTE_TR_NONE 0u
+
+/* Guard |gte_c[base + k]| < 2^30 for k = 0..2, else branch to lbl_bounce. Clobbers r2, r3. */
+static void gte_emit_guard_c3(Emitter *e, u32 base, u16 lbl_bounce) {
+    for (u32 k = 0u; k < 3u; ++k) {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(base + k));
+        gte_emit_guard_2p30(e, ARM_R2, ARM_R3, lbl_bounce);
+    }
+}
+
+/* Load (s64)(gte_c[tr] << 12) into r4:r3 (or zero). Clobbers r2. */
+static void gte_emit_acc_init(Emitter *e, u32 tr_idx, bool has_tr) {
+    if (has_tr) {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(tr_idx));
+        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
+        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
+    } else {
+        emit_const(e, ARM_R3, 0u);
+        emit_const(e, ARM_R4, 0u);
+    }
+}
+
+/*
+ * MAC1..3 = (TR << 12) + M * V  (>> sf);  IR1..3 = sat(MAC, lm)
+ * mat_base: gte_c index of the matrix (0 = RT, 8 = LLM, 16 = LCM)
+ * vsrc:     0..2 = V0..V2, GTE_VSRC_IR = IR1..IR3 (latched before any IR write)
+ * tr_base:  gte_c index of TR (5 = TR, 13 = BK) or GTE_TR_NONE; must be guarded.
+ * Clobbers r0-r7.
+ */
+static void gte_emit_mat_vec(Emitter *e, u32 mat_base, u32 vsrc, u32 tr_base, bool sf12, bool lm) {
+    bool has_tr = (tr_base != GTE_TR_NONE);
+
+    /* r0 = VY:VX packed halves, r1 = VZ (low half) */
+    if (vsrc < 3u) {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(vsrc * 2u));
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(vsrc * 2u + 1u));
+    } else {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(9u));  /* IR1 */
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(10u)); /* IR2 */
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(11u)); /* IR3 */
+        emit_pkhbt(e, ARM_CC_AL, ARM_R0, ARM_R0, ARM_R2, 16u);
+    }
+
+    /* Row 0: M11*VX + M12*VY (SMLALD) + M13*VZ */
+    gte_emit_acc_init(e, tr_base + 0u, has_tr);
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_C(mat_base + 0u)); /* M12:M11 */
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_C(mat_base + 1u)); /* M21:M13 */
+    emit_smlald(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R5);
+    emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R6, false, false);
+    gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
+    emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(25u));
+    gte_emit_sat_ir(e, ARM_R5, ARM_R2, 1u, lm);
+    emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(9u));
+
+    /* Row 1: M21*VX + M22*VY + M23*VZ */
+    gte_emit_acc_init(e, tr_base + 1u, has_tr);
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_C(mat_base + 2u)); /* M23:M22 */
+    emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R6, false, true);
+    emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R7, true, false);
+    emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R7, false, true);
+    gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
+    emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(26u));
+    gte_emit_sat_ir(e, ARM_R5, ARM_R2, 2u, lm);
+    emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(10u));
+
+    /* Row 2: M31*VX + M32*VY (SMLALD) + M33*VZ */
+    gte_emit_acc_init(e, tr_base + 2u, has_tr);
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_C(mat_base + 3u)); /* M32:M31 */
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_C(mat_base + 4u)); /* ---:M33 */
+    emit_smlald(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R5);
+    emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R6, false, false);
+    gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
+    emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(27u));
+    gte_emit_sat_ir(e, ARM_R5, ARM_R2, 3u, lm);
+    emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(11u));
+}
+
+/* r5 = byte k of r7 (colour word), zero-extended. */
+static void gte_emit_color_byte(Emitter *e, u32 k) {
+    if (k == 0u) {
+        emit_uxtb(e, ARM_CC_AL, ARM_R5, ARM_R7);
+    } else {
+        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R7, ARM_SH_LSR, k * 8u);
+        emit_uxtb(e, ARM_CC_AL, ARM_R5, ARM_R5);
+    }
+}
+
+/* r5 = (rgb_k * (s16)IR_k) << 4 with rgb from r7 (|r5| <= 2^27, exact in s32). Clobbers r0. */
+static void gte_emit_color_ir_base(Emitter *e, u32 k) {
+    gte_emit_color_byte(e, k);
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(9u + k));
+    emit_sxth(e, ARM_CC_AL, ARM_R0, ARM_R0, 0u);
+    emit_mul(e, ARM_CC_AL, ARM_R5, ARM_R0, ARM_R5);
+    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R5, ARM_SH_LSL, 4u);
+}
+
+/* NCCS/NCCT/CC colour step: MAC_k = r5 >> sf; IR_k = sat(MAC_k, lm). Clobbers r1, r2. */
+static void gte_emit_ncc_component(Emitter *e, u32 k, bool sf12, bool lm) {
+    ArmReg mac = ARM_R5;
+    if (sf12) {
+        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R1, ARM_R5, ARM_SH_ASR, 12u);
+        mac = ARM_R1;
+    }
+    emit_str_imm(e, ARM_CC_AL, mac, JIT_REG_CPU, OFF_D(25u + k));
+    gte_emit_sat_ir(e, ARM_R2, mac, k + 1u, lm);
+    emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(9u + k));
+}
+
+/*
+ * Depth-cue interpolation of one component (gte_depth_cue_vec body):
+ *   a1 = (FC_k << 12) - base;  tmp = sat((s32)(a1 >> sf), lm = 0)
+ *   MAC_k = (s32)(base + IR0 * tmp) >> sf;  IR_k = sat(MAC_k, lm)
+ * In: r5 = base (s32, |base| <= 2^27), r6 = (s16)IR0. FC must be guarded. Clobbers r0-r4.
+ */
+static void gte_emit_dcue_component(Emitter *e, u32 k, bool sf12, bool lm) {
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(21u + k));
+    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
+    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
+    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R0, ARM_R5, ARM_SH_ASR, 31u);
+    emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 1u /*S*/, ARM_R3, ARM_R3, ARM_R5);
+    emit_alu_reg(e, ARM_CC_AL, ARM_OP_SBC, 0u, ARM_R4, ARM_R4, ARM_R0);
+
+    gte_emit_shift_sf64(e, ARM_R1, ARM_R3, ARM_R4, sf12);
+    gte_emit_sat_ir(e, ARM_R2, ARM_R1, k + 1u, false);
+
+    emit_mul(e, ARM_CC_AL, ARM_R1, ARM_R6, ARM_R2);
+    emit_alu_reg(e, ARM_CC_AL, ARM_OP_ADD, 0u, ARM_R1, ARM_R5, ARM_R1);
+    if (sf12) {
+        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R1, ARM_R1, ARM_SH_ASR, 12u);
+    }
+    emit_str_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(25u + k));
+    gte_emit_sat_ir(e, ARM_R2, ARM_R1, k + 1u, lm);
+    emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(9u + k));
+}
+
+static void gte_emit_load_ir0(Emitter *e) {
+    emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_D(8u));
+    emit_sxth(e, ARM_CC_AL, ARM_R6, ARM_R6, 0u);
+}
+
+enum { GTE_COLOR_NONE = 0, GTE_COLOR_CC = 1, GTE_COLOR_DCUE = 2 };
+
+/* Colour stage after IR1..3 hold the light colour: (RGBC * IR) [+ depth cue], then RGB FIFO push */
+static void gte_emit_color_stage(Emitter *e, u32 mode, bool sf12, bool lm) {
+    if (mode != GTE_COLOR_NONE) {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_D(6u)); /* RGBC */
+        if (mode == GTE_COLOR_DCUE) {
+            gte_emit_load_ir0(e);
+        }
+        for (u32 k = 0u; k < 3u; ++k) {
+            gte_emit_color_ir_base(e, k);
+            if (mode == GTE_COLOR_CC) {
+                gte_emit_ncc_component(e, k, sf12, lm);
+            } else {
+                gte_emit_dcue_component(e, k, sf12, lm);
+            }
+        }
+    }
+    gte_emit_push_rgb_fifo(e);
+}
+
+/* One NCS/NCCS/NCDS vertex: IR = LLM*V; IR = BK + LCM*IR; colour stage */
+static void gte_emit_nc_vertex(Emitter *e, u32 v, u32 mode, bool sf12, bool lm) {
+    gte_emit_mat_vec(e, 8u, v, GTE_TR_NONE, sf12, lm);
+    gte_emit_mat_vec(e, 16u, GTE_VSRC_IR, 13u, sf12, lm);
+    gte_emit_color_stage(e, mode, sf12, lm);
+}
+
+/*
+ * Upper bound of ARM words emitted by jit_emit_gte_inline(opcode), incl. literal pool
+ * and bounce path. Measured maxima over all sf/lm/mx/vx/cv variants (test_jit_gte
+ * asserts emitted <= budget) + 16 words of slack for far-call (LDR/BLX) helper calls
+ * when the code buffer is > 32 MiB from .text (3DS heap).
+ */
+u32 jit_gte_inline_words(u32 opcode) {
+    switch (opcode & 0x3Fu) {
+        case 0x01u: return 166u;            /* RTPS  (150) */
+        case 0x06u: return 45u;             /* NCLIP (29)  */
+        case 0x0Cu: return 65u;             /* OP    (49)  */
+        case 0x10u: case 0x11u: return 136u;/* DPCS / INTPL (120) */
+        case 0x12u: return 89u;             /* MVMVA (73)  */
+        case 0x13u: return 241u;            /* NCDS  (225) */
+        case 0x14u: return 200u;            /* CDP   (184) */
+        case 0x16u: return 619u;            /* NCDT  (603) */
+        case 0x1Bu: return 191u;            /* NCCS  (175) */
+        case 0x1Cu: return 150u;            /* CC    (134) */
+        case 0x1Eu: return 155u;            /* NCS   (139) */
+        case 0x20u: return 379u;            /* NCT   (363) */
+        case 0x28u: return 53u;             /* SQR   (37)  */
+        case 0x29u: return 145u;            /* DCPL  (129) */
+        case 0x2Au: return 318u;            /* DPCT  (302) */
+        case 0x2Du: case 0x2Eu: return 50u; /* AVSZ3 / AVSZ4 (34) */
+        case 0x30u: return 374u;            /* RTPT  (358) */
+        case 0x3Du: return 80u;             /* GPF   (64)  */
+        case 0x3Eu: return 109u;            /* GPL   (93)  */
+        case 0x3Fu: return 487u;            /* NCCT  (471) */
+        default:    return 24u;             /* C helper call */
+    }
+}
+
+bool jit_can_inline_gte(u32 opcode) {
+    switch (opcode & 0x3Fu) {
+        case 0x01u: case 0x06u: case 0x0Cu: case 0x10u: case 0x11u:
+        case 0x13u: case 0x14u: case 0x16u: case 0x1Bu: case 0x1Cu:
+        case 0x1Eu: case 0x20u: case 0x28u: case 0x29u: case 0x2Au:
+        case 0x2Du: case 0x2Eu: case 0x30u: case 0x3Du: case 0x3Eu:
+        case 0x3Fu:
+            return true;
+        case 0x12u: { /* MVMVA: hardware-buggy mx=3 / cv=2 forms stay on the C reference */
+            u32 mx = (opcode >> 17) & 3u;
+            u32 cv = (opcode >> 13) & 3u;
+            return mx != 3u && cv != 2u;
+        }
+        default:
+            return false;
+    }
+}
+
 bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
     u32 fn = opcode & 0x3Fu;
     bool sf12 = ((opcode >> 19) & 1u) != 0u;
     bool lm = ((opcode >> 10) & 1u) != 0u;
+
+    if (!jit_can_inline_gte(opcode)) {
+        return false;
+    }
 
     switch (fn) {
         case 0x06u: { /* NCLIP: MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1) */
@@ -494,22 +733,21 @@ bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
             emit_ldr_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(13u)); /* SXY1 */
             emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(14u)); /* SXY2 */
 
-            emit_sxth(e, ARM_CC_AL, ARM_R5, ARM_R0, 0u); /* SX0 */
-            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R0, ARM_R0, ARM_SH_ASR, 16u); /* SY0 */
-            emit_sxth(e, ARM_CC_AL, ARM_R6, ARM_R1, 0u); /* SX1 */
-            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R1, ARM_R1, ARM_SH_ASR, 16u); /* SY1 */
-            emit_sxth(e, ARM_CC_AL, ARM_R7, ARM_R2, 0u); /* SX2 */
-            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R2, ARM_R2, ARM_SH_ASR, 16u); /* SY2 */
+            /* r5 = SY1 - SY2, r6 = SY2 - SY0, r7 = SY0 - SY1 (exact s32) */
+            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R1, ARM_SH_ASR, 16u);
+            emit_alu_reg_sh(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R5, ARM_R5, ARM_R2, ARM_SH_ASR, 16u);
+            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R6, ARM_R2, ARM_SH_ASR, 16u);
+            emit_alu_reg_sh(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R6, ARM_R6, ARM_R0, ARM_SH_ASR, 16u);
+            emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R7, ARM_R0, ARM_SH_ASR, 16u);
+            emit_alu_reg_sh(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R7, ARM_R7, ARM_R1, ARM_SH_ASR, 16u);
 
-            /* r3:r4 = SX0 * (SY1 - SY2) */
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R12, ARM_R1, ARM_R2);
-            emit_smull(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R5, ARM_R12);
-            /* += SX1 * (SY2 - SY0) */
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R12, ARM_R2, ARM_R0);
-            emit_smlal(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R6, ARM_R12);
-            /* += SX2 * (SY0 - SY1) */
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R12, ARM_R0, ARM_R1);
-            emit_smlal(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R7, ARM_R12);
+            emit_sxth(e, ARM_CC_AL, ARM_R0, ARM_R0, 0u); /* SX0 */
+            emit_sxth(e, ARM_CC_AL, ARM_R1, ARM_R1, 0u); /* SX1 */
+            emit_sxth(e, ARM_CC_AL, ARM_R2, ARM_R2, 0u); /* SX2 */
+
+            emit_smull(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R5);
+            emit_smlal(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R6);
+            emit_smlal(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R2, ARM_R7);
 
             gte_emit_check_mac0(e, ARM_R3, ARM_R4);
             emit_str_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, OFF_D(24u));
@@ -555,10 +793,7 @@ bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
         case 0x30u: { /* RTPT */
             u16 lbl_bounce = arm_label_create(e);
             /* Guard |TRX|, |TRY|, |TRZ| < 2^30 before modifying any FIFO or register */
-            for (u32 k = 0u; k < 3u; ++k) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(5u + k));
-                gte_emit_guard_2p30(e, ARM_R2, ARM_R3, lbl_bounce);
-            }
+            gte_emit_guard_c3(e, 5u, lbl_bounce);
             emit_const(e, GTE_REG_FLAG, 0u);
             if (fn == 0x01u) {
                 gte_emit_rtp_vertex(e, 0u, sf12, lm, true);
@@ -571,99 +806,101 @@ bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
             return true;
         }
 
-        case 0x12u: { /* MVMVA (inline when mx < 3 && cv != 2; bounce quirky mx=3 / cv=2) */
+        case 0x12u: { /* MVMVA (mx < 3 && cv != 2 guaranteed by jit_can_inline_gte) */
             u32 mx = (opcode >> 17) & 3u;
             u32 vx = (opcode >> 15) & 3u;
             u32 cv = (opcode >> 13) & 3u;
-            if (mx == 3u || cv == 2u) {
-                return false;
-            }
-
             bool has_tr = (cv == 0u || cv == 1u);
             u32 tr_base = (cv == 0u) ? 5u : 13u;
-            u32 mat_base = mx * 8u;
 
             u16 lbl_bounce = 0u;
             if (has_tr) {
                 lbl_bounce = arm_label_create(e);
-                for (u32 k = 0u; k < 3u; ++k) {
-                    emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(tr_base + k));
-                    gte_emit_guard_2p30(e, ARM_R2, ARM_R3, lbl_bounce);
-                }
+                gte_emit_guard_c3(e, tr_base, lbl_bounce);
             }
-
             emit_const(e, GTE_REG_FLAG, 0u);
-
-            /* Load input vector into r0 = VY:VX packed, r1 = VZ (low16) BEFORE writing IR1..3 */
-            if (vx < 3u) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(vx * 2u));
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(vx * 2u + 1u));
-            } else {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(9u));  /* IR1 */
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(10u)); /* IR2 */
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(11u)); /* IR3 */
-                emit_pkhbt(e, ARM_CC_AL, ARM_R0, ARM_R0, ARM_R2, 16u);
-            }
-
-            /* Row 0 */
-            if (has_tr) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(tr_base + 0u));
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
-            } else {
-                emit_const(e, ARM_R3, 0u);
-                emit_const(e, ARM_R4, 0u);
-            }
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_C(mat_base + 0u));
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_C(mat_base + 1u));
-            emit_smlald(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R5);
-            emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R6, false, false);
-            gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
-            emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(25u));
-            gte_emit_sat_ir(e, ARM_R5, ARM_R2, 1u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(9u));
-
-            /* Row 1 */
-            if (has_tr) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(tr_base + 1u));
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
-            } else {
-                emit_const(e, ARM_R3, 0u);
-                emit_const(e, ARM_R4, 0u);
-            }
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_C(mat_base + 2u));
-            emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R6, false, true);
-            emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R7, true, false);
-            emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R7, false, true);
-            gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
-            emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(26u));
-            gte_emit_sat_ir(e, ARM_R5, ARM_R2, 2u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(10u));
-
-            /* Row 2 */
-            if (has_tr) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(tr_base + 2u));
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
-            } else {
-                emit_const(e, ARM_R3, 0u);
-                emit_const(e, ARM_R4, 0u);
-            }
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_C(mat_base + 3u));
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_C(mat_base + 4u));
-            emit_smlald(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R0, ARM_R5);
-            emit_smlalxy(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R1, ARM_R6, false, false);
-            gte_emit_shift_sf64(e, ARM_R2, ARM_R3, ARM_R4, sf12);
-            emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(27u));
-            gte_emit_sat_ir(e, ARM_R5, ARM_R2, 3u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(11u));
-
+            gte_emit_mat_vec(e, mx * 8u, vx, has_tr ? tr_base : GTE_TR_NONE, sf12, lm);
             gte_emit_epilogue(e, has_tr, lbl_bounce, opcode);
             return true;
         }
 
-        case 0x0Cu: { /* OP: outer product of (R11, R22, R33) x (IR1, IR2, IR3) */
+        case 0x13u:   /* NCDS */
+        case 0x16u:   /* NCDT */
+        case 0x1Bu:   /* NCCS */
+        case 0x3Fu:   /* NCCT */
+        case 0x1Eu:   /* NCS  */
+        case 0x20u: { /* NCT  */
+            u32 mode = (fn == 0x13u || fn == 0x16u) ? (u32)GTE_COLOR_DCUE
+                     : (fn == 0x1Bu || fn == 0x3Fu) ? (u32)GTE_COLOR_CC
+                                                    : (u32)GTE_COLOR_NONE;
+            u32 n_vert = (fn == 0x16u || fn == 0x3Fu || fn == 0x20u) ? 3u : 1u;
+            u16 lbl_bounce = arm_label_create(e);
+            gte_emit_guard_c3(e, 13u, lbl_bounce); /* BK */
+            if (mode == GTE_COLOR_DCUE) {
+                gte_emit_guard_c3(e, 21u, lbl_bounce); /* FC */
+            }
+            emit_const(e, GTE_REG_FLAG, 0u);
+            for (u32 v = 0u; v < n_vert; ++v) {
+                gte_emit_nc_vertex(e, v, mode, sf12, lm);
+            }
+            gte_emit_epilogue(e, true, lbl_bounce, opcode);
+            return true;
+        }
+
+        case 0x1Cu:   /* CC  */
+        case 0x14u: { /* CDP */
+            u32 mode = (fn == 0x14u) ? (u32)GTE_COLOR_DCUE : (u32)GTE_COLOR_CC;
+            u16 lbl_bounce = arm_label_create(e);
+            gte_emit_guard_c3(e, 13u, lbl_bounce); /* BK */
+            if (mode == GTE_COLOR_DCUE) {
+                gte_emit_guard_c3(e, 21u, lbl_bounce); /* FC */
+            }
+            emit_const(e, GTE_REG_FLAG, 0u);
+            gte_emit_mat_vec(e, 16u, GTE_VSRC_IR, 13u, sf12, lm);
+            gte_emit_color_stage(e, mode, sf12, lm);
+            gte_emit_epilogue(e, true, lbl_bounce, opcode);
+            return true;
+        }
+
+        case 0x29u: { /* DCPL: depth cue of (RGBC * IR) << 4 */
+            u16 lbl_bounce = arm_label_create(e);
+            gte_emit_guard_c3(e, 21u, lbl_bounce);
+            emit_const(e, GTE_REG_FLAG, 0u);
+            gte_emit_color_stage(e, GTE_COLOR_DCUE, sf12, lm);
+            gte_emit_epilogue(e, true, lbl_bounce, opcode);
+            return true;
+        }
+
+        case 0x10u:   /* DPCS:  base = RGBC_k << 16 */
+        case 0x11u:   /* INTPL: base = IR_k << 12  */
+        case 0x2Au: { /* DPCT:  3x DPCS from RGB0 (FIFO shifts), CODE from RGBC */
+            u16 lbl_bounce = arm_label_create(e);
+            gte_emit_guard_c3(e, 21u, lbl_bounce);
+            emit_const(e, GTE_REG_FLAG, 0u);
+            gte_emit_load_ir0(e);
+            u32 steps = (fn == 0x2Au) ? 3u : 1u;
+            for (u32 st = 0u; st < steps; ++st) {
+                if (fn != 0x11u) {
+                    emit_ldr_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_D((fn == 0x2Au) ? 20u : 6u));
+                }
+                for (u32 k = 0u; k < 3u; ++k) {
+                    if (fn == 0x11u) {
+                        emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(9u + k));
+                        emit_sxth(e, ARM_CC_AL, ARM_R5, ARM_R5, 0u);
+                        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R5, ARM_SH_LSL, 12u);
+                    } else {
+                        gte_emit_color_byte(e, k);
+                        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R5, ARM_SH_LSL, 16u);
+                    }
+                    gte_emit_dcue_component(e, k, sf12, lm);
+                }
+                gte_emit_push_rgb_fifo(e); /* clobbers r0-r3 only: r6 (IR0) survives */
+            }
+            gte_emit_epilogue(e, true, lbl_bounce, opcode);
+            return true;
+        }
+
+        case 0x0Cu: { /* OP: outer product of (R11, R22, R33) x (IR1, IR2, IR3); r0-r8 only */
             emit_const(e, GTE_REG_FLAG, 0u);
             emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_C(0u));
             emit_sxth(e, ARM_CC_AL, ARM_R0, ARM_R0, 0u); /* D1 = R11 */
@@ -679,34 +916,23 @@ bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
             emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(11u));
             emit_sxth(e, ARM_CC_AL, ARM_R5, ARM_R5, 0u); /* IR3 */
 
-            /* MAC1 = (D2*IR3 - D3*IR2) >> sf */
-            emit_mul(e, ARM_CC_AL, ARM_R6, ARM_R1, ARM_R5);
-            emit_mul(e, ARM_CC_AL, ARM_R7, ARM_R2, ARM_R4);
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R6, ARM_R6, ARM_R7);
-            if (sf12) emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R6, ARM_R6, ARM_SH_ASR, 12u);
-            emit_str_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_D(25u));
-
-            /* MAC2 = (D3*IR1 - D1*IR3) >> sf */
-            emit_mul(e, ARM_CC_AL, ARM_R7, ARM_R2, ARM_R3);
-            emit_mul(e, ARM_CC_AL, ARM_R12, ARM_R0, ARM_R5);
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R7, ARM_R7, ARM_R12);
-            if (sf12) emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R7, ARM_R7, ARM_SH_ASR, 12u);
-            emit_str_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_D(26u));
-
-            /* MAC3 = (D1*IR2 - D2*IR1) >> sf */
-            emit_mul(e, ARM_CC_AL, ARM_R12, ARM_R0, ARM_R4);
-            emit_mul(e, ARM_CC_AL, ARM_LR, ARM_R1, ARM_R3);
-            emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R12, ARM_R12, ARM_LR);
-            if (sf12) emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R12, ARM_R12, ARM_SH_ASR, 12u);
-            emit_str_imm(e, ARM_CC_AL, ARM_R12, JIT_REG_CPU, OFF_D(27u));
-
-            gte_emit_sat_ir(e, ARM_R0, ARM_R6, 1u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(9u));
-            gte_emit_sat_ir(e, ARM_R0, ARM_R7, 2u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(10u));
-            gte_emit_sat_ir(e, ARM_R0, ARM_R12, 3u, lm);
-            emit_str_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(11u));
-
+            /* |Dx*IRy - Dz*IRw| < 2^31: exact in s32, MAC 44-bit overflow impossible */
+            static const u8 k_op_terms[3][4] = {
+                { ARM_R1, ARM_R5, ARM_R2, ARM_R4 }, /* MAC1 = D2*IR3 - D3*IR2 */
+                { ARM_R2, ARM_R3, ARM_R0, ARM_R5 }, /* MAC2 = D3*IR1 - D1*IR3 */
+                { ARM_R0, ARM_R4, ARM_R1, ARM_R3 }  /* MAC3 = D1*IR2 - D2*IR1 */
+            };
+            for (u32 k = 0u; k < 3u; ++k) {
+                emit_mul(e, ARM_CC_AL, ARM_R6, (ArmReg)k_op_terms[k][0], (ArmReg)k_op_terms[k][1]);
+                emit_mul(e, ARM_CC_AL, ARM_R7, (ArmReg)k_op_terms[k][2], (ArmReg)k_op_terms[k][3]);
+                emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 0u, ARM_R6, ARM_R6, ARM_R7);
+                if (sf12) {
+                    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R6, ARM_R6, ARM_SH_ASR, 12u);
+                }
+                emit_str_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_D(25u + k));
+                gte_emit_sat_ir(e, ARM_R7, ARM_R6, k + 1u, lm);
+                emit_str_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_D(9u + k));
+            }
             gte_emit_epilogue(e, false, 0u, opcode);
             return true;
         }
@@ -765,62 +991,8 @@ bool jit_emit_gte_inline(Emitter *e, u32 opcode) {
                 emit_ldr_imm(e, ARM_CC_AL, ARM_R0, JIT_REG_CPU, OFF_D(9u + k));
                 emit_sxth(e, ARM_CC_AL, ARM_R0, ARM_R0, 0u);
                 emit_smlal(e, ARM_CC_AL, ARM_R3, ARM_R4, ARM_R5, ARM_R0);
-                /* Check 32-bit overflow when sf=0 (Note: 44-bit cannot overflow since |MAC|<2^30) */
+                /* 44-bit cannot overflow since |MAC| < 2^30 */
                 gte_emit_shift_sf64(e, ARM_R1, ARM_R3, ARM_R4, sf12);
-                emit_str_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(25u + k));
-                gte_emit_sat_ir(e, ARM_R2, ARM_R1, k + 1u, lm);
-                emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(9u + k));
-            }
-            gte_emit_push_rgb_fifo(e);
-            gte_emit_epilogue(e, true, lbl_bounce, opcode);
-            return true;
-        }
-
-        case 0x10u:   /* DPCS */
-        case 0x11u: { /* INTPL */
-            u16 lbl_bounce = arm_label_create(e);
-            for (u32 k = 0u; k < 3u; ++k) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(21u + k)); /* RFC/GFC/BFC */
-                gte_emit_guard_2p30(e, ARM_R2, ARM_R3, lbl_bounce);
-            }
-            emit_const(e, GTE_REG_FLAG, 0u);
-            emit_ldr_imm(e, ARM_CC_AL, ARM_R6, JIT_REG_CPU, OFF_D(8u));
-            emit_sxth(e, ARM_CC_AL, ARM_R6, ARM_R6, 0u); /* IR0 */
-            if (fn == 0x10u) {
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R7, JIT_REG_CPU, OFF_D(6u)); /* RGBC */
-            }
-            for (u32 k = 0u; k < 3u; ++k) {
-                /* r5 = base[k] (fits in 32-bit signed: <= 0xFF0000 or +-0x8000000) */
-                if (fn == 0x10u) {
-                    if (k == 0u) {
-                        emit_uxtb(e, ARM_CC_AL, ARM_R5, ARM_R7);
-                    } else {
-                        emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R7, ARM_SH_LSR, k * 8u);
-                        emit_uxtb(e, ARM_CC_AL, ARM_R5, ARM_R5);
-                    }
-                    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R5, ARM_SH_LSL, 16u);
-                } else {
-                    emit_ldr_imm(e, ARM_CC_AL, ARM_R5, JIT_REG_CPU, OFF_D(9u + k));
-                    emit_sxth(e, ARM_CC_AL, ARM_R5, ARM_R5, 0u);
-                    emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R5, ARM_R5, ARM_SH_LSL, 12u);
-                }
-
-                /* a1 = (fc << 12) - base[k] in 64-bit r4:r3 */
-                emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_C(21u + k));
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R3, ARM_R2, ARM_SH_LSL, 12u);
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R4, ARM_R2, ARM_SH_ASR, 20u);
-                emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R0, ARM_R5, ARM_SH_ASR, 31u);
-                emit_alu_reg(e, ARM_CC_AL, ARM_OP_SUB, 1u /*S*/, ARM_R3, ARM_R3, ARM_R5);
-                emit_alu_reg(e, ARM_CC_AL, ARM_OP_SBC, 0u, ARM_R4, ARM_R4, ARM_R0);
-
-                /* Step 1 temporary IR always saturates (s32)(a1 >> sf) with lm = false */
-                gte_emit_shift_sf64(e, ARM_R1, ARM_R3, ARM_R4, sf12);
-                gte_emit_sat_ir(e, ARM_R2, ARM_R1, k + 1u, false);
-
-                /* Step 2: a2 = base[k] + ir0 * tmp_ir (fits in 32-bit signed!) */
-                emit_mul(e, ARM_CC_AL, ARM_R1, ARM_R6, ARM_R2);
-                emit_alu_reg(e, ARM_CC_AL, ARM_OP_ADD, 0u, ARM_R1, ARM_R5, ARM_R1);
-                if (sf12) emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R1, ARM_R1, ARM_SH_ASR, 12u);
                 emit_str_imm(e, ARM_CC_AL, ARM_R1, JIT_REG_CPU, OFF_D(25u + k));
                 gte_emit_sat_ir(e, ARM_R2, ARM_R1, k + 1u, lm);
                 emit_str_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, OFF_D(9u + k));

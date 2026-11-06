@@ -185,6 +185,131 @@ static void jit_ibtc_record(PsxSystem *sys, u32 pc, const JitBlock *b) {
 }
 
 /* ============================================================================
+ * In-block proven address facts (linear dataflow from block entry; reset per block)
+ *
+ * After a checked dynamic access `op rt, simm(rs)` falls through, the hardware
+ * guarantees (rs + simm) % width == 0, and (if KUc was checked) that the access
+ * did not fault on KUc. Later accesses off the same, unmodified base register
+ * whose offset keeps the proven residue skip the TST/B guard and its STUB_EXC.
+ * Any GPR write kills (or exactly propagates, for ADDIU/ADDU/SUBU/SLL/LUI/ANDI)
+ * the facts of its destination. KUc facts are only reused for the exact same
+ * (base, offset) pair (no wrap-around reasoning) and are dropped on any COP0 op.
+ * ============================================================================ */
+typedef struct AddrProof {
+    u8  al_bits[32];   /* number of known low address bits of GPR value (0..2) */
+    u8  al_res[32];    /* known residue modulo (1 << al_bits)                   */
+    u8  kuc_ok[32];    /* KUc guard passed for (gpr + kuc_simm)                 */
+    u32 kuc_simm[32];
+} AddrProof;
+
+static AddrProof g_proof;
+/* true iff ARM_R3 currently holds cpu->fastmem_w.p (consecutive-store hoisting) */
+static bool g_fmw_r3_live;
+
+static void proof_kill(u32 r) {
+    if (r != 0u) {
+        g_proof.al_bits[r] = 0u;
+        g_proof.kuc_ok[r] = 0u;
+    }
+}
+
+static void proof_get(u32 r, u32 *bits, u32 *res) {
+    if (r == 0u) {
+        *bits = 2u;
+        *res = 0u;
+    } else {
+        *bits = g_proof.al_bits[r];
+        *res = g_proof.al_res[r];
+    }
+}
+
+static void proof_set_al(u32 d, u32 bits, u32 res) {
+    if (d == 0u) {
+        return;
+    }
+    if (bits > 2u) {
+        bits = 2u;
+    }
+    g_proof.kuc_ok[d] = 0u;
+    g_proof.al_bits[d] = (u8)bits;
+    g_proof.al_res[d] = (u8)(res & ((1u << bits) - 1u));
+}
+
+/* Update facts for the GPR(s) written by `insn` (called after its code is emitted) */
+static void proof_after_insn(u32 insn) {
+    u32 op = insn >> 26;
+    u32 rs = (insn >> 21) & 31u;
+    u32 rt = (insn >> 16) & 31u;
+    u32 rd = (insn >> 11) & 31u;
+    u32 sh = (insn >> 6) & 31u;
+    u32 fn = insn & 63u;
+    u32 b1 = 0u, r1 = 0u, b2 = 0u, r2 = 0u;
+
+    switch (op) {
+        case 0x00u:
+            switch (fn) {
+                case 0x00u: /* SLL */
+                    if (insn != 0u) {
+                        proof_get(rt, &b1, &r1);
+                        proof_set_al(rd, b1 + sh, r1 << (sh & 31u));
+                    }
+                    return;
+                case 0x20u: case 0x21u: /* ADD / ADDU */
+                case 0x22u: case 0x23u: /* SUB / SUBU */
+                    proof_get(rs, &b1, &r1);
+                    proof_get(rt, &b2, &r2);
+                    proof_set_al(rd, (b1 < b2) ? b1 : b2, (fn <= 0x21u) ? (r1 + r2) : (r1 - r2));
+                    return;
+                case 0x08u: case 0x0Cu: case 0x0Du: case 0x11u: case 0x13u:
+                case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+                    return; /* JR / SYSCALL / BREAK / MTHI / MTLO / MULT / DIV: no GPR write */
+                default:
+                    proof_kill(rd);
+                    return;
+            }
+        case 0x01u: /* REGIMM: BLTZAL / BGEZAL link $ra even when untaken */
+            if ((rt & 0x1Eu) == 0x10u) {
+                proof_kill(31u);
+            }
+            return;
+        case 0x03u: /* JAL */
+            proof_kill(31u);
+            return;
+        case 0x08u: case 0x09u: /* ADDI / ADDIU */
+            proof_get(rs, &b1, &r1);
+            proof_set_al(rt, b1, r1 + (u32)(s32)(s16)(insn & 0xFFFFu));
+            return;
+        case 0x0Cu: /* ANDI: zero-extended mask clears low bits */
+            if ((insn & 3u) == 0u) {
+                proof_set_al(rt, 2u, 0u);
+            } else {
+                proof_kill(rt);
+            }
+            return;
+        case 0x0Fu: /* LUI */
+            proof_set_al(rt, 2u, 0u);
+            return;
+        case 0x0Au: case 0x0Bu: case 0x0Du: case 0x0Eu: /* SLTI / SLTIU / ORI / XORI */
+            proof_kill(rt);
+            return;
+        case 0x10u: case 0x11u: case 0x12u: case 0x13u: /* COPz */
+            if (rs == 0x00u || rs == 0x02u) {
+                proof_kill(rt); /* MFCz / CFCz */
+            }
+            if (op == 0x10u) {
+                memset(g_proof.kuc_ok, 0, sizeof(g_proof.kuc_ok)); /* SR may change */
+            }
+            return;
+        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+        case 0x24u: case 0x25u: case 0x26u: /* loads */
+            proof_kill(rt);
+            return;
+        default:
+            return; /* J, branches, stores, LWCz/SWCz: no GPR write */
+    }
+}
+
+/* ============================================================================
  * Code-Gen Sub-Emitters (Cold Stubs, Pending Loads, Terminators, Fastmem)
  * ============================================================================ */
 
@@ -325,6 +450,8 @@ static void emit_all_cold_stubs(Emitter *e, const JitRegAlloc *ra,
             emit_mov_reg(e, ARM_R2, (ArmReg)s->arm_reg);
             emit_mov_reg(e, ARM_R0, JIT_REG_CPU);
             emit_call(e, fn, true);
+            /* Re-establish r3 = fastmem_w so consecutive stores may reuse it */
+            emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_FASTMEM_W);
             emit_ldr_imm(e, ARM_CC_AL, ARM_R2, JIT_REG_CPU, PSX_OFF_JIT_ABORT);
             emit_cmp_imm_enc(e, ARM_CC_AL, ARM_R2, 0u);
             emit_b_label(e, ARM_CC_EQ, s->label_cont);
@@ -338,6 +465,7 @@ static void commit_prev_load_after_alu(Emitter *e, JitRegAlloc *ra, u32 *pend_re
     u32 pr = *pend_reg;
     if (pr != 0u) {
         if (pr != wreg) {
+            g_fmw_r3_live = false;
             emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_GTE_SCRATCH + 8);
             jit_ra_commit_write(e, ra, pr, ARM_R3);
         }
@@ -351,6 +479,7 @@ static void stage_new_delayed_load(Emitter *e, JitRegAlloc *ra, u32 *pend_reg,
     u32 pr = *pend_reg;
     if (pr != 0u && pr != new_rt) {
         ArmReg tmp = (val_reg == ARM_R3) ? ARM_R2 : ARM_R3;
+        g_fmw_r3_live = false;
         emit_ldr_imm(e, ARM_CC_AL, tmp, JIT_REG_CPU, PSX_OFF_GTE_SCRATCH + 8);
         jit_ra_commit_write(e, ra, pr, tmp);
     }
@@ -447,9 +576,38 @@ static void emit_addr_guards_r1(Emitter *e, const PsxSystem *sys, u32 start_pc,
                                 ColdStub *stubs, u32 *n_stubs,
                                 const JitRegAlloc *ra, u32 pend_reg,
                                 const JitDecodedInsn *dec, u16 block_cycles,
-                                u8 width, u8 fault_exc) {
+                                u8 width, u8 fault_exc, u32 rs, u32 simm) {
     bool check_align = sys->cfg.jit_check_align && (width > 1u);
     bool check_kuc = (start_pc < 0x80000000u) || sys->cfg.jit_check_kuc;
+    bool track = (rs != 0u) && !dec->known_rs;
+    u32 wbits = (width == 4u) ? 2u : ((width == 2u) ? 1u : 0u);
+
+    /* Elide guards already proven by an earlier fall-through access in this block */
+    if (check_align) {
+        if (dec->known_rs) {
+            check_align = ((dec->kval_rs + simm) & (width - 1u)) != 0u;
+        } else if (track && g_proof.al_bits[rs] >= wbits &&
+                   ((g_proof.al_res[rs] + simm) & (width - 1u)) == 0u) {
+            check_align = false;
+        }
+    }
+    bool kuc_emit = check_kuc;
+    if (check_kuc && track && g_proof.kuc_ok[rs] != 0u && g_proof.kuc_simm[rs] == simm) {
+        kuc_emit = false;
+    }
+
+    /* Facts that hold on the fall-through path of this access */
+    if (track) {
+        if (sys->cfg.jit_check_align && width > 1u && g_proof.al_bits[rs] < wbits) {
+            g_proof.al_bits[rs] = (u8)wbits;
+            g_proof.al_res[rs] = (u8)((0u - simm) & (width - 1u));
+        }
+        if (check_kuc) {
+            g_proof.kuc_ok[rs] = 1u;
+            g_proof.kuc_simm[rs] = simm;
+        }
+    }
+    check_kuc = kuc_emit;
     if (!check_align && !check_kuc) {
         return;
     }
@@ -523,7 +681,7 @@ static void emit_mem_load_to_reg(Emitter *e, const PsxSystem *sys, u32 start_pc,
     /* Dynamic fastmem load (6 ARMv6K instructions on aligned KSEG0/KSEG1 fastpath) */
     emit_calc_addr_r1(e, ra, dec, rs, simm);
     emit_addr_guards_r1(e, sys, start_pc, stubs, n_stubs, ra, pend_reg,
-                        dec, block_cycles, width, PSX_EXC_ADEL);
+                        dec, block_cycles, width, PSX_EXC_ADEL, rs, simm);
 
     ColdStub *s = push_mem_stub(e, stubs, n_stubs, STUB_MEM_LOAD, ra, pend_reg,
                                 dec, block_cycles, width, is_signed, dst_reg);
@@ -570,7 +728,9 @@ static void emit_mem_store_from_reg(Emitter *e, const PsxSystem *sys, u32 start_
         }
         u32 vp = caddr >> 12;
         emit_const(e, ARM_R1, caddr);
-        emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_FASTMEM_W);
+        if (!g_fmw_r3_live) {
+            emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_FASTMEM_W);
+        }
         if ((vp * 4u) < 4096u) {
             emit_ldr_imm(e, ARM_CC_AL, ARM_R2, ARM_R3, (s32)(vp * 4u));
         } else {
@@ -587,6 +747,7 @@ static void emit_mem_store_from_reg(Emitter *e, const PsxSystem *sys, u32 start_
         }
         emit_b_label(e, ARM_CC_EQ, s->label_entry);
         arm_label_bind(e, s->label_cont);
+        g_fmw_r3_live = true; /* slow stub reloads r3 before returning */
         return;
     }
 
@@ -605,7 +766,7 @@ static void emit_mem_store_from_reg(Emitter *e, const PsxSystem *sys, u32 start_
     /* Dynamic fastmem store (checks fm_w for SMC code pages and SR.IsC) */
     emit_calc_addr_r1(e, ra, dec, rs, simm);
     emit_addr_guards_r1(e, sys, start_pc, stubs, n_stubs, ra, pend_reg,
-                        dec, block_cycles, width, PSX_EXC_ADES);
+                        dec, block_cycles, width, PSX_EXC_ADES, rs, simm);
 
     ColdStub *s = push_mem_stub(e, stubs, n_stubs, STUB_MEM_STORE, ra, pend_reg,
                                 dec, block_cycles, width, false, val_reg);
@@ -613,7 +774,9 @@ static void emit_mem_store_from_reg(Emitter *e, const PsxSystem *sys, u32 start_
         return;
     }
 
-    emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_FASTMEM_W);
+    if (!g_fmw_r3_live) {
+        emit_ldr_imm(e, ARM_CC_AL, ARM_R3, JIT_REG_CPU, PSX_OFF_FASTMEM_W);
+    }
     emit_shift_imm(e, ARM_CC_AL, 0u, ARM_R2, ARM_R1, ARM_SH_LSR, 12u);
     emit_ldr_reg_lsl(e, ARM_CC_AL, ARM_R2, ARM_R3, ARM_R2, 2u);
     emit_cmp_imm_enc(e, ARM_CC_AL, ARM_R2, 0u);
@@ -626,6 +789,7 @@ static void emit_mem_store_from_reg(Emitter *e, const PsxSystem *sys, u32 start_
     }
     emit_b_label(e, ARM_CC_EQ, s->label_entry);
     arm_label_bind(e, s->label_cont);
+    g_fmw_r3_live = true; /* slow stub reloads r3 before returning */
 }
 
 /* ============================================================================
@@ -737,6 +901,8 @@ static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_p
 
     JitRegAlloc ra;
     jit_ra_init(&ra, &scan);
+    memset(&g_proof, 0, sizeof(g_proof));
+    g_fmw_r3_live = false;
 
     u32 n_stubs = 0u;
 
@@ -820,6 +986,11 @@ static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_p
         u32 fn = insn & 63u;
         u32 imm16 = insn & 0xFFFFu;
         u32 simm = (u32)(s32)(s16)imm16;
+
+        /* r3 = fastmem_w survives only across back-to-back SB/SH/SW */
+        if (op != 0x28u && op != 0x29u && op != 0x2Bu) {
+            g_fmw_r3_live = false;
+        }
 
         switch (op) {
             case 0x00u: { /* SPECIAL */
@@ -1364,9 +1535,10 @@ static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_p
 
                 if ((rs & 0x10u) != 0u) {
                     bool emitted_inline = false;
-                    if (sys->cfg.jit_inline_gte) {
-                        /* MANDATORY: spill DIRTY slots AND mark ALL 7 slots UNLOADED! */
-                        jit_ra_spill_and_invalidate_all(&e, &ra);
+                    if (sys->cfg.jit_inline_gte && jit_can_inline_gte(insn)) {
+                        /* Inline kernels clobber r0-r8 only: spill + unload r4-r8 slots,
+                         * keep r12 / lr slots live. C fallback (emit_call) preserves all 7. */
+                        jit_ra_spill_and_invalidate_r4_r8(&e, &ra);
                         emitted_inline = jit_emit_gte_inline(&e, insn);
                     }
                     if (!emitted_inline) {
@@ -1619,6 +1791,7 @@ static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_p
                 break;
             }
         }
+        proof_after_insn(insn);
     }
 
     /* 4. Block epilogue: dirty GPR writeback, pending load resolution & terminator */
@@ -1738,6 +1911,7 @@ emit_tails:
             (void)jit_block_add_ram_page(sys, b_idx, scan.ram_pages[k]);
         }
     }
+    jit_block_mark_code(sys, b);
 
     if (is_ram) {
         j->tab_ram[BLOCKTAB_RAM_IDX(start_pc)] = entry_rx;

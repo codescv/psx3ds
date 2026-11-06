@@ -187,9 +187,10 @@ int main(void) {
     CHECK(g_sys.bus.code_page_traps[page] == 1u);
     CHECK(g_sys.bus.code_page_mode[page] == (u8)PSX_PAGE_TRAP);
     psx_write32(c, 0x80003010u, 0x12345678u);
-    psx_write32(c, 0x80003010u, 0x12345678u); /* exceeds budget=2 -> flips to VERIFY */
-    CHECK(g_sys.bus.code_page_mode[page] == (u8)PSX_PAGE_VERIFY);
-    CHECK(g_sys.bus.fm_w[0x80003u] != 0u);
+    psx_write32(c, 0x80003010u, 0x12345678u); /* exceeds budget=2: page MUST stay trapped */
+    CHECK(g_sys.bus.code_page_traps[page] == 3u);
+    CHECK(g_sys.bus.code_page_mode[page] == (u8)PSX_PAGE_TRAP);
+    CHECK(g_sys.bus.fm_w[0x80003u] == 0u);
 
     bus_code_page_unref(&g_sys.bus, page);
     CHECK(g_sys.bus.code_page_refs[page] == 0u);
