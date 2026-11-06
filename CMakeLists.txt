@@ -318,4 +318,11 @@ function(psx3ds_add_unit_test test_name test_src)
     endif()
 endfunction()
 
-psx3ds_add_unit_test(test_layout tests/unit/test_layout.c)
+file(GLOB PSX3DS_UNIT_TEST_SRCS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_*.c"
+)
+list(SORT PSX3DS_UNIT_TEST_SRCS)
+foreach(_test_src IN LISTS PSX3DS_UNIT_TEST_SRCS)
+    get_filename_component(_test_name "${_test_src}" NAME_WE)
+    psx3ds_add_unit_test("${_test_name}" "${_test_src}")
+endforeach()

@@ -1,10 +1,10 @@
 # Build directories
-build/
-build-*/
-build*/
-out/
-bin/
-obj/
+/build/
+/build-*/
+/build*/
+/out/
+/bin/
+/obj/
 
 # Compiled objects and libraries
 *.o
@@ -46,8 +46,8 @@ Makefile.bak
 *.profdata
 perf.data*
 gmon.out
-core
-core.*
+/core
+/core.*
 
 # Proprietary BIOS images & runtime save files (keep open-source tests/roms/ tracked)
 *[Ss][Cc][Pp][Hh]*.[Bb][Ii][Nn]
