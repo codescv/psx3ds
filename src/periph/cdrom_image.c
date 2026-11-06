@@ -65,14 +65,26 @@ void cd_image_close(CdImage *img) {
     if (!img) {
         return;
     }
+    cd_io_lock(img);
+    CdChdState *old_chd = img->chd;
+    img->chd    = NULL;
+    img->loaded = false;
     for (u32 i = 0u; i < img->file_count && i < PSX_CD_MAX_FILES; i++) {
         periph_fclose(&img->files[i]);
     }
+    bool small_mem    = img->small_mem;
     bool motor_on     = img->motor_on;
     bool header_valid = img->header_valid;
     bool bfrd         = img->bfrd;
+    cd_io_unlock(img);
+
+    if (old_chd) {
+        cd_chd_close_state(old_chd);
+    }
+
     memset(img, 0, sizeof(*img));
     img->region_char  = 'A';
+    img->small_mem    = small_mem;
     img->motor_on     = motor_on;
     img->header_valid = header_valid;
     img->bfrd         = bfrd;
@@ -485,6 +497,14 @@ PsxResult cd_image_open(CdImage *img, const char *path) {
         return PSX_ERR_BAD_ARG;
     }
     cd_image_close(img);
+    if (cd_has_ext(path, ".chd") || (!cd_has_ext(path, ".cue") && cd_chd_has_magic(path))) {
+        PsxResult r = cd_chd_open(img, path);
+        if (r == PSX_OK) {
+            cd_detect_region(img);
+            cd_chd_reset_cache_stats(img);
+        }
+        return r;
+    }
     if (cd_has_ext(path, ".cue")) {
         return cd_open_cue(img, path);
     }
@@ -505,7 +525,7 @@ const CdTrack *cd_image_find_track(const CdImage *img, u32 lba) {
     return &img->tracks[0];
 }
 
-static void cd_synth_sync_msf(u32 lba, u8 mode_byte, u8 out_2352[2352]) {
+void cd_synth_sync_msf(u32 lba, u8 mode_byte, u8 out_2352[2352]) {
     out_2352[0] = 0x00u;
     memset(&out_2352[1], 0xFF, 10u);
     out_2352[11] = 0x00u;
@@ -518,12 +538,25 @@ static void cd_synth_sync_msf(u32 lba, u8 mode_byte, u8 out_2352[2352]) {
 }
 
 bool cd_image_read_sector(CdImage *img, u32 lba, u8 out_2352[2352]) {
-    if (!img || !img->loaded || !out_2352 || lba >= img->total_lba) {
+    if (!img || !out_2352) {
         if (out_2352) {
             memset(out_2352, 0, 2352u);
         }
         return false;
     }
+
+    cd_io_lock(img);
+    if (!img->loaded || lba >= img->total_lba) {
+        cd_io_unlock(img);
+        memset(out_2352, 0, 2352u);
+        return false;
+    }
+    if (img->chd) {
+        bool ok = cd_chd_read_sector_locked(img, lba, out_2352);
+        cd_io_unlock(img);
+        return ok;
+    }
+    cd_io_unlock(img);
 
     const CdTrack *t = cd_image_find_track(img, lba);
     if (!t || t->file_slot >= img->file_count) {

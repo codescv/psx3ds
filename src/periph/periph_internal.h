@@ -173,14 +173,18 @@ typedef struct CdTrack {
     u64         file_offset; /* byte offset of start_lba in backing file */
 } CdTrack;
 
+typedef struct CdChdState CdChdState;
+
 struct CdImage {
     bool        loaded;
+    bool        small_mem;
     u8          track_count;
     u8          first_track;
     u8          last_track;
     u8          region_char; /* 'A' (NTSC-U), 'E' (PAL), 'I' (NTSC-J) */
     u32         total_lba;
     u32         file_count;
+    CdChdState *chd;         /* non-NULL when backed by CHD v1-v5 image */
     char        file_paths[PSX_CD_MAX_FILES][256];
     PeriphFile  files[PSX_CD_MAX_FILES];
     CdTrack     tracks[PSX_CD_MAX_TRACKS];
@@ -199,6 +203,14 @@ void      cd_image_close(CdImage *img);
 PsxResult cd_image_open(CdImage *img, const char *path);
 bool      cd_image_read_sector(CdImage *img, u32 lba, u8 out_2352[2352]);
 const CdTrack *cd_image_find_track(const CdImage *img, u32 lba);
+void      cd_synth_sync_msf(u32 lba, u8 mode_byte, u8 out_2352[2352]);
+
+bool      cd_chd_has_magic(const char *path);
+PsxResult cd_chd_open(CdImage *img, const char *path);
+void      cd_chd_close_state(CdChdState *st);
+bool      cd_chd_read_sector_locked(CdImage *img, u32 lba, u8 out_2352[2352]);
+void      cd_chd_reset_cache_stats(CdImage *img);
+void      cd_chd_get_cache_stats(const CdImage *img, u64 *out_hits, u64 *out_misses, u32 *out_slots);
 
 void cd_lba_to_msf(u32 lba, u8 *mm, u8 *ss, u8 *ff);
 u32  cd_msf_to_lba(u8 mm, u8 ss, u8 ff);

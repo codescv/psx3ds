@@ -55,7 +55,7 @@ static u32 cd_sector_period(const PsxCdrom *cd) {
 
 static void cd_load_data_fifo(PsxCdrom *cd) {
     bool whole = (cd->mode & 0x20u) != 0u;
-    u32  off   = whole ? 12u : 24u;
+    u32  off   = whole ? 12u : ((cd->sector[15] == 0x01u) ? 16u : 24u);
     u32  len   = whole ? 2340u : 2048u;
     memcpy(cd->data_fifo, &cd->sector[off], len);
     cd->data_r     = 0u;
@@ -941,6 +941,9 @@ void cdrom_init(PsxSystem *sys) {
 
     cd->img = (CdImage *)arena_alloc(&sys->arena, (u32)sizeof(CdImage), 32u);
     cd_image_init(cd->img);
+    if (cd->img) {
+        cd->img->small_mem = sys->cfg.small_mem;
+    }
     cdrom_ra_init(sys);
 
     bus_mmio_register(sys, PSX_REG_CDROM_BASE, 0x10u, cdrom_mmio_read, cdrom_mmio_write);
@@ -1005,6 +1008,15 @@ PsxResult cdrom_load(PsxSystem *sys, const char *path) {
     cdrom_ra_reset(sys);
     cdrom_ra_seek(sys, 0u);
     return PSX_OK;
+}
+
+bool cdrom_is_chd(const PsxSystem *sys) {
+    return sys && sys->cdrom.img && sys->cdrom.img->loaded && (sys->cdrom.img->chd != NULL);
+}
+
+void cdrom_chd_cache_stats(const PsxSystem *sys, u64 *out_hits, u64 *out_misses, u32 *out_slots) {
+    const CdImage *img = sys ? sys->cdrom.img : NULL;
+    cd_chd_get_cache_stats(img, out_hits, out_misses, out_slots);
 }
 
 void cdrom_state(PsxSystem *sys, StateIO *st) {
