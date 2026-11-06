@@ -1,0 +1,70 @@
+# Build directories
+build/
+build-*/
+out/
+bin/
+obj/
+
+# Compiled objects and libraries
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.lo
+*.la
+
+# 3DS homebrew & shader build outputs
+*.elf
+*.3dsx
+*.smdh
+*.cia
+*.3ds
+*.cci
+*.shbin
+*.shbin.h
+*.shbin.o
+*.pica.o
+
+# CMake & Ninja artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+.ninja_deps
+.ninja_log
+Makefile.bak
+
+# Coverage, profiling, and crash artifacts
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
+perf.data*
+gmon.out
+core
+core.*
+
+# Proprietary BIOS images & runtime save files (keep open-source tests/roms/ tracked)
+*[Ss][Cc][Pp][Hh]*.[Bb][Ii][Nn]
+*.mcr
+*.mcd
+*.srm
+*.sav
+*.state
+
+# Python / scripts cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor & OS files
+.DS_Store
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
