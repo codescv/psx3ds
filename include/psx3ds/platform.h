@@ -44,4 +44,12 @@ bool plat_mkdir_p(const char *path);
 u32  plat_listdir(const char *path, char (*names)[256], u32 max);
 void plat_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* Media file writers (video_ppm.c / audio_wav.c on host) */
+PsxResult video_ppm_write_rgb555(const char *path, const u16 *vram,
+                                 u16 w, u16 h, u16 pitch_px, bool is24);
+PsxResult video_ppm_write_rgb24_raw(const char *path, const u8 *rgb24,
+                                    u16 w, u16 h, u32 pitch_bytes);
+PsxResult audio_wav_write(const char *path, const s16 *stereo,
+                          u32 frames, u32 sample_rate);
+
 #endif /* PSX3DS_PLATFORM_H */
