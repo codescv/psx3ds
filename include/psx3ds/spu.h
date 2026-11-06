@@ -39,6 +39,14 @@ typedef struct PsxSpu {
     u32      xa_w, xa_r;
     bool     async_mode, irq_enabled;
     u32      batch_tick;
+    /*
+     * Dual-core (Core 0 emulation / Core 1 async renderer) serialization: render_lock
+     * guards voice/reverb/RAM state; Core 1 never calls irq_raise() directly, it latches
+     * irq_pending which Core 0 delivers in spu_event_cb / Core-0 render paths.
+     */
+    alignas(32) u32 render_lock;
+    u32      irq_pending;
+    u8       defer_irq;
 } PsxSpu;
 
 void spu_init(PsxSystem *sys);
@@ -46,7 +54,16 @@ void spu_reset(PsxSystem *sys);
 void spu_state(PsxSystem *sys, StateIO *st);
 void spu_shutdown(PsxSystem *sys);
 
+/* Core 0: render `frames` (consuming queued commands first, free-running the rest) */
 void spu_render_batch(PsxSystem *sys, u32 frames);
+/*
+ * Core 1 async consumer: renders ONLY emulated time already queued by Core 0
+ * (SPU_CMD_REG_ADVANCE), up to max_frames, never free-running. Returns frames rendered
+ * (0 if the queue is empty or Core 0 holds the render lock).
+ */
+u32  spu_render_queued_async(PsxSystem *sys, u32 max_frames);
+/* Number of queued SpuCmd entries not yet consumed (any core). */
+u32  spu_cmd_backlog(const PsxSystem *sys);
 void spu_push_xa(PsxSystem *sys, const s16 *stereo, u32 frames);
 
 void spu_dma_write_words(PsxSystem *sys, const u32 *src, u32 n);

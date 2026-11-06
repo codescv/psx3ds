@@ -34,6 +34,12 @@ typedef struct GpuTexWindowKey {
     u8 off_y;
 } GpuTexWindowKey;
 
+/* Per-8x8-tile STP presence bitmasks for a 256x256 page (bit tx of row ty) */
+typedef struct GpuTexTileMasks {
+    u32 stp0[32]; /* tile holds >= 1 non-zero STP=0 texel */
+    u32 stp1[32]; /* tile holds >= 1 STP=1 texel (incl. 0x8000) */
+} GpuTexTileMasks;
+
 typedef struct GpuTexSlot {
     bool             valid;
     bool             texel_dirty;
@@ -54,6 +60,9 @@ typedef struct GpuTexSlot {
     u64              clut_col_mask;
     u32              clut_row_bit;
 
+    u32              last_frame;  /* GPU frame id that last referenced this slot (0 = never) */
+    GpuTexTileMasks  tiles;       /* per-8x8-tile STP=0 / STP=1 presence */
+
     void            *pixels;      /* Morton-tiled pixel buffer (u16 RGBA5551 or u32 RGBA8) */
     u32              pixel_bytes;
     void            *hw_tex;      /* C3D_Tex* on 3DS (NULL on T2/T3 host builds) */
@@ -64,6 +73,10 @@ typedef struct GpuTexCache {
     u32        lru_clock;
     u32        hits;
     u32        uploads;
+    u32        max_slots;   /* active slot count (64, or fewer on Old 3DS small_mem) */
+    u32        mru;         /* index of the most recently returned slot */
+    u32        cur_frame;   /* in-flight GPU frame id (0 = no frame tracking) */
+    bool       stalled;     /* last lookup failed: every slot is referenced by cur_frame */
     bool       allow_rgba8; /* true by default; false if small_mem forces RGBA5551 */
 } GpuTexCache;
 
@@ -116,25 +129,34 @@ static inline u32 gpu_psx_to_rgba8888(u16 psx) {
     return (r8 << 24) | (g8 << 16) | (b8 << 8) | a8;
 }
 
+/* All decoders accept tm == NULL; when non-NULL they fill per-8x8-tile STP masks. */
 GpuTexAlphaClass gpu_morton_decode_4bpp_5551(u16 *dst_morton, const u16 *vram,
                                              u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw);
+                                             const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
 GpuTexAlphaClass gpu_morton_decode_8bpp_5551(u16 *dst_morton, const u16 *vram,
                                              u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw);
+                                             const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
 GpuTexAlphaClass gpu_morton_decode_15bpp_5551(u16 *dst_morton, const u16 *vram,
                                               u16 tp_x, u16 tp_y,
-                                              const GpuTexWindowKey *tw);
+                                              const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
 
 GpuTexAlphaClass gpu_morton_decode_4bpp_8888(u32 *dst_morton, const u16 *vram,
                                              u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw);
+                                             const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
 GpuTexAlphaClass gpu_morton_decode_8bpp_8888(u32 *dst_morton, const u16 *vram,
                                              u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw);
+                                             const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
 GpuTexAlphaClass gpu_morton_decode_15bpp_8888(u32 *dst_morton, const u16 *vram,
                                               u16 tp_x, u16 tp_y,
-                                              const GpuTexWindowKey *tw);
+                                              const GpuTexWindowKey *tw, GpuTexTileMasks *tm);
+
+/*
+ * Classify the inclusive texel box [u_lo..u_hi] x [v_lo..v_hi] of a decoded page:
+ * ALL_OPAQUE (no STP=1 texel), ALL_STP (no non-zero STP=0 texel) or MIXED.
+ * Spans >= 256 texels (or hi < lo) are treated as covering the whole axis.
+ */
+GpuTexAlphaClass gpu_tex_tiles_classify(const GpuTexTileMasks *tm,
+                                        s32 u_lo, s32 v_lo, s32 u_hi, s32 v_hi);
 
 /* Swizzle an arbitrary linear PSX VRAM subrect into a WxH RGBA5551 Morton texture (opaque A=1) */
 void gpu_morton_swizzle_vram_rect_5551(u16 *dst_morton, u32 dst_w, u32 dst_h,
@@ -150,7 +172,21 @@ void gpu_morton_swizzle_vram_24bpp_8888(u32 *dst_morton, u32 dst_w, u32 dst_h,
 u32  gpu_clut_hash_fnv1a(const u16 *vram, u16 clut_attr, u8 tex_depth);
 void gpu_vram_rect_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *out_rows);
 
-bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8);
+/* Old 3DS (small_mem) slot cap: 20 x 128 KiB RGBA5551 pages = 2.5 MiB LINEAR RAM */
+#define GPU_HW_TEXCACHE_SLOTS_SMALL 20u
+
+/* max_slots is clamped to [1, GPU_HW_TEXCACHE_SLOTS] (0 selects the full 64) */
+bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8, u32 max_slots);
+
+/*
+ * In-flight tracking: slots referenced while tc->cur_frame == F are never re-decoded,
+ * re-allocated or freed until cur_frame advances (the PICA200 has not consumed them yet).
+ * When every active slot is in flight, lookup returns NULL and sets tc->stalled; the
+ * backend must submit + wait for the GPU, advance cur_frame and retry.
+ */
+static inline void gpu_texcache_set_frame(GpuTexCache *tc, u32 frame_id) {
+    tc->cur_frame = frame_id;
+}
 void gpu_texcache_reset(GpuTexCache *tc);
 void gpu_texcache_shutdown(GpuTexCache *tc);
 void gpu_texcache_invalidate_vram(GpuTexCache *tc, u16 x, u16 y, u16 w, u16 h);

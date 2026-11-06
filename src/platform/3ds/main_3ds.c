@@ -27,6 +27,7 @@ typedef struct CtrAutorunCfg {
     char json[256];
     char tty[256];
     char done[256];
+    int  small_mem; /* -1 = auto (O3DS), 0 = force off, 1 = force Old-3DS memory profile */
 } CtrAutorunCfg;
 
 static char *trim_ws(char *s) {
@@ -43,6 +44,7 @@ static char *trim_ws(char *s) {
 static bool parse_autorun_cfg(CtrAutorunCfg *ar) {
     memset(ar, 0, sizeof(*ar));
     ar->frames = 120u;
+    ar->small_mem = -1;
 
     FILE *fp = fopen(AUTORUN_CFG_PATH, "r");
     if (!fp) {
@@ -92,6 +94,8 @@ static bool parse_autorun_cfg(CtrAutorunCfg *ar) {
             snprintf(ar->tty, sizeof(ar->tty), "%s", val);
         } else if (strcmp(key, "done") == 0) {
             snprintf(ar->done, sizeof(ar->done), "%s", val);
+        } else if (strcmp(key, "small_mem") == 0) {
+            ar->small_mem = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0) ? 1 : 0;
         }
     }
     fclose(fp);
@@ -135,6 +139,12 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         cfg.gpu_backend = GPU_BACKEND_SOFT;
     } else if (strcmp(ar->gpu, "hw") == 0) {
         cfg.gpu_backend = GPU_BACKEND_HW;
+    }
+    if (ar->small_mem >= 0) {
+        /* Mirror psx_config_defaults() O3DS/N3DS budgets for an explicit override */
+        cfg.small_mem      = (ar->small_mem != 0);
+        cfg.jit_code_bytes = cfg.small_mem ? 6u * 1024u * 1024u : 16u * 1024u * 1024u;
+        cfg.jit_max_blocks = cfg.small_mem ? 32768u : 65536u;
     }
     if (strcmp(ar->cpu, "interp") == 0) {
         cfg.cpu_engine = CPU_INTERP;
@@ -262,9 +272,22 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     return 0;
 }
 
+/* Save/load with Core 1 (SPU) and Core 2 (CD readahead) workers quiesced */
+static PsxResult state_io_quiesced(PsxSystem *sys, CtrHwInfo *hw, const char *path, bool save) {
+    ctr_threads_stop_workers(sys, hw);
+    PsxResult rc = save ? psx_state_save_file(sys, path) : psx_state_load_file(sys, path);
+    ctr_threads_start_workers(sys, hw);
+    return rc;
+}
+
 static PsxResult boot_game_into_system(PsxSystem *sys, CtrUiState *ui, CtrHwInfo *hw,
                                        const char *boot_path) {
     ctr_threads_stop_workers(sys, hw);
+    /*
+     * Mark the system unloaded BEFORE tearing it down: if init/load below fails, the main
+     * loop must not keep calling psx_run_frame() on the destroyed arena.
+     */
+    ui->game_loaded = false;
     psx_system_shutdown(sys);
 
     PsxConfig cfg;
@@ -396,7 +419,7 @@ int main(int argc, char **argv) {
                     break;
                 case CTR_UI_SAVE_STATE:
                     format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
-                    if (psx_state_save_file(sys, st_path) == PSX_OK) {
+                    if (state_io_quiesced(sys, &hw, st_path, true) == PSX_OK) {
                         ctr_ui_set_status(ui, "Saved state to SD card");
                     } else {
                         ctr_ui_set_status(ui, "Save state failed");
@@ -404,7 +427,7 @@ int main(int argc, char **argv) {
                     break;
                 case CTR_UI_LOAD_STATE:
                     format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
-                    if (psx_state_load_file(sys, st_path) == PSX_OK) {
+                    if (state_io_quiesced(sys, &hw, st_path, false) == PSX_OK) {
                         ctr_ui_set_status(ui, "Loaded state from SD card");
                     } else {
                         ctr_ui_set_status(ui, "State slot empty or invalid");
@@ -425,7 +448,7 @@ int main(int argc, char **argv) {
             if (hkeys.save_state) {
                 char st_path[256];
                 format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
-                (void)psx_state_save_file(sys, st_path);
+                (void)state_io_quiesced(sys, &hw, st_path, true);
                 ctr_ui_set_status(ui, "Quick-saved state (L+R+X)");
             }
             psx_run_frame(sys);

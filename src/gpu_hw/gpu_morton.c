@@ -1,5 +1,7 @@
 #include "psx3ds/gpu_hw.h"
 
+#include <string.h>
+
 /*
  * PICA200 8x8 Z-order (Morton) intra-tile lookup table:
  *   index = morton_x[x] | morton_y[y]
@@ -25,6 +27,7 @@ u32 gpu_morton_index(u32 x, u32 y, u32 width) {
     return (tile_idx << 6) + (u32)gpu_morton8x8_lut[y & 7u][x & 7u];
 }
 
+/* bit0 = non-zero STP=0 texel present, bit1 = STP=1 texel present (0x0000 contributes nothing) */
 static inline u8 psx_texel_class_bits(u16 psx) {
     if (psx == 0x0000u) {
         return 0u;
@@ -46,6 +49,24 @@ static inline bool tw_is_active(const GpuTexWindowKey *tw) {
     return tw != NULL && ((tw->mask_x & 0x1Fu) != 0u || (tw->mask_y & 0x1Fu) != 0u);
 }
 
+static inline void tile_masks_clear(GpuTexTileMasks *tm) {
+    if (tm != NULL) {
+        memset(tm, 0, sizeof(*tm));
+    }
+}
+
+static inline void tile_masks_record(GpuTexTileMasks *tm, u32 tx, u32 ty, u32 tcls) {
+    if (tm != NULL) {
+        u32 bit = 1u << tx;
+        if (tcls & 1u) {
+            tm->stp0[ty] |= bit;
+        }
+        if (tcls & 2u) {
+            tm->stp1[ty] |= bit;
+        }
+    }
+}
+
 static void build_tw_maps(const GpuTexWindowKey *tw, u8 u_map[256], u8 v_map[256]) {
     u32 mx = (u32)(tw->mask_x & 0x1Fu) * 8u;
     u32 my = (u32)(tw->mask_y & 0x1Fu) * 8u;
@@ -57,396 +78,252 @@ static void build_tw_maps(const GpuTexWindowKey *tw, u8 u_map[256], u8 v_map[256
     }
 }
 
-/* --------------------------------------------------------------------------
- * 4bpp CLUT -> RGBA5551 / RGBA8888 (256x256 TexPage)
- * -------------------------------------------------------------------------- */
-GpuTexAlphaClass gpu_morton_decode_4bpp_5551(u16 *dst_morton, const u16 *vram,
-                                             u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw) {
-    u16 clut5551[16];
-    u8  clut_cls[16];
-    const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);
-    for (u32 i = 0; i < 16u; ++i) {
-        u16 c = clut_row[(clut_x + i) & 0x3FFu];
-        clut5551[i] = gpu_psx_to_rgba5551(c);
-        clut_cls[i] = psx_texel_class_bits(c);
+/*
+ * Region STP classification from per-8x8-tile masks. Coordinates are inclusive texel
+ * bounds inside the 256x256 page; spans >= 256 (wrapping / repeat) cover the full axis.
+ */
+GpuTexAlphaClass gpu_tex_tiles_classify(const GpuTexTileMasks *tm,
+                                        s32 u_lo, s32 v_lo, s32 u_hi, s32 v_hi) {
+    if (tm == NULL) {
+        return GPU_TEX_ALPHA_MIXED;
+    }
+    u32 col_mask;
+    if (u_hi < u_lo || (u_hi - u_lo) >= 255) {
+        col_mask = 0xFFFFFFFFu;
+    } else {
+        u32 c0 = ((u32)u_lo & 0xFFu) >> 3;
+        u32 c1 = ((u32)u_hi & 0xFFu) >> 3;
+        if (c0 <= c1) {
+            u32 n = c1 - c0 + 1u;
+            col_mask = (n >= 32u) ? 0xFFFFFFFFu : (((1u << n) - 1u) << c0);
+        } else {
+            /* wrapped across u = 255 -> 0 */
+            col_mask = (0xFFFFFFFFu << c0) | ((c1 >= 31u) ? 0xFFFFFFFFu : ((2u << c1) - 1u));
+        }
     }
 
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 vx0 = ((u32)tp_x + (tx << 1) + 0u) & 0x3FFu;
-                u32 vx1 = ((u32)tp_x + (tx << 1) + 1u) & 0x3FFu;
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 w0 = vrow[vx0];
-                    u32 w1 = vrow[vx1];
-                    u32 n0 = w0 & 0xFu;
-                    u32 n1 = (w0 >> 4) & 0xFu;
-                    u32 n2 = (w0 >> 8) & 0xFu;
-                    u32 n3 = (w0 >> 12) & 0xFu;
-                    u32 n4 = w1 & 0xFu;
-                    u32 n5 = (w1 >> 4) & 0xFu;
-                    u32 n6 = (w1 >> 8) & 0xFu;
-                    u32 n7 = (w1 >> 12) & 0xFu;
-                    u32 my = k_morton_y[ry];
+    u32 r0, r1;
+    bool v_full = (v_hi < v_lo || (v_hi - v_lo) >= 255);
+    if (v_full) {
+        r0 = 0u;
+        r1 = 31u;
+    } else {
+        r0 = ((u32)v_lo & 0xFFu) >> 3;
+        r1 = ((u32)v_hi & 0xFFu) >> 3;
+    }
 
-                    tile[my +  0u] = clut5551[n0];
-                    tile[my +  1u] = clut5551[n1];
-                    tile[my +  4u] = clut5551[n2];
-                    tile[my +  5u] = clut5551[n3];
-                    tile[my + 16u] = clut5551[n4];
-                    tile[my + 17u] = clut5551[n5];
-                    tile[my + 20u] = clut5551[n6];
-                    tile[my + 21u] = clut5551[n7];
-
-                    cls_mask |= (u32)(clut_cls[n0] | clut_cls[n1] | clut_cls[n2] | clut_cls[n3] |
-                                      clut_cls[n4] | clut_cls[n5] | clut_cls[n6] | clut_cls[n7]);
-                }
-            }
+    u32 acc0 = 0u, acc1 = 0u;
+    if (r0 <= r1) {
+        for (u32 r = r0; r <= r1; ++r) {
+            acc0 |= tm->stp0[r];
+            acc1 |= tm->stp1[r];
         }
     } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 w = vrow[((u32)tp_x + (u >> 2)) & 0x3FFu];
-                        u32 nib = (w >> ((u & 3u) << 2)) & 0xFu;
-                        tile[my + k_morton_x[rx]] = clut5551[nib];
-                        cls_mask |= clut_cls[nib];
-                    }
-                }
-            }
+        for (u32 r = r0; r < 32u; ++r) {
+            acc0 |= tm->stp0[r];
+            acc1 |= tm->stp1[r];
+        }
+        for (u32 r = 0u; r <= r1; ++r) {
+            acc0 |= tm->stp0[r];
+            acc1 |= tm->stp1[r];
         }
     }
-    return mask_to_alpha_class(cls_mask);
-}
-
-GpuTexAlphaClass gpu_morton_decode_4bpp_8888(u32 *dst_morton, const u16 *vram,
-                                             u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw) {
-    u32 clut8888[16];
-    u8  clut_cls[16];
-    const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);
-    for (u32 i = 0; i < 16u; ++i) {
-        u16 c = clut_row[(clut_x + i) & 0x3FFu];
-        clut8888[i] = gpu_psx_to_rgba8888(c);
-        clut_cls[i] = psx_texel_class_bits(c);
+    bool has0 = (acc0 & col_mask) != 0u;
+    bool has1 = (acc1 & col_mask) != 0u;
+    if (has0 && has1) {
+        return GPU_TEX_ALPHA_MIXED;
     }
-
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 vx0 = ((u32)tp_x + (tx << 1) + 0u) & 0x3FFu;
-                u32 vx1 = ((u32)tp_x + (tx << 1) + 1u) & 0x3FFu;
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 w0 = vrow[vx0];
-                    u32 w1 = vrow[vx1];
-                    u32 n0 = w0 & 0xFu;
-                    u32 n1 = (w0 >> 4) & 0xFu;
-                    u32 n2 = (w0 >> 8) & 0xFu;
-                    u32 n3 = (w0 >> 12) & 0xFu;
-                    u32 n4 = w1 & 0xFu;
-                    u32 n5 = (w1 >> 4) & 0xFu;
-                    u32 n6 = (w1 >> 8) & 0xFu;
-                    u32 n7 = (w1 >> 12) & 0xFu;
-                    u32 my = k_morton_y[ry];
-
-                    tile[my +  0u] = clut8888[n0];
-                    tile[my +  1u] = clut8888[n1];
-                    tile[my +  4u] = clut8888[n2];
-                    tile[my +  5u] = clut8888[n3];
-                    tile[my + 16u] = clut8888[n4];
-                    tile[my + 17u] = clut8888[n5];
-                    tile[my + 20u] = clut8888[n6];
-                    tile[my + 21u] = clut8888[n7];
-
-                    cls_mask |= (u32)(clut_cls[n0] | clut_cls[n1] | clut_cls[n2] | clut_cls[n3] |
-                                      clut_cls[n4] | clut_cls[n5] | clut_cls[n6] | clut_cls[n7]);
-                }
-            }
-        }
-    } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 w = vrow[((u32)tp_x + (u >> 2)) & 0x3FFu];
-                        u32 nib = (w >> ((u & 3u) << 2)) & 0xFu;
-                        tile[my + k_morton_x[rx]] = clut8888[nib];
-                        cls_mask |= clut_cls[nib];
-                    }
-                }
-            }
-        }
-    }
-    return mask_to_alpha_class(cls_mask);
+    return has1 ? GPU_TEX_ALPHA_ALL_STP : GPU_TEX_ALPHA_ALL_OPAQUE;
 }
 
 /* --------------------------------------------------------------------------
- * 8bpp CLUT -> RGBA5551 / RGBA8888 (256x256 TexPage)
+ * Generic decode skeletons (T = u16 RGBA5551 or u32 RGBA8888)
  * -------------------------------------------------------------------------- */
-GpuTexAlphaClass gpu_morton_decode_8bpp_5551(u16 *dst_morton, const u16 *vram,
-                                             u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw) {
-    u16 clut5551[256];
-    u8  clut_cls[256];
-    const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);
-    for (u32 i = 0; i < 256u; ++i) {
-        u16 c = clut_row[(clut_x + i) & 0x3FFu];
-        clut5551[i] = gpu_psx_to_rgba5551(c);
-        clut_cls[i] = psx_texel_class_bits(c);
+#define DEFINE_DECODE_CLUT4(NAME, T, CONV)                                                     \
+    GpuTexAlphaClass NAME(T *dst_morton, const u16 *vram, u16 tp_x, u16 tp_y,                  \
+                          u16 clut_x, u16 clut_y, const GpuTexWindowKey *tw,                   \
+                          GpuTexTileMasks *tm) {                                               \
+        T  clut[16];                                                                           \
+        u8 ccls[16];                                                                           \
+        const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);                           \
+        for (u32 i = 0; i < 16u; ++i) {                                                        \
+            u16 c = clut_row[(clut_x + i) & 0x3FFu];                                           \
+            clut[i] = CONV(c);                                                                 \
+            ccls[i] = psx_texel_class_bits(c);                                                 \
+        }                                                                                      \
+        tile_masks_clear(tm);                                                                  \
+        u32 cls_mask = 0u;                                                                     \
+        if (!tw_is_active(tw)) {                                                               \
+            for (u32 ty = 0; ty < 32u; ++ty) {                                                 \
+                for (u32 tx = 0; tx < 32u; ++tx) {                                             \
+                    T *tile = dst_morton + (((ty << 5) + tx) << 6);                            \
+                    u32 vx0 = ((u32)tp_x + (tx << 1) + 0u) & 0x3FFu;                           \
+                    u32 vx1 = ((u32)tp_x + (tx << 1) + 1u) & 0x3FFu;                           \
+                    u32 tcls = 0u;                                                             \
+                    for (u32 ry = 0; ry < 8u; ++ry) {                                          \
+                        u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;                        \
+                        const u16 *vrow = vram + (vy << 10);                                   \
+                        u32 w0 = vrow[vx0];                                                    \
+                        u32 w1 = vrow[vx1];                                                    \
+                        u32 n0 = w0 & 0xFu, n1 = (w0 >> 4) & 0xFu;                             \
+                        u32 n2 = (w0 >> 8) & 0xFu, n3 = (w0 >> 12) & 0xFu;                     \
+                        u32 n4 = w1 & 0xFu, n5 = (w1 >> 4) & 0xFu;                             \
+                        u32 n6 = (w1 >> 8) & 0xFu, n7 = (w1 >> 12) & 0xFu;                     \
+                        u32 my = k_morton_y[ry];                                               \
+                        tile[my +  0u] = clut[n0];                                             \
+                        tile[my +  1u] = clut[n1];                                             \
+                        tile[my +  4u] = clut[n2];                                             \
+                        tile[my +  5u] = clut[n3];                                             \
+                        tile[my + 16u] = clut[n4];                                             \
+                        tile[my + 17u] = clut[n5];                                             \
+                        tile[my + 20u] = clut[n6];                                             \
+                        tile[my + 21u] = clut[n7];                                             \
+                        tcls |= (u32)(ccls[n0] | ccls[n1] | ccls[n2] | ccls[n3] |              \
+                                      ccls[n4] | ccls[n5] | ccls[n6] | ccls[n7]);              \
+                    }                                                                          \
+                    tile_masks_record(tm, tx, ty, tcls);                                       \
+                    cls_mask |= tcls;                                                          \
+                }                                                                              \
+            }                                                                                  \
+        } else {                                                                               \
+            u8 u_map[256], v_map[256];                                                         \
+            build_tw_maps(tw, u_map, v_map);                                                   \
+            for (u32 ty = 0; ty < 32u; ++ty) {                                                 \
+                for (u32 tx = 0; tx < 32u; ++tx) {                                             \
+                    T *tile = dst_morton + (((ty << 5) + tx) << 6);                            \
+                    u32 tcls = 0u;                                                             \
+                    for (u32 ry = 0; ry < 8u; ++ry) {                                          \
+                        u32 v = v_map[(ty << 3) + ry];                                         \
+                        const u16 *vrow = vram + ((((u32)tp_y + v) & 0x1FFu) << 10);           \
+                        u32 my = k_morton_y[ry];                                               \
+                        for (u32 rx = 0; rx < 8u; ++rx) {                                      \
+                            u32 u = u_map[(tx << 3) + rx];                                     \
+                            u16 w = vrow[((u32)tp_x + (u >> 2)) & 0x3FFu];                     \
+                            u32 nib = (w >> ((u & 3u) << 2)) & 0xFu;                           \
+                            tile[my + k_morton_x[rx]] = clut[nib];                             \
+                            tcls |= ccls[nib];                                                 \
+                        }                                                                      \
+                    }                                                                          \
+                    tile_masks_record(tm, tx, ty, tcls);                                       \
+                    cls_mask |= tcls;                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        return mask_to_alpha_class(cls_mask);                                                  \
     }
 
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 vx0 = ((u32)tp_x + (tx << 2) + 0u) & 0x3FFu;
-                u32 vx1 = ((u32)tp_x + (tx << 2) + 1u) & 0x3FFu;
-                u32 vx2 = ((u32)tp_x + (tx << 2) + 2u) & 0x3FFu;
-                u32 vx3 = ((u32)tp_x + (tx << 2) + 3u) & 0x3FFu;
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 w0 = vrow[vx0];
-                    u32 w1 = vrow[vx1];
-                    u32 w2 = vrow[vx2];
-                    u32 w3 = vrow[vx3];
-                    u32 b0 = w0 & 0xFFu, b1 = w0 >> 8;
-                    u32 b2 = w1 & 0xFFu, b3 = w1 >> 8;
-                    u32 b4 = w2 & 0xFFu, b5 = w2 >> 8;
-                    u32 b6 = w3 & 0xFFu, b7 = w3 >> 8;
-                    u32 my = k_morton_y[ry];
-
-                    tile[my +  0u] = clut5551[b0];
-                    tile[my +  1u] = clut5551[b1];
-                    tile[my +  4u] = clut5551[b2];
-                    tile[my +  5u] = clut5551[b3];
-                    tile[my + 16u] = clut5551[b4];
-                    tile[my + 17u] = clut5551[b5];
-                    tile[my + 20u] = clut5551[b6];
-                    tile[my + 21u] = clut5551[b7];
-
-                    cls_mask |= (u32)(clut_cls[b0] | clut_cls[b1] | clut_cls[b2] | clut_cls[b3] |
-                                      clut_cls[b4] | clut_cls[b5] | clut_cls[b6] | clut_cls[b7]);
-                }
-            }
-        }
-    } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 w = vrow[((u32)tp_x + (u >> 1)) & 0x3FFu];
-                        u32 idx = (w >> ((u & 1u) << 3)) & 0xFFu;
-                        tile[my + k_morton_x[rx]] = clut5551[idx];
-                        cls_mask |= clut_cls[idx];
-                    }
-                }
-            }
-        }
+#define DEFINE_DECODE_CLUT8(NAME, T, CONV)                                                     \
+    GpuTexAlphaClass NAME(T *dst_morton, const u16 *vram, u16 tp_x, u16 tp_y,                  \
+                          u16 clut_x, u16 clut_y, const GpuTexWindowKey *tw,                   \
+                          GpuTexTileMasks *tm) {                                               \
+        T  clut[256];                                                                          \
+        u8 ccls[256];                                                                          \
+        const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);                           \
+        for (u32 i = 0; i < 256u; ++i) {                                                       \
+            u16 c = clut_row[(clut_x + i) & 0x3FFu];                                           \
+            clut[i] = CONV(c);                                                                 \
+            ccls[i] = psx_texel_class_bits(c);                                                 \
+        }                                                                                      \
+        tile_masks_clear(tm);                                                                  \
+        u32 cls_mask = 0u;                                                                     \
+        if (!tw_is_active(tw)) {                                                               \
+            for (u32 ty = 0; ty < 32u; ++ty) {                                                 \
+                for (u32 tx = 0; tx < 32u; ++tx) {                                             \
+                    T *tile = dst_morton + (((ty << 5) + tx) << 6);                            \
+                    u32 vx0 = ((u32)tp_x + (tx << 2) + 0u) & 0x3FFu;                           \
+                    u32 vx1 = ((u32)tp_x + (tx << 2) + 1u) & 0x3FFu;                           \
+                    u32 vx2 = ((u32)tp_x + (tx << 2) + 2u) & 0x3FFu;                           \
+                    u32 vx3 = ((u32)tp_x + (tx << 2) + 3u) & 0x3FFu;                           \
+                    u32 tcls = 0u;                                                             \
+                    for (u32 ry = 0; ry < 8u; ++ry) {                                          \
+                        u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;                        \
+                        const u16 *vrow = vram + (vy << 10);                                   \
+                        u32 w0 = vrow[vx0], w1 = vrow[vx1], w2 = vrow[vx2], w3 = vrow[vx3];    \
+                        u32 b0 = w0 & 0xFFu, b1 = w0 >> 8;                                     \
+                        u32 b2 = w1 & 0xFFu, b3 = w1 >> 8;                                     \
+                        u32 b4 = w2 & 0xFFu, b5 = w2 >> 8;                                     \
+                        u32 b6 = w3 & 0xFFu, b7 = w3 >> 8;                                     \
+                        u32 my = k_morton_y[ry];                                               \
+                        tile[my +  0u] = clut[b0];                                             \
+                        tile[my +  1u] = clut[b1];                                             \
+                        tile[my +  4u] = clut[b2];                                             \
+                        tile[my +  5u] = clut[b3];                                             \
+                        tile[my + 16u] = clut[b4];                                             \
+                        tile[my + 17u] = clut[b5];                                             \
+                        tile[my + 20u] = clut[b6];                                             \
+                        tile[my + 21u] = clut[b7];                                             \
+                        tcls |= (u32)(ccls[b0] | ccls[b1] | ccls[b2] | ccls[b3] |              \
+                                      ccls[b4] | ccls[b5] | ccls[b6] | ccls[b7]);              \
+                    }                                                                          \
+                    tile_masks_record(tm, tx, ty, tcls);                                       \
+                    cls_mask |= tcls;                                                          \
+                }                                                                              \
+            }                                                                                  \
+        } else {                                                                               \
+            u8 u_map[256], v_map[256];                                                         \
+            build_tw_maps(tw, u_map, v_map);                                                   \
+            for (u32 ty = 0; ty < 32u; ++ty) {                                                 \
+                for (u32 tx = 0; tx < 32u; ++tx) {                                             \
+                    T *tile = dst_morton + (((ty << 5) + tx) << 6);                            \
+                    u32 tcls = 0u;                                                             \
+                    for (u32 ry = 0; ry < 8u; ++ry) {                                          \
+                        u32 v = v_map[(ty << 3) + ry];                                         \
+                        const u16 *vrow = vram + ((((u32)tp_y + v) & 0x1FFu) << 10);           \
+                        u32 my = k_morton_y[ry];                                               \
+                        for (u32 rx = 0; rx < 8u; ++rx) {                                      \
+                            u32 u = u_map[(tx << 3) + rx];                                     \
+                            u16 w = vrow[((u32)tp_x + (u >> 1)) & 0x3FFu];                     \
+                            u32 idx = (w >> ((u & 1u) << 3)) & 0xFFu;                          \
+                            tile[my + k_morton_x[rx]] = clut[idx];                             \
+                            tcls |= ccls[idx];                                                 \
+                        }                                                                      \
+                    }                                                                          \
+                    tile_masks_record(tm, tx, ty, tcls);                                       \
+                    cls_mask |= tcls;                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        return mask_to_alpha_class(cls_mask);                                                  \
     }
-    return mask_to_alpha_class(cls_mask);
-}
 
-GpuTexAlphaClass gpu_morton_decode_8bpp_8888(u32 *dst_morton, const u16 *vram,
-                                             u16 tp_x, u16 tp_y, u16 clut_x, u16 clut_y,
-                                             const GpuTexWindowKey *tw) {
-    u32 clut8888[256];
-    u8  clut_cls[256];
-    const u16 *clut_row = vram + (((u32)clut_y & 0x1FFu) << 10);
-    for (u32 i = 0; i < 256u; ++i) {
-        u16 c = clut_row[(clut_x + i) & 0x3FFu];
-        clut8888[i] = gpu_psx_to_rgba8888(c);
-        clut_cls[i] = psx_texel_class_bits(c);
+#define DEFINE_DECODE_15BPP(NAME, T, CONV)                                                     \
+    GpuTexAlphaClass NAME(T *dst_morton, const u16 *vram, u16 tp_x, u16 tp_y,                  \
+                          const GpuTexWindowKey *tw, GpuTexTileMasks *tm) {                    \
+        tile_masks_clear(tm);                                                                  \
+        u32 cls_mask = 0u;                                                                     \
+        bool twa = tw_is_active(tw);                                                           \
+        u8 u_map[256], v_map[256];                                                             \
+        if (twa) {                                                                             \
+            build_tw_maps(tw, u_map, v_map);                                                   \
+        }                                                                                      \
+        for (u32 ty = 0; ty < 32u; ++ty) {                                                     \
+            for (u32 tx = 0; tx < 32u; ++tx) {                                                 \
+                T *tile = dst_morton + (((ty << 5) + tx) << 6);                                \
+                u32 tcls = 0u;                                                                 \
+                for (u32 ry = 0; ry < 8u; ++ry) {                                              \
+                    u32 v = twa ? v_map[(ty << 3) + ry] : ((ty << 3) + ry);                    \
+                    const u16 *vrow = vram + ((((u32)tp_y + v) & 0x1FFu) << 10);               \
+                    u32 my = k_morton_y[ry];                                                   \
+                    for (u32 rx = 0; rx < 8u; ++rx) {                                          \
+                        u32 u = twa ? u_map[(tx << 3) + rx] : ((tx << 3) + rx);                \
+                        u16 c = vrow[((u32)tp_x + u) & 0x3FFu];                                \
+                        tile[my + k_morton_x[rx]] = CONV(c);                                   \
+                        tcls |= psx_texel_class_bits(c);                                       \
+                    }                                                                          \
+                }                                                                              \
+                tile_masks_record(tm, tx, ty, tcls);                                           \
+                cls_mask |= tcls;                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        return mask_to_alpha_class(cls_mask);                                                  \
     }
 
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 vx0 = ((u32)tp_x + (tx << 2) + 0u) & 0x3FFu;
-                u32 vx1 = ((u32)tp_x + (tx << 2) + 1u) & 0x3FFu;
-                u32 vx2 = ((u32)tp_x + (tx << 2) + 2u) & 0x3FFu;
-                u32 vx3 = ((u32)tp_x + (tx << 2) + 3u) & 0x3FFu;
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 w0 = vrow[vx0];
-                    u32 w1 = vrow[vx1];
-                    u32 w2 = vrow[vx2];
-                    u32 w3 = vrow[vx3];
-                    u32 b0 = w0 & 0xFFu, b1 = w0 >> 8;
-                    u32 b2 = w1 & 0xFFu, b3 = w1 >> 8;
-                    u32 b4 = w2 & 0xFFu, b5 = w2 >> 8;
-                    u32 b6 = w3 & 0xFFu, b7 = w3 >> 8;
-                    u32 my = k_morton_y[ry];
-
-                    tile[my +  0u] = clut8888[b0];
-                    tile[my +  1u] = clut8888[b1];
-                    tile[my +  4u] = clut8888[b2];
-                    tile[my +  5u] = clut8888[b3];
-                    tile[my + 16u] = clut8888[b4];
-                    tile[my + 17u] = clut8888[b5];
-                    tile[my + 20u] = clut8888[b6];
-                    tile[my + 21u] = clut8888[b7];
-
-                    cls_mask |= (u32)(clut_cls[b0] | clut_cls[b1] | clut_cls[b2] | clut_cls[b3] |
-                                      clut_cls[b4] | clut_cls[b5] | clut_cls[b6] | clut_cls[b7]);
-                }
-            }
-        }
-    } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 w = vrow[((u32)tp_x + (u >> 1)) & 0x3FFu];
-                        u32 idx = (w >> ((u & 1u) << 3)) & 0xFFu;
-                        tile[my + k_morton_x[rx]] = clut8888[idx];
-                        cls_mask |= clut_cls[idx];
-                    }
-                }
-            }
-        }
-    }
-    return mask_to_alpha_class(cls_mask);
-}
-
-/* --------------------------------------------------------------------------
- * 15bpp Direct -> RGBA5551 / RGBA8888 (256x256 TexPage)
- * -------------------------------------------------------------------------- */
-GpuTexAlphaClass gpu_morton_decode_15bpp_5551(u16 *dst_morton, const u16 *vram,
-                                              u16 tp_x, u16 tp_y,
-                                              const GpuTexWindowKey *tw) {
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 base_x = (u32)tp_x + (tx << 3);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u16 c = vrow[(base_x + rx) & 0x3FFu];
-                        tile[my + k_morton_x[rx]] = gpu_psx_to_rgba5551(c);
-                        cls_mask |= psx_texel_class_bits(c);
-                    }
-                }
-            }
-        }
-    } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u16 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 c = vrow[((u32)tp_x + u) & 0x3FFu];
-                        tile[my + k_morton_x[rx]] = gpu_psx_to_rgba5551(c);
-                        cls_mask |= psx_texel_class_bits(c);
-                    }
-                }
-            }
-        }
-    }
-    return mask_to_alpha_class(cls_mask);
-}
-
-GpuTexAlphaClass gpu_morton_decode_15bpp_8888(u32 *dst_morton, const u16 *vram,
-                                              u16 tp_x, u16 tp_y,
-                                              const GpuTexWindowKey *tw) {
-    u32 cls_mask = 0u;
-    if (!tw_is_active(tw)) {
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                u32 base_x = (u32)tp_x + (tx << 3);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 vy = ((u32)tp_y + (ty << 3) + ry) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u16 c = vrow[(base_x + rx) & 0x3FFu];
-                        tile[my + k_morton_x[rx]] = gpu_psx_to_rgba8888(c);
-                        cls_mask |= psx_texel_class_bits(c);
-                    }
-                }
-            }
-        }
-    } else {
-        u8 u_map[256], v_map[256];
-        build_tw_maps(tw, u_map, v_map);
-        for (u32 ty = 0; ty < 32u; ++ty) {
-            for (u32 tx = 0; tx < 32u; ++tx) {
-                u32 *tile = dst_morton + (((ty << 5) + tx) << 6);
-                for (u32 ry = 0; ry < 8u; ++ry) {
-                    u32 v = v_map[(ty << 3) + ry];
-                    u32 vy = ((u32)tp_y + v) & 0x1FFu;
-                    const u16 *vrow = vram + (vy << 10);
-                    u32 my = k_morton_y[ry];
-                    for (u32 rx = 0; rx < 8u; ++rx) {
-                        u32 u = u_map[(tx << 3) + rx];
-                        u16 c = vrow[((u32)tp_x + u) & 0x3FFu];
-                        tile[my + k_morton_x[rx]] = gpu_psx_to_rgba8888(c);
-                        cls_mask |= psx_texel_class_bits(c);
-                    }
-                }
-            }
-        }
-    }
-    return mask_to_alpha_class(cls_mask);
-}
+DEFINE_DECODE_CLUT4(gpu_morton_decode_4bpp_5551, u16, gpu_psx_to_rgba5551)
+DEFINE_DECODE_CLUT4(gpu_morton_decode_4bpp_8888, u32, gpu_psx_to_rgba8888)
+DEFINE_DECODE_CLUT8(gpu_morton_decode_8bpp_5551, u16, gpu_psx_to_rgba5551)
+DEFINE_DECODE_CLUT8(gpu_morton_decode_8bpp_8888, u32, gpu_psx_to_rgba8888)
+DEFINE_DECODE_15BPP(gpu_morton_decode_15bpp_5551, u16, gpu_psx_to_rgba5551)
+DEFINE_DECODE_15BPP(gpu_morton_decode_15bpp_8888, u32, gpu_psx_to_rgba8888)
 
 /* --------------------------------------------------------------------------
  * Arbitrary Subrect Swizzlers for CPU->VRAM Uploads & 24bpp Display

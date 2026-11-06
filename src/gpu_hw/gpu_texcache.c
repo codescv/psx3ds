@@ -173,13 +173,28 @@ static void free_slot_storage(GpuTexSlot *slot) {
 #endif
 }
 
-bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8) {
+bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8, u32 max_slots) {
     if (tc == NULL) {
         return false;
     }
     memset(tc, 0, sizeof(*tc));
     tc->allow_rgba8 = allow_rgba8;
+    if (max_slots == 0u || max_slots > GPU_HW_TEXCACHE_SLOTS) {
+        max_slots = GPU_HW_TEXCACHE_SLOTS;
+    }
+    tc->max_slots = max_slots;
     return true;
+}
+
+static inline bool slot_in_flight(const GpuTexCache *tc, const GpuTexSlot *s) {
+    return tc->cur_frame != 0u && s->last_frame == tc->cur_frame;
+}
+
+static inline const GpuTexSlot *slot_touch(GpuTexCache *tc, GpuTexSlot *s) {
+    s->last_used = ++tc->lru_clock;
+    s->last_frame = tc->cur_frame;
+    tc->mru = (u32)(s - tc->slots);
+    return s;
 }
 
 void gpu_texcache_reset(GpuTexCache *tc) {
@@ -192,11 +207,14 @@ void gpu_texcache_reset(GpuTexCache *tc) {
         s->texel_dirty = false;
         s->clut_dirty = false;
         s->last_used = 0u;
+        s->last_frame = 0u;
         s->decode_gen = 0u;
     }
     tc->lru_clock = 0u;
     tc->hits = 0u;
     tc->uploads = 0u;
+    tc->mru = 0u;
+    tc->stalled = false;
 }
 
 void gpu_texcache_shutdown(GpuTexCache *tc) {
@@ -217,7 +235,7 @@ void gpu_texcache_invalidate_vram(GpuTexCache *tc, u16 x, u16 y, u16 w, u16 h) {
     u32 rows = 0u;
     gpu_vram_rect_cell_masks(x, y, w, h, &cols, &rows);
 
-    for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+    for (u32 i = 0; i < tc->max_slots; ++i) {
         GpuTexSlot *s = &tc->slots[i];
         if (!s->valid) {
             continue;
@@ -282,13 +300,15 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         tw_norm.off_y  = (u8)((tw->off_y & tw->mask_y) & 0x1Fu);
     }
 
-    /* 1. Ultra-fast zero-hash check: exact (texpage, clut_attr, tw) with clean texels & CLUT */
-    for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
-        GpuTexSlot *s = &tc->slots[i];
+    tc->stalled = false;
+    u32 nslots = tc->max_slots;
+
+    /* 1. Ultra-fast zero-hash check: MRU slot first, then exact (texpage, clut_attr, tw) scan */
+    {
+        GpuTexSlot *s = &tc->slots[tc->mru < nslots ? tc->mru : 0u];
         if (s->valid && !s->texel_dirty && !s->clut_dirty &&
             s->texpage_key == tp_key && s->clut_attr == clut_norm &&
             tw_keys_equal(&s->tw, &tw_norm)) {
-            s->last_used = ++tc->lru_clock;
             tc->hits++;
             if (stats) {
                 stats->gpu_tex_hits++;
@@ -296,19 +316,33 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
             if (out_hit) {
                 *out_hit = true;
             }
-            return s;
+            return slot_touch(tc, s);
+        }
+    }
+    for (u32 i = 0; i < nslots; ++i) {
+        GpuTexSlot *s = &tc->slots[i];
+        if (s->valid && !s->texel_dirty && !s->clut_dirty &&
+            s->texpage_key == tp_key && s->clut_attr == clut_norm &&
+            tw_keys_equal(&s->tw, &tw_norm)) {
+            tc->hits++;
+            if (stats) {
+                stats->gpu_tex_hits++;
+            }
+            if (out_hit) {
+                *out_hit = true;
+            }
+            return slot_touch(tc, s);
         }
     }
 
     /* 2. Compute FNV-1a CLUT content hash and search for any clean-texel content match */
     u32 cur_hash = has_clut ? gpu_clut_hash_fnv1a(vram, clut_norm, eff_depth) : 0u;
-    for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+    for (u32 i = 0; i < nslots; ++i) {
         GpuTexSlot *s = &tc->slots[i];
         if (s->valid && !s->texel_dirty &&
             s->texpage_key == tp_key && tw_keys_equal(&s->tw, &tw_norm) &&
             (!has_clut || s->clut_hash == cur_hash)) {
             update_slot_clut_footprint(s, clut_norm, eff_depth);
-            s->last_used = ++tc->lru_clock;
             tc->hits++;
             if (stats) {
                 stats->gpu_tex_hits++;
@@ -316,31 +350,31 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
             if (out_hit) {
                 *out_hit = true;
             }
-            return s;
+            return slot_touch(tc, s);
         }
     }
 
     /*
-     * 3. Cache miss: retire any texel-dirty matching slots (without overwriting their
-     * pixel buffers if free/older LRU slots exist, keeping in-flight GPU batches safe),
-     * then select a free slot first, else the oldest LRU slot.
+     * 3. Cache miss: retire any texel-dirty matching slots, then pick a victim that the
+     * PICA200 is not still going to sample this frame: a free slot first (preferring one
+     * other than the retired exact match), else the oldest LRU slot that is not in flight.
      */
     GpuTexSlot *dirty_match = NULL;
-    for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+    for (u32 i = 0; i < nslots; ++i) {
         GpuTexSlot *s = &tc->slots[i];
         if (s->valid && s->texel_dirty && s->texpage_key == tp_key &&
             tw_keys_equal(&s->tw, &tw_norm)) {
             s->valid = false;
-            if (dirty_match == NULL && s->clut_attr == clut_norm) {
+            if (dirty_match == NULL && s->clut_attr == clut_norm && !slot_in_flight(tc, s)) {
                 dirty_match = s;
             }
         }
     }
 
     GpuTexSlot *victim = NULL;
-    for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+    for (u32 i = 0; i < nslots; ++i) {
         GpuTexSlot *s = &tc->slots[i];
-        if (!s->valid && s != dirty_match) {
+        if (!s->valid && s != dirty_match && !slot_in_flight(tc, s)) {
             victim = s;
             break;
         }
@@ -349,15 +383,22 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         victim = dirty_match;
     }
     if (victim == NULL) {
-        u32 best_idx = 0u;
-        u32 best_age = tc->slots[0].last_used;
-        for (u32 i = 1u; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
-            if (tc->slots[i].last_used < best_age) {
-                best_age = tc->slots[i].last_used;
-                best_idx = i;
+        for (u32 i = 0u; i < nslots; ++i) {
+            GpuTexSlot *s = &tc->slots[i];
+            if (slot_in_flight(tc, s)) {
+                continue;
+            }
+            if (victim == NULL || s->last_used < victim->last_used) {
+                victim = s;
             }
         }
-        victim = &tc->slots[best_idx];
+    }
+    if (victim == NULL) {
+        tc->stalled = true;
+        if (out_hit) {
+            *out_hit = false;
+        }
+        return NULL;
     }
 
     u16 tp_x = (u16)((texpage & 0x0Fu) << 6);
@@ -380,10 +421,12 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         }
         if (want8) {
             acls = gpu_morton_decode_4bpp_8888((u32 *)victim->pixels, vram,
-                                               tp_x, tp_y, clut_x, clut_y, &tw_norm);
+                                               tp_x, tp_y, clut_x, clut_y, &tw_norm,
+                                               &victim->tiles);
         } else {
             acls = gpu_morton_decode_4bpp_5551((u16 *)victim->pixels, vram,
-                                               tp_x, tp_y, clut_x, clut_y, &tw_norm);
+                                               tp_x, tp_y, clut_x, clut_y, &tw_norm,
+                                               &victim->tiles);
             if (acls == GPU_TEX_ALPHA_MIXED) {
                 acls = GPU_TEX_ALPHA_ALL_STP;
             }
@@ -402,10 +445,12 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         }
         if (want8) {
             acls = gpu_morton_decode_8bpp_8888((u32 *)victim->pixels, vram,
-                                               tp_x, tp_y, clut_x, clut_y, &tw_norm);
+                                               tp_x, tp_y, clut_x, clut_y, &tw_norm,
+                                               &victim->tiles);
         } else {
             acls = gpu_morton_decode_8bpp_5551((u16 *)victim->pixels, vram,
-                                               tp_x, tp_y, clut_x, clut_y, &tw_norm);
+                                               tp_x, tp_y, clut_x, clut_y, &tw_norm,
+                                               &victim->tiles);
             if (acls == GPU_TEX_ALPHA_MIXED) {
                 acls = GPU_TEX_ALPHA_ALL_STP;
             }
@@ -417,10 +462,12 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
             }
             return NULL;
         }
-        acls = gpu_morton_decode_15bpp_5551((u16 *)victim->pixels, vram, tp_x, tp_y, &tw_norm);
+        acls = gpu_morton_decode_15bpp_5551((u16 *)victim->pixels, vram, tp_x, tp_y, &tw_norm,
+                                            &victim->tiles);
         if (acls == GPU_TEX_ALPHA_MIXED) {
             if (tc->allow_rgba8 && ensure_slot_storage(victim, true)) {
-                acls = gpu_morton_decode_15bpp_8888((u32 *)victim->pixels, vram, tp_x, tp_y, &tw_norm);
+                acls = gpu_morton_decode_15bpp_8888((u32 *)victim->pixels, vram, tp_x, tp_y,
+                                                    &tw_norm, &victim->tiles);
             } else {
                 acls = GPU_TEX_ALPHA_ALL_STP;
             }
@@ -444,8 +491,8 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
     victim->texpage_key = tp_key;
     victim->tw          = tw_norm;
     victim->clut_hash   = cur_hash;
-    victim->last_used   = ++tc->lru_clock;
     victim->decode_gen++;
+    (void)slot_touch(tc, victim);
 
     tc->uploads++;
     if (stats) {
