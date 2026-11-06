@@ -12,7 +12,7 @@
 #endif
 
 PsxResult arena_init(PsxArena *a, u32 bytes) {
-    if (!a || bytes == 0u) {
+    if (!a || bytes == 0u || bytes > (UINT32_MAX - 4095u)) {
         return PSX_ERR_BAD_ARG;
     }
     u32 aligned_size = (bytes + 4095u) & ~4095u;
@@ -67,14 +67,17 @@ void *arena_alloc(PsxArena *a, u32 bytes, u32 align) {
     if ((align & (align - 1u)) != 0u) {
         abort();
     }
-    u32 mask = align - 1u;
-    u64 start = ((u64)a->used + mask) & ~(u64)mask;
-    u64 end = start + (u64)(bytes ? bytes : 1u);
+    uintptr_t cur = (uintptr_t)a->base + (uintptr_t)a->used;
+    uintptr_t mask = (uintptr_t)(align - 1u);
+    uintptr_t aligned = (cur + mask) & ~mask;
+    u64 pad = (u64)(aligned - cur);
+    u64 alloc_sz = (u64)(bytes ? bytes : 1u);
+    u64 end = (u64)a->used + pad + alloc_sz;
     if (end > (u64)a->size) {
         abort();
     }
     a->used = (u32)end;
-    void *ptr = a->base + start;
-    memset(ptr, 0, bytes ? bytes : 1u);
+    void *ptr = (void *)aligned;
+    memset(ptr, 0, (size_t)alloc_sz);
     return ptr;
 }
