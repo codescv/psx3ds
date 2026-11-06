@@ -114,6 +114,20 @@ static void fb_draw_button(u8 *fb, int x, int y, int w, int h,
     fb_draw_text(fb, tx, ty, label, COL_TEXT, w / 8);
 }
 
+static bool is_chd_filename(const char *name) {
+    if (!name) {
+        return false;
+    }
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot[1] == '\0') {
+        return false;
+    }
+    return tolower((unsigned char)dot[1]) == 'c' &&
+           tolower((unsigned char)dot[2]) == 'h' &&
+           tolower((unsigned char)dot[3]) == 'd' &&
+           dot[4] == '\0';
+}
+
 static bool has_rom_extension(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) {
@@ -125,7 +139,8 @@ static bool has_rom_extension(const char *name) {
         ext[i] = (char)tolower((unsigned char)dot[i]);
     }
     ext[i] = '\0';
-    return strcmp(ext, ".cue") == 0 ||
+    return strcmp(ext, ".chd") == 0 ||
+           strcmp(ext, ".cue") == 0 ||
            strcmp(ext, ".bin") == 0 ||
            strcmp(ext, ".iso") == 0 ||
            strcmp(ext, ".img") == 0 ||
@@ -421,7 +436,7 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
 
         if (ui->rom_count == 0u) {
             fb_draw_text(fb, 16, 68, "No PS1 discs/EXEs found on SD.", COL_WARN, 36);
-            fb_draw_text(fb, 16, 86, "Place .cue/.bin/.iso/.exe in:", COL_DIM, 36);
+            fb_draw_text(fb, 16, 86, "Place .chd/.cue/.bin/.iso/.exe in:", COL_DIM, 36);
             fb_draw_text(fb, 16, 102, "  sdmc:/psx/ or sdmc:/psx3ds/roms/", COL_TEXT, 36);
             fb_draw_text(fb, 16, 122, "Place SCPH1001.BIN in sdmc:/psx/", COL_DIM, 36);
             fb_draw_text(fb, 16, 138, "(Built-in HLE BIOS ready!)", COL_OK, 36);
@@ -430,12 +445,16 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                 u32 idx = ui->rom_scroll + i;
                 int ry = 48 + (int)i * 14;
                 bool sel = (idx == ui->rom_sel);
+                bool chd = is_chd_filename(ui->rom_paths[idx]);
                 if (sel) {
                     fb_fill_rect(fb, 8, ry - 1, 304, 13, COL_BTN_ACT);
                     fb_draw_char(fb, 10, ry + 1, '\x10', COL_ACCENT);
                 }
                 fb_draw_text(fb, 20, ry + 1, ui->rom_labels[idx],
-                             sel ? COL_TEXT : COL_DIM, 36);
+                             sel ? COL_TEXT : COL_DIM, chd ? 30 : 36);
+                if (chd) {
+                    fb_draw_text(fb, 268, ry + 1, "[CHD]", sel ? COL_OK : COL_ACCENT, 5);
+                }
             }
         }
         fb_draw_button(fb, 8,   196, 148, 24, "Boot BIOS/HLE", false);
@@ -483,7 +502,8 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                   (hw && hw->spu_core1_active) ? "ASYNC" : "SYNC",
                   (hw && hw->ndsp_ok) ? "OK" : "MUTE");
         fb_printf(fb, 12, 150, (hw && hw->cd_worker_core >= 0) ? COL_OK : COL_DIM,
-                  "CD Readahead: Core %d (Miss %u)",
+                  cdrom_is_chd(sys) ? "CD [CHD]: Core %d (Miss %u)"
+                                    : "CD Readahead: Core %d (Miss %u)",
                   hw ? hw->cd_worker_core : -1,
                   sys ? (unsigned)sys->stats.cd_ra_misses : 0u);
         fb_printf(fb, 12, 166, COL_ACCENT, "%s", ui->status_msg);

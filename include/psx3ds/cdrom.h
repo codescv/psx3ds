@@ -40,6 +40,8 @@ void      cdrom_state(PsxSystem *sys, StateIO *st);
 void      cdrom_shutdown(PsxSystem *sys);
 
 PsxResult cdrom_load(PsxSystem *sys, const char *path);
+bool      cdrom_is_chd(const PsxSystem *sys);
+void      cdrom_chd_cache_stats(const PsxSystem *sys, u64 *out_hits, u64 *out_misses, u32 *out_slots);
 void      cdrom_readahead_thread(void *sys);
 u32       cdrom_dma_read_words(PsxSystem *sys, u32 *dst, u32 n);
 

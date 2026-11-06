@@ -169,6 +169,7 @@ set(PSX3DS_CORE_SRCS
     src/periph/spu_reverb.c
     src/periph/spu_xa.c
     src/periph/cdrom.c
+    src/periph/cdrom_chd.c
     src/periph/cdrom_image.c
     src/periph/cdrom_readahead.c
     src/periph/mdec.c
@@ -251,6 +252,8 @@ target_compile_options(psx3ds_core_objs PRIVATE
     $<$<COMPILE_LANGUAGE:C>:${PSX3DS_COMMON_C_FLAGS} ${PSX3DS_TARGET_C_FLAGS}>
     $<$<COMPILE_LANGUAGE:ASM>:${PSX3DS_TARGET_ASM_FLAGS}>
 )
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/chd.cmake")
 
 # Helper function to configure any executable linking psx3ds_core_objs
 function(psx3ds_configure_executable target_name)
