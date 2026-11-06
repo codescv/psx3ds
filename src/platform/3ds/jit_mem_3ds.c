@@ -87,25 +87,26 @@ static u32 find_free_mirror_va(u32 size, uintptr_t rw_addr) {
     return 0u;
 }
 
-static bool probe_hle_exec_buffer(u8 *rw) {
+static bool probe_hle_exec_buffer(u8 *probe_addr) {
     /*
-     * Emit minimal 2-word ARM leaf `{ mov r0, #42 ; bx lr }` and verify execution.
-     * Only called when Luma3DS is absent (HLE emulator such as Azahar/Citra).
+     * Emit minimal 2-word ARM leaf `{ mov r0, #42 ; bx lr }` in the dedicated
+     * trailing probe page (`rw + size - 64u`) — NEVER at `rw + 0` where arm_jit
+     * emits its first PS1 block (otherwise Azahar's Dynarmic caches `{mov r0,#42; bx lr}`
+     * at `rw + 0`!).
      */
-    u32 *code = (u32 *)(void *)rw;
+    u32 *code = (u32 *)(void *)probe_addr;
     code[0] = 0xE3A0002Au; /* mov r0, #42 */
     code[1] = 0xE12FFF1Eu; /* bx lr */
 
-    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)rw, 64u);
+    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)probe_addr, 64u);
     ctr_el0_dsb_isb();
 
-    int (*probe_fn)(void) = (int (*)(void))(uintptr_t)rw;
+    int (*probe_fn)(void) = (int (*)(void))(uintptr_t)probe_addr;
     int res = probe_fn();
 
-    /* Restore clean zeroed buffer before append-only JIT code emission begins */
     code[0] = 0u;
     code[1] = 0u;
-    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)rw, 64u);
+    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)probe_addr, 64u);
     ctr_el0_dsb_isb();
 
     return (res == 42);
@@ -119,7 +120,7 @@ PsxResult jit_mem_alloc(JitMem *m, u32 size) {
         jit_mem_free(m);
     }
 
-    size = (size == 0u) ? 0x1000u : ((size + 0xFFFu) & ~0xFFFu);
+    size = (size < 0x2000u) ? 0x2000u : ((size + 0xFFFu) & ~0xFFFu);
     memset(m, 0, sizeof(*m));
     m->size = size;
     m->mode = JIT_MEM_NONE;
@@ -209,14 +210,15 @@ PsxResult jit_mem_alloc(JitMem *m, u32 size) {
      *        real 3DS W^X kernels always return a negative Result < 0 on SVC failure).
      */
     bool is_hle_emu = (!real_luma) || (have_proc && rc_prot > 0);
-    if (is_hle_emu && g_jit_allow_hle_exec && probe_hle_exec_buffer(rw)) {
+    if (is_hle_emu && g_jit_allow_hle_exec && probe_hle_exec_buffer(rw + size - 64u)) {
         m->rx = rw;
+        m->size = size - 0x1000u; /* Reserve trailing probe page; keep [rw, rw+m->size) virgin */
         m->mode = JIT_MEM_RWX_INPLACE;
         m->luma_icache_svc = false;
         g_jit_mapped_mirror = false;
         g_jit_prot_rwx = false;
         plat_log("[jit_mem_3ds] mode=RWX_INPLACE(HLE) rw=%p size=%u\n",
-                 (void *)m->rw, (unsigned)size);
+                 (void *)m->rw, (unsigned)m->size);
         return PSX_OK;
     }
 

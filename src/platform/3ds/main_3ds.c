@@ -8,6 +8,9 @@
 
 #include "plat_3ds_internal.h"
 
+/* Override libctru's weak 32 KiB default main-thread stack size with 256 KiB */
+PSX_USED u32 __stacksize__ = 256u * 1024u;
+
 #define AUTORUN_CFG_PATH "sdmc:/psx3ds_autorun.cfg"
 
 typedef struct CtrAutorunCfg {
