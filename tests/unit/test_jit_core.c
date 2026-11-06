@@ -316,6 +316,11 @@ static int compare_three_engines(const char *label, u32 halt_pc, u32 ram_check_o
                     (unsigned long)halt_pc);
             return 1;
         }
+        if (got->next_pc != ref->next_pc) {
+            fprintf(stderr, "[%s/%s] next_pc mismatch: ref=0x%08lX got=0x%08lX\n",
+                    label, ename, (unsigned long)ref->next_pc, (unsigned long)got->next_pc);
+            return 1;
+        }
         if (got->gpr[0] != 0u) {
             fprintf(stderr, "[%s/%s] $zero corrupted: 0x%08lX\n",
                     label, ename, (unsigned long)got->gpr[0]);
@@ -1180,6 +1185,168 @@ static int test_diff_live_smc(void) {
 }
 
 /* ============================================================================
+ * Test 10b: OpenBIOS KUSEG ReturnFromException Epilogue, Stale next_pc Fallback,
+ *           & Deep Intra-Page Eager Block Linking Regression
+ * ============================================================================ */
+#define M_BC2F(off) M_IMM(0x12u, 0x08u, 0x00u, off)
+
+static int test_diff_openbios_epilogue_and_next_pc(void) {
+    /* Subtest A: OpenBIOS-style 30-LW KUSEG epilogue + JR $k0 + RFE at 0x000028AC.
+     * Previously overflowed JIT_MAX_BLOCK_BYTES (1024 words) & fell back to step_one. */
+    {
+        const u32 epi_va   = 0x000028ACu;
+        const u32 user_va  = 0x00003000u;
+        const u32 ctx_va   = 0x00009000u;
+        const u32 out_va   = 0x00009100u;
+
+        u32 epi_code[34];
+        u32 n_epi = 0u;
+        /* Load $k0 (reg 26) first so load delay is long resolved before JR $k0,
+         * then restore 29 GPRs (regs 1..25, 28..31) via KUSEG LWs off $k1 (reg 27). */
+        epi_code[n_epi++] = M_LW(R_K0, 0, R_K1);
+        u32 ctx_slot = 1u;
+        for (u32 r = 1u; r <= 31u; ++r) {
+            if (r == R_K0 || r == R_K1) {
+                continue;
+            }
+            epi_code[n_epi++] = M_LW(r, (s32)(ctx_slot * 4u), R_K1);
+            ctx_slot++;
+        }
+        /* Total so far: 30 KUSEG LWs + JR $k0 + RFE = 32 instructions! */
+        epi_code[n_epi++] = M_JR(R_K0);
+        epi_code[n_epi++] = M_RFE;
+
+        /* User-mode target at 0x00003000: fold all restored GPRs into a checksum and halt */
+        u32 user_code[40];
+        u32 u_idx = 0u;
+        for (u32 r = 2u; r <= 31u; ++r) {
+            if (r == R_K0 || r == R_K1) {
+                continue;
+            }
+            user_code[u_idx++] = M_ADDU(R_AT, R_AT, r);
+        }
+        user_code[u_idx++] = M_LUI(R_T0, 0x0000u);
+        user_code[u_idx++] = M_ORI(R_T0, R_T0, (u16)out_va);
+        user_code[u_idx++] = M_SW(R_AT, 0, R_T0);
+        u32 halt_va = user_va + u_idx * 4u;
+        user_code[u_idx++] = M_BEQ(R_ZERO, R_ZERO, -1);
+        user_code[u_idx++] = M_NOP;
+
+        for (int i = 0; i < 3; ++i) {
+            test_sys_prepare(&g_sys[i], epi_va);
+            /* Kernel mode (KUc=0) with KUp=1, IEp=0 in bits [3:2] -> RFE enters User mode (KUc=1) */
+            g_sys[i].cpu.cop0[COP0_SR] = PSX_SR_CU2 | (0x02u << 2);
+            g_sys[i].cpu.gpr[R_K1] = ctx_va;
+
+            write_ram32(&g_sys[i], ctx_va + 0u, user_va);
+            for (u32 s = 1u; s < ctx_slot; ++s) {
+                write_ram32(&g_sys[i], ctx_va + s * 4u, 0x10000000u + s * 0x01010103u);
+            }
+            write_code(&g_sys[i], epi_va, epi_code, n_epi);
+            write_code(&g_sys[i], user_va, user_code, u_idx);
+
+            if (i == 0) {
+                run_oracle_until_halt(&g_sys[0], halt_va, 500u);
+            } else {
+                run_engine_until_halt(&g_sys[i], i == 2, halt_va, 2000, 10u);
+            }
+        }
+
+        CHECK_TRUE(compare_three_engines("openbios_kuseg_epi", halt_va, out_va, 1u) == 0,
+                   "OpenBIOS 30-LW KUSEG epilogue + JR $k0 + RFE 3-engine agreement");
+        CHECK_TRUE((g_sys[0].cpu.cop0[COP0_SR] & PSX_SR_KUC) != 0u,
+                   "RFE transitioned CPU into User mode");
+#if PSX3DS_HAVE_JIT
+        CHECK_TRUE(g_sys[2].stats.step_one_fallbacks == 0u,
+                   "30-LW KUSEG epilogue splits cleanly into native JIT blocks with zero step_one fallbacks");
+        CHECK_TRUE(g_sys[2].stats.jit_blocks_live >= 3u,
+                   "30-LW KUSEG epilogue compiled into >= 3 linked native blocks");
+#endif
+    }
+
+    /* Subtest B: Stale cpu.next_pc across jit_exit_step_one fallback (ResetGraph-style).
+     * Compiled block at 0x000027B4 JALs to 0x000028AC where BC2F forces jit_exit_step_one
+     * while cpu.next_pc was left at 0x000027B8 (where a trap/poison sits!). */
+    {
+        const u32 caller_va = 0x000027B4u;
+        const u32 callee_va = 0x000028ACu;
+        const u32 out_va    = 0x00009200u;
+
+        const u32 caller_code[] = {
+            M_JAL(callee_va),
+            M_ADDIU(R_A0, R_ZERO, 0x1234),
+            /* Return landing at 0x000027BC: store $v0 to out_va and halt */
+            M_ORI(R_T1, R_ZERO, (u16)out_va),
+            M_SW(R_V0, 0, R_T1),
+            M_BEQ(R_ZERO, R_ZERO, -1),
+            M_NOP
+        };
+        const u32 halt_va = caller_va + 4u * 4u;
+
+        const u32 callee_code[] = {
+            M_BC2F(2),
+            M_ADDIU(R_V0, R_A0, 10),
+            M_ADDIU(R_V0, R_ZERO, 0x7FFF),
+            M_JR(R_RA),
+            M_ADDIU(R_V0, R_V0, 1)
+        };
+
+        for (int i = 0; i < 3; ++i) {
+            test_sys_prepare(&g_sys[i], caller_va);
+            write_code(&g_sys[i], caller_va, caller_code, 6u);
+            write_code(&g_sys[i], callee_va, callee_code, 5u);
+            if (i == 0) {
+                run_oracle_until_halt(&g_sys[0], halt_va, 200u);
+            } else {
+                run_engine_until_halt(&g_sys[i], i == 2, halt_va, 1000, 10u);
+            }
+        }
+
+        CHECK_TRUE(compare_three_engines("stale_next_pc_step_one", halt_va, out_va, 1u) == 0,
+                   "jit_exit_step_one resynchronizes cpu.next_pc without teleporting");
+        CHECK_TRUE(read_ram32(&g_sys[2], out_va) == (0x1234u + 10u + 1u),
+                   "callee after BC2F fallback produced exact result");
+    }
+
+    /* Subtest C: Deep 5-level intra-page eager block linking diamond (stack frame check) */
+    {
+        const u32 base_va = 0x80014000u;
+        const u32 base_pa = 0x00014000u;
+        const u32 out_pa  = 0x00014800u;
+        u32 chain[48];
+        u32 idx = 0u;
+        chain[idx++] = M_ORI(R_V0, R_ZERO, 1u);
+        for (u32 d = 0u; d < 6u; ++d) {
+            chain[idx++] = M_ADDIU(R_V0, R_V0, (s32)(d + 2u));
+            chain[idx++] = M_BNE(R_V0, R_ZERO, 2);
+            chain[idx++] = M_SLL(R_V0, R_V0, 1u);
+            chain[idx++] = M_ADDIU(R_V0, R_ZERO, 0xBADu);
+        }
+        chain[idx++] = M_LUI(R_T0, 0x8001u);
+        chain[idx++] = M_ORI(R_T0, R_T0, 0x4800u);
+        chain[idx++] = M_SW(R_V0, 0, R_T0);
+        u32 halt_va = base_va + idx * 4u;
+        chain[idx++] = M_BEQ(R_ZERO, R_ZERO, -1);
+        chain[idx++] = M_NOP;
+
+        for (int i = 0; i < 3; ++i) {
+            test_sys_prepare(&g_sys[i], base_va);
+            write_code(&g_sys[i], base_pa, chain, idx);
+            if (i == 0) {
+                run_oracle_until_halt(&g_sys[0], halt_va, 400u);
+            } else {
+                run_engine_until_halt(&g_sys[i], i == 2, halt_va, 2000, 8u);
+            }
+        }
+
+        CHECK_TRUE(compare_three_engines("deep_eager_diamond", halt_va, out_pa, 1u) == 0,
+                   "5-level intra-page eager block linking 3-engine agreement");
+    }
+
+    return 0;
+}
+
+/* ============================================================================
  * Test 4: Microbenchmark (Oracle vs Cached Interpreter vs ARM11 JIT)
  * ============================================================================ */
 static int test_microbenchmark(void) {
@@ -1319,6 +1486,7 @@ int main(void) {
     if (test_diff_segment_alias() != 0) return 1;
     if (test_idle_and_counted_loops() != 0) return 1;
     if (test_diff_live_smc() != 0) return 1;
+    if (test_diff_openbios_epilogue_and_next_pc() != 0) return 1;
     if (test_microbenchmark() != 0) return 1;
 
     for (int i = 0; i < 3; ++i) {
