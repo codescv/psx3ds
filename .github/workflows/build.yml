@@ -65,31 +65,57 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install host tools, 3DS portlibs, makerom & bannertool
+      - name: Install host tools, makerom & bannertool
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl unzip tar xz-utils cmake ninja-build python3 zip
-          PM="$(command -v dkp-pacman || command -v pacman)"
-          "$PM" -Sy --noconfirm
-          "$PM" -S --noconfirm --needed \
-            libctru citro3d 3dstools picasso 3ds-cmake 3ds-pkg-config 3ds-zlib 3ds-flac
-          for pkg in 3ds-libzstd 3ds-zstd 3ds-liblzma 3ds-lzma 3ds-xz; do
-            if "$PM" -Si "$pkg" >/dev/null 2>&1; then
-              "$PM" -S --noconfirm --needed "$pkg" || true
+            ca-certificates curl unzip tar xz-utils cmake ninja-build g++ pkg-config python3 zip
+
+          # devkitpro/devkitarm:latest already ships devkitARM, libctru, citro3d,
+          # 3dstools, picasso, 3ds-cmake, 3ds-pkg-config, 3ds-zlib, and 3ds-flac
+          # preinstalled in /opt/devkitpro (avoiding pkg.devkitpro.org 403s on GHA IPs).
+          if [ ! -f /opt/devkitpro/cmake/3DS.cmake ] || \
+             [ ! -f /opt/devkitpro/libctru/lib/libctru.a ] || \
+             [ ! -f /opt/devkitpro/libctru/lib/libcitro3d.a ] || \
+             [ ! -x /opt/devkitpro/tools/bin/picasso ] || \
+             [ ! -x /opt/devkitpro/tools/bin/3dsxtool ] || \
+             [ ! -x /opt/devkitpro/tools/bin/smdhtool ]; then
+            PM="$(command -v dkp-pacman || command -v pacman || true)"
+            if [ -n "$PM" ] && "$PM" -Sy --noconfirm; then
+              "$PM" -S --noconfirm --needed \
+                libctru citro3d 3dstools picasso 3ds-cmake 3ds-pkg-config 3ds-zlib 3ds-flac
             fi
-          done
+          fi
+          test -f /opt/devkitpro/cmake/3DS.cmake
+          test -f /opt/devkitpro/libctru/include/3ds.h
+          test -f /opt/devkitpro/libctru/lib/libctru.a
+          test -f /opt/devkitpro/libctru/lib/libcitro3d.a
 
           tmpd="$(mktemp -d)"
+          # makerom v0.18.4 links against GLIBC <= 2.34 (compatible with Debian 12 GLIBC 2.36)
           curl -fsSL -o "$tmpd/makerom.zip" \
-            "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.19.0/makerom-v0.19.0-ubuntu_x86_64.zip"
+            "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18.4/makerom-v0.18.4-ubuntu_x86_64.zip"
           unzip -q "$tmpd/makerom.zip" -d "$tmpd/mk"
           install -m 0755 "$(find "$tmpd/mk" -name makerom -type f | head -n1)" /opt/devkitpro/tools/bin/makerom
+          (/opt/devkitpro/tools/bin/makerom -help 2>&1 || true) | grep -qi "MAKEROM"
 
-          curl -fsSL -o "$tmpd/bannertool.tar.gz" \
-            "https://github.com/carstene1ns/3ds-bannertool/releases/download/1.2.3/bannertool-1.2.3-linux.tar.gz"
-          tar -xzf "$tmpd/bannertool.tar.gz" -C "$tmpd"
-          install -m 0755 "$(find "$tmpd" -name bannertool -type f | head -n1)" /opt/devkitpro/tools/bin/bannertool
+          # Build bannertool 1.2.3 natively against container glibc/libstdc++
+          curl -fsSL -o "$tmpd/bannertool-src.tar.gz" \
+            "https://github.com/carstene1ns/3ds-bannertool/archive/refs/tags/1.2.3.tar.gz"
+          tar -xzf "$tmpd/bannertool-src.tar.gz" -C "$tmpd"
+          btsrc="$tmpd/3ds-bannertool-1.2.3"
+          g++ -std=c++17 -O1 \
+            -DVERSION='"1.2.3"' \
+            -DSTBI_ONLY_PNG -DSTBI_NO_LINEAR -DSTBI_NO_STDIO \
+            -DSTB_VORBIS_NO_PUSHDATA_API -DSTB_VORBIS_NO_STDIO \
+            -DDR_WAV_NO_STDIO \
+            -I"$btsrc/source" -I"$btsrc/source/pc" \
+            "$btsrc"/source/*.cpp \
+            "$btsrc"/source/3ds/*.cpp \
+            "$btsrc"/source/pc/*.cpp \
+            -o /opt/devkitpro/tools/bin/bannertool
+          chmod 0755 /opt/devkitpro/tools/bin/bannertool
+          test -x /opt/devkitpro/tools/bin/bannertool
           rm -rf "$tmpd"
 
       - name: Build Nintendo 3DS Release (.3dsx, .cia, .cci, .smdh)
@@ -106,10 +132,10 @@ jobs:
 
       - name: Stage release artifacts & SHA-256 checksums
         run: |
-          mkdir -p dist/sdmc/3ds/psx3ds dist/sdmc/cia dist/sdmc/psx3ds/bios
+          mkdir -p dist/sdmc/3ds/psx3ds dist/sdmc/cia dist/sdmc/psx/bios
           cp build-3ds/psx3ds.3dsx build-3ds/psx3ds.smdh dist/sdmc/3ds/psx3ds/
           cp build-3ds/psx3ds.cia dist/sdmc/cia/
-          cp tests/roms/bios/openbios.bin tests/roms/bios/LICENSE.openbios dist/sdmc/psx3ds/bios/
+          cp tests/roms/bios/openbios.bin tests/roms/bios/LICENSE.openbios dist/sdmc/psx/bios/
           cp README.md LICENSE dist/sdmc/
 
           cp build-3ds/psx3ds.cia build-3ds/psx3ds.3dsx build-3ds/psx3ds.cci build-3ds/psx3ds.smdh dist/
@@ -121,7 +147,7 @@ jobs:
       - name: Upload Nintendo 3DS build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: psx3ds-3ds-${{ github.ref_name }}-${{ github.sha }}
+          name: psx3ds-3ds-${{ github.sha }}
           path: |
             dist/psx3ds.cia
             dist/psx3ds.3dsx
