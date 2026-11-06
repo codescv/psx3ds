@@ -41,12 +41,12 @@ All user-space SDK binaries are cleanly self-contained under `${PSX3DS_SDK_ROOT:
 | Host C/C++ Compiler | `/usr/bin/gcc`, `/usr/bin/g++` | GCC `15.2.0` | Native `x86_64` build, ASan/UBSan tests & fast CI |
 | Build Generator | `cmake`, `ctest`, `ninja`, `make` | CMake `4.4.5`, Ninja `1.13.2` | Cross-platform & multi-target build system |
 | 3DS Cross-Compiler | `arm-none-eabi-gcc` / `g++` | `devkitARM` GCC `16.1.0` | Official Nintendo 3DS bare-metal / Horizon OS compiler + patched `newlib` |
-| 3DS OS & GPU SDK | `libctru`, `citro3d`, `citro2d` | `libctru 2.7+`, `citro3d 1.7+` | Horizon OS services, `ndsp` audio, `citro3d` PICA200 GPU driver |
+| 3DS OS, GPU & CHD Portlibs | `libctru`, `citro3d`, `3ds-zlib`, `3ds-xz`, `3ds-zstd`, `3ds-flac` | `libctru 2.7+`, `citro3d 1.7+`, devkitPro portlibs | Horizon OS services, `ndsp` audio, `citro3d` PICA200 GPU driver, and ARMv6K hardware-float Deflate/LZMA/Zstd/FLAC decoders for CHD v1–v5 |
 | PICA200 Shader Assembler | `picasso` | `2.7.2` | Compiles `.pica` vertex/geometry shaders to `.shbin` |
 | 3DS Packaging Tools | `3dsxtool`, `smdhtool`, `makerom`, `bannertool`, `3dsxdump`, `mkromfs3ds`, `tex3ds`, `bin2s`, `3dslink` | `3dstools` / `makerom 0.19.0` / `bannertool 1.2.3` | `.elf` -> `.3dsx`/`.cia`/`.cci` conversion, Home Menu banner/audio, SMDH icons/metadata, RomFS, textures, binary embedding |
 | ARM11 Linux Cross-Compiler | `arm-linux-gnueabihf-gcc` / `g++` | Bootlin `2026.08-1` GCC `15.3.0` (`armv6-eabihf` glibc) | Compiles ARM11v6K + VFPv2 Linux test binaries & `arm_jit` unit harnesses |
 | ARM11 User-Mode Emulator | `qemu-arm` (`qemu-arm-static`) | QEMU `11.1.2` | Executes ARM11 MPCore (`-cpu arm11mpcore`) JIT & ARMv6 SIMD code on `x86_64` |
-| 3DS System Emulator | `azahar`, `azahar-headless` | Azahar `2126.2` (`xvfb-run` + Mesa `llvmpipe` OpenGL 4.6) | Headless end-to-end `.3dsx` + PICA200 shader + `sdmc:/` integration tests |
+| 3DS System Emulator | `azahar`, `azahar-headless` | Azahar `2126.2` (`xvfb-run` + Mesa `llvmpipe` OpenGL 4.6) | Headless end-to-end `.3dsx` & `.cci` (CIA NCCH) + PICA200 shader + `.chd`/`sdmc:/` integration tests |
 
 ---
 
@@ -93,37 +93,11 @@ qemu-arm -cpu arm11mpcore -d in_asm,cpu ./build-arm11/arm11_jit_test 2> /tmp/arm
 
 ---
 
-### Tier 3: Nintendo 3DS Cross-Compilation (`.3dsx` / `.elf`) & Headless Azahar Runner
+### Tier 3: Nintendo 3DS Cross-Compilation (`.cia` / `.3dsx` / `.cci`) & Headless Azahar Runner
 
-#### Option A: CMake + Ninja (`$DEVKITPRO/cmake/3DS.cmake`) — Recommended
+#### Option A: CMake + Ninja (`$DEVKITPRO/cmake/3DS.cmake` + `cmake/{chd,cia}.cmake`) — Recommended
 
-devkitPro's official `3DS.cmake` toolchain provides `ctr_generate_smdh()`, `ctr_create_3dsx()`, and `dkp_add_embedded_binary_library()`:
-
-```cmake
-cmake_minimum_required(VERSION 3.20)
-project(psx3ds C CXX ASM)
-
-if(NINTENDO_3DS)
-    # Assemble PICA200 shader (.pica -> .shbin -> embedded symbol)
-    add_custom_command(
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/psx_gpu.shbin
-        COMMAND picasso -o ${CMAKE_CURRENT_BINARY_DIR}/psx_gpu.shbin ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/3ds/psx_gpu.pica
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/3ds/psx_gpu.pica
-    )
-    dkp_target_generate_symbol_list ... # or bin2s custom command
-
-    target_include_directories(psx3ds PRIVATE ${DEVKITPRO}/libctru/include ${DEVKITPRO}/portlibs/3ds/include)
-    target_link_directories(psx3ds PRIVATE ${DEVKITPRO}/portlibs/3ds/lib ${DEVKITPRO}/libctru/lib)
-    target_link_libraries(psx3ds PRIVATE citro3d ctru m)
-    ctr_generate_smdh(psx3ds.smdh
-        NAME "PSX3DS"
-        DESCRIPTION "High-Performance PlayStation 1 Emulator for New 3DS"
-        AUTHOR "psx3ds"
-        ICON "${DEVKITPRO}/libctru/default_icon.png"
-    )
-    ctr_create_3dsx(psx3ds SMDH psx3ds.smdh)
-endif()
-```
+`CMakeLists.txt` integrates `cmake/chd.cmake` (vendored `libchdr` `v0.3.0` linked against devkitPro's `3ds-zlib`, `3ds-xz`, `3ds-zstd`, and `3ds-flac` portlibs on T1, or bundled single-file `miniz`/`LzmaDec`/`zstddeclib`/`dr_flac` on T2/T3) and `cmake/cia.cmake` (custom 48×48 SMDH icon, 256×128 banner + boot chime via `bannertool`, and universal O3DS+N3DS `.cia`/`.cci` packages via `makerom` + `assets/3ds/psx3ds.rsf`):
 
 Build command:
 
@@ -133,7 +107,16 @@ cmake -S . -B build-3ds -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$CTR_CMAKE_TOOLCHAIN_FILE" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-3ds
+# Produces:
+#   build-3ds/psx3ds.cia   — FBI-installable universal archive (TitleID 000400000F853D00, SVC 0x70 W^X JIT)
+#   build-3ds/psx3ds.3dsx  — Homebrew Launcher executable (embedded custom SMDH)
+#   build-3ds/psx3ds.cci   — Azahar/Citra direct-boot NCCH image (identical RSF ExHeader to .cia)
+#   build-3ds/psx3ds.smdh, build-3ds/psx3ds.bnr, build-3ds/psx3ds.elf
 ```
+
+> **Universal `.cia` / `.cci` RSF ExHeader & Old 3DS 64 MiB Heap Split (`v0.2.0`):**
+> - `assets/3ds/psx3ds.rsf` specifies `SystemMode: 64MB` (Old 3DS compatible) + `SystemModeExt: 124MB`, `CpuSpeed: 804MHz`, `EnableL2Cache: true`, `CanAccessCore2: true`, `SVC 0x70` (`ControlProcessMemory` for native `JIT_MEM_MIRROR_RWRX` hardware W^X JIT on Luma3DS), `OpenProcess (0x33)`, I/D-cache SVCs, DSP memory mapping `1ff00000-1ff7ffff`, and `ir:rst`/`qtm:s` (New 3DS C-Stick & ZL/ZR).
+> - On strict 64 MiB Old 3DS `.cia`/`.cci`, `libctru`'s default 32 MiB linear heap leaves only `29.15 MiB` of normal heap — starving `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`. `src/platform/3ds/main_3ds.c` sets `u32 __ctru_linear_heap_size = 20u * 1024u * 1024u`, leaving **`42.57 MiB`** of normal heap on Old 3DS (`102.57 MiB` on New 3DS 124 MiB) while keeping ample linear memory for `citro3d` and `ndsp`.
 
 #### Option B: Direct CLI Compilation (`picasso` + `bin2s` + `arm-none-eabi-gcc` + `3dsxtool`)
 

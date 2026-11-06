@@ -11,6 +11,15 @@
 /* Override libctru's weak 32 KiB default main-thread stack size with 256 KiB */
 PSX_USED u32 __stacksize__ = 256u * 1024u;
 
+/*
+ * Cap libctru's linear heap at 20 MiB instead of its 32 MiB default.
+ * On Old 3DS 64 MiB CIA/CCI (`SystemMode: 64MB`), a 32 MiB linear heap leaves
+ * only ~29.1 MiB of normal heap — starving `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`.
+ * 20 MiB gives citro3d/ndsp ~7–10 MiB headroom while leaving ~42.5 MiB normal heap
+ * on Old 3DS (and ~102.5 MiB on New 3DS 124 MiB) for arena + ARM11 JIT + CHD codecs.
+ */
+PSX_USED u32 __ctru_linear_heap_size = 20u * 1024u * 1024u;
+
 #define AUTORUN_CFG_PATH "sdmc:/psx3ds_autorun.cfg"
 
 typedef struct CtrAutorunCfg {

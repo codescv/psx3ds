@@ -15,7 +15,7 @@ static void print_usage(const char *prog) {
             "  --bios <path>             Path to 512KB PS1 BIOS or openbios.bin (default: auto)\n"
             "  --hle                     Use built-in BIOS-less HLE bootstrap & kernel\n"
             "  --exe <path>              Load and execute PS-X EXE binary\n"
-            "  --cd <path>               Mount CD-ROM image (.cue/.bin/.iso/.img)\n"
+            "  --cd <path>               Mount CD-ROM image (.chd/.cue/.bin/.iso/.img)\n"
             "  --cpu <mode>              CPU engine: interp | cached | jit | auto (alias: --engine)\n"
             "  --gpu <mode>              GPU backend: soft | hw\n"
             "  --frames <N>              Run at most N emulated frames (default: 600)\n"

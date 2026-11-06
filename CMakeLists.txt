@@ -290,6 +290,7 @@ if(PSX3DS_IS_3DS)
         SMDH "${CMAKE_CURRENT_BINARY_DIR}/psx3ds.smdh"
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/psx3ds.3dsx"
     )
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/cia.cmake")
 else()
     add_executable(psx3ds-cli
         src/platform/host/main_cli.c

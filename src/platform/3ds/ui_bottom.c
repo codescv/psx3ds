@@ -418,11 +418,12 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
     /* Top Header & Hardware Badges */
     fb_fill_rect(fb, 0, 0, UI_W, 19, COL_HEADER);
     fb_draw_text(fb, 6, 6, "PSX3DS", COL_ACCENT, 8);
+    fb_draw_text(fb, 58, 6, "v" PSX3DS_VERSION_STR, COL_DIM, 8);
     if (hw) {
-        fb_printf(fb, 62, 6, hw->is_n3ds ? COL_OK : COL_WARN,
+        fb_printf(fb, 120, 6, hw->is_n3ds ? COL_OK : COL_WARN,
                   "%s %uMHz", hw->is_n3ds ? "N3DS" : "O3DS", (unsigned)hw->cpu_mhz);
     }
-    fb_printf(fb, 184, 6, ui->bios_path[0] ? COL_OK : COL_WARN, "[%s]", ui->bios_badge);
+    fb_printf(fb, 232, 6, ui->bios_path[0] ? COL_OK : COL_WARN, "[%s]", ui->bios_badge);
 
     /* Tab Bar */
     fb_draw_button(fb, 2,   20, 104, 19, "1:ROMS", ui->active_tab == 0u);

@@ -1,10 +1,10 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.0`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
 and the PICA200 GPU:
 
-* **`arm_jit`** recompiles MIPS R3000A code to ARMv6K. It caches 7 MIPS GPRs in host
+* **`arm_jit`** recompiles MIPS R3000A code to ARM11v6K. It caches 7 MIPS GPRs in host
   registers, uses direct block linking and a software fastmem LUT, and emits **100% of GTE
   commands inline** using `SMLAD`/`SMLALD`.
 * **Sub-page self-modifying-code (SMC) tracking.** Each 4 KiB page keeps a 64-byte code-line
@@ -14,16 +14,26 @@ and the PICA200 GPU:
   texture cache that tracks STP per 8×8 tile. `gpu_soft` is a software rasterizer with
   ARMv6 SIMD span kernels (`UQADD8`, `UHADD8`, `USAT`, `PKHBT`) and Bresenham edge walkers
   that never divide.
+* **Compressed CHD v1–v5 disc streaming.** Built-in `libchdr` supports all four CHD v5 CD
+  codecs (`cdzl` Deflate, `cdlz` LZMA, `cdzs` Zstd, `cdfl` FLAC + Subcode) plus v1–v4,
+  4-sector track padding remapping, ARMv6K `REV16` CD-DA endianness conversion, an 8-hunk
+  LRU cache (4-hunk on Old 3DS; `87.5%` sequential cold hit rate), and asynchronous Core 2
+  decompression.
+* **Installable universal `.cia` & Homebrew `.3dsx`.** Installing `psx3ds.cia` via FBI on
+  Luma3DS unlocks native Horizon OS `SVC 0x70` hardware W^X dual-mapped RW+RX JIT
+  (`JIT_MEM_MIRROR_RWRX`), New 3DS 804 MHz clock / 124 MiB FCRAM / 2 MiB L2 / Core 2 /
+  C-Stick & ZL/ZR (`ir:rst`, `qtm:s`), while remaining 100% compatible with Old 3DS (268 MHz,
+  64 MiB `small_mem`).
 * **Multi-core 3DS runtime.** Core 0 runs the CPU, GTE and GPU. Core 1 renders the SPU into
-  `ndsp`. Core 2 (New 3DS only) prefetches CD-ROM sectors.
+  `ndsp`. Core 2 (New 3DS only) prefetches and decompresses CD-ROM / `.chd` sectors.
 
 The same sources build for three targets, and every change is checked on all three before it
 reaches `main`:
 
 | Target | Toolchain | What it is for |
 |---|---|---|
-| **T1 — Nintendo 3DS** (`psx3ds.3dsx`) | devkitARM `-march=armv6k -mtune=mpcore -mfloat-abi=hard -O3 -flto` | The real product. Tested in `azahar-headless` and meant for real hardware (Luma3DS). |
-| **T2 — ARM11 QEMU harness** | Bootlin `armv6-eabihf` GCC run under `qemu-arm -cpu arm11mpcore` | Runs the exact JIT and `.S` kernels on x86_64. Any ARMv7 instruction traps with `SIGILL`. |
+| **T1 — Nintendo 3DS** (`psx3ds.cia`, `psx3ds.3dsx`, `psx3ds.cci`) | devkitARM `-march=armv6k -mtune=mpcore -mfloat-abi=hard -O3 -flto` + `makerom` / `bannertool` | The real product. Tested as both `.cci` (NCCH/ExHeader) and `.3dsx` in `azahar-headless`, and built for real New 3DS & Old 3DS hardware (Luma3DS). |
+| **T2 — ARM11 QEMU harness** | Bootlin `armv6-eabihf` GCC run under `qemu-arm -cpu arm11mpcore` | Runs the exact JIT, `.S` kernels, and CHD v5 decoders on x86_64. Any ARMv7 instruction traps with `SIGILL`. |
 | **T3 — x86_64 host CLI** | Host GCC, optionally ASan+UBSan | Interpreter, cached interpreter and portable C paths. Golden tests and sanitizer CI. |
 
 ---
@@ -59,7 +69,7 @@ flowchart LR
         NDSP["ndsp 44.1 kHz"]
     end
     subgraph Core2["Core 2 (N3DS)"]
-        CDRA["CD-ROM readahead"]
+        CDRA["CD-ROM + CHD v5<br/>8-hunk LRU & readahead"]
     end
     JIT --> BUS
     CACHED --> BUS
@@ -81,11 +91,14 @@ src/core/         bus, fastmem, scheduler, IRQ, DMA, timers, interpreter, COP0, 
 src/jit/          block cache, cached interpreter, arm_jit emitter, register allocator, inline GTE
 src/gpu/          GP0/GP1 front-end, software rasterizer, ARMv6 span kernels
 src/gpu_hw/       citro3d backend, Morton texture cache, psx_gpu.v.pica shader
-src/periph/       SPU (+ ARMv6 ADPCM), CD-ROM + readahead, MDEC (+ ARMv6 IDCT), SIO / pad / memcard
+src/periph/       SPU (+ ARMv6 ADPCM), CD-ROM + CHD v5 + readahead, MDEC (+ ARMv6 IDCT), SIO / pad / memcard
 src/sys/          system lifecycle, BIOS/HLE, PS-EXE loader, save states, stats, bench
 src/platform/     host CLI (PPM/WAV dumps) and 3DS frontend (UI, threads, ndsp, JIT memory)
-tests/            ctest unit tests, ROM runner, trace_diff.py, bench_report.py, test ROMs
-tools/            env.sh, gen_offsets_check.sh
+assets/3ds/       CIA/CCI RSF ExHeader spec, 48x48 SMDH icon, 256x128 banner & boot chime
+cmake/            ARM11 QEMU toolchain, libchdr codec build rules, 3DS .cia/.cci packaging
+third_party/      vendored libchdr v0.3.0 (+ miniz/LZMA/zstd/dr_flac for host & QEMU targets)
+tests/            19 ctest unit suites, ROM runner, trace_diff.py, bench_report.py, test ROMs
+tools/            env.sh, gen_offsets_check.sh, gen_cia_assets.py
 ```
 
 ---
@@ -99,13 +112,22 @@ All targets use one CMake project. Load the toolchain environment first (see
 source tools/env.sh
 ```
 
-### T1 — Nintendo 3DS `.3dsx`
+### T1 — Nintendo 3DS (`.cia`, `.3dsx`, `.cci`)
 
 ```bash
-cmake -S . -B build-3ds -G Ninja -DCMAKE_TOOLCHAIN_FILE="${CTR_CMAKE_TOOLCHAIN_FILE}"
+cmake -S . -B build-3ds -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE="${CTR_CMAKE_TOOLCHAIN_FILE}" \
+    -DCMAKE_BUILD_TYPE=Release
 ninja -C build-3ds
-# -> build-3ds/psx3ds.3dsx, build-3ds/psx3ds.smdh, build-3ds/psx3ds.elf
+# -> build-3ds/psx3ds.cia   (installable via FBI on Luma3DS New 3DS & Old 3DS)
+# -> build-3ds/psx3ds.3dsx  (Homebrew Launcher executable w/ embedded custom SMDH)
+# -> build-3ds/psx3ds.cci   (NCCH cartridge image w/ full RSF ExHeader for Azahar/Citra)
+# -> build-3ds/psx3ds.smdh, build-3ds/psx3ds.bnr, build-3ds/psx3ds.elf
 ```
+
+T1 links devkitPro's `3ds-zlib`, `3ds-xz`, `3ds-zstd`, and `3ds-flac` portlibs for CHD v1–v5
+decompression, and automatically packages `.cia`/`.cci` when `makerom` and `bannertool` are
+installed in `$DEVKITPRO/tools/bin` (pass `-DPSX3DS_BUILD_CIA=OFF` to build `.3dsx` only).
 
 > [!IMPORTANT]
 > Do not pass `-DCMAKE_C_FLAGS=...` on T1. It replaces the `-march=armv6k -mtune=mpcore
@@ -137,6 +159,7 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 | Option | Purpose |
 |---|---|
 | `--cpu interp\|cached\|jit` | Choose the CPU engine (`jit` exists on ARM targets only) |
+| `--cd <disc.chd\|.cue\|.bin\|.iso>` | Mount a CHD v1–v5 archive, CUE/BIN multi-track set, or raw ISO/IMG |
 | `--frames N`, `--stop-on-tty STR` | Run length, or stop when the guest prints a string |
 | `--dump-ppm out.ppm[:every]`, `--dump-wav out.wav` | Save frames and 44.1 kHz stereo audio |
 | `--bench`, `--bench-json out.json` | Benchmark all engines with JSON telemetry (`psx3ds-bench` runs `--bench` by default) |
@@ -148,42 +171,81 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 ### Verification gates (CI order)
 
 1. `tools/gen_offsets_check.sh`: all 34 `PsxCpu` offsets must be identical on x86_64 and ARM11.
-2. T3 ASan+UBSan `ctest` and T2 `ctest` under `qemu-arm -cpu arm11mpcore`, with 0 warnings and
-   0 `SIGILL`. T1 must build with 0 warnings.
+2. **19/19** `ctest` suites (including `test_periph_chd` covering all four CHD v5 codecs + LRU cache)
+   on T3 ASan+UBSan and T2 `qemu-arm -cpu arm11mpcore`, with 0 warnings and 0 `SIGILL`. T1 builds
+   `psx3ds.cia`, `psx3ds.3dsx`, `psx3ds.cci`, and `psx3ds.smdh` with 0 compiler warnings.
 3. ROM gates on T2 with `--cpu jit`, checked against the T3 interpreter: `psxtest_cpu.exe`
    (`Result: 00000101`), `gte-test-all.exe` (1150/1150), `psxtest_gte.exe`, timers, DMA, MDEC,
-   SPU ADPCM, and save-state round trips.
-4. Real `.3dsx` runs in `azahar-headless` with `psx3ds_autorun.cfg` (see below), using both
-   `gpu=hw` and `gpu=soft`, plus an O3DS `small_mem=1` run.
+   SPU ADPCM, CHD v5 disc mounting (`--cd *.chd`), and save-state round trips.
+4. Real `.cci` (exact `.cia` NCCH + RSF ExHeader `SVC 0x70` permissions) and `.3dsx` runs in
+   `azahar-headless` with `psx3ds_autorun.cfg`, across New 3DS (`124 MiB`), Old 3DS (`64 MiB`,
+   `small_mem=1`), `gpu=hw` / `gpu=soft`, and `.chd` disc images.
 
 ---
 
 ## Running on a 3DS
 
-### SD card layout
+### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
+
+Grab the latest release bundle (`psx3ds-v0.2.0-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
+
+* **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.0-3ds.zip` to the root
+     of your SD card).
+  2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
+     **PSX3DS** from the 3DS Home Menu.
+  3. The universal ExHeader (`TitleID 000400000F853D00`) automatically unlocks native **`SVC 0x70`
+     hardware W^X dual-mapped RW+RX JIT (`JIT_MEM_MIRROR_RWRX`)**, **New 3DS 804 MHz / 124 MiB
+     FCRAM / 2 MiB L2 / Core 2** CD/CHD prefetch, and **`ir:rst` + `qtm:s`** (C-Stick & ZL/ZR),
+     while seamlessly running on **Old 3DS / 2DS (`SystemMode: 64MB`, 268 MHz)** using the `small_mem`
+     memory profile.
+* **Option B — Homebrew Launcher `.3dsx`:**
+  Copy `psx3ds.3dsx` and `psx3ds.smdh` into `sdmc:/3ds/psx3ds/` and launch from the Luma3DS
+  Homebrew Menu (`hbmenu`).
+
+### SD card layout & CHD compression
 
 ```
 sdmc:/
+├── cia/
+│   └── psx3ds.cia                # install via FBI for Home Menu + native SVC 0x70 W^X JIT
 ├── 3ds/
-│   ├── psx3ds/psx3ds.3dsx        # the Homebrew Launcher lists any .3dsx under /3ds
+│   ├── psx3ds/
+│   │   ├── psx3ds.3dsx           # Homebrew Launcher executable
+│   │   └── psx3ds.smdh           # icon & title metadata
 │   └── dspfirm.cdc               # DSP firmware dump (needed for audio; otherwise silent)
 └── psx3ds/
-    ├── bios/                     # SCPH1001.BIN (yours) or openbios.bin (tests/roms/bios/)
-    ├── roms/                     # *.cue / *.bin / *.iso / *.img / *.exe / *.psx
+    ├── bios/                     # SCPH1001.BIN (yours) or openbios.bin (MIT, included in zip)
+    ├── roms/                     # *.chd (recommended) / *.cue + *.bin / *.iso / *.img / *.exe
     ├── saves/                    # save states: <game>_slot<N>.st
     └── memcards/                 # 128 KiB raw memory-card images
 ```
 
-The ROM browser also scans `sdmc:/psx`, `sdmc:/roms/psx` and `sdmc:/`. BIOS lookup tries
-`sdmc:/psx3ds/bios/`, `sdmc:/psx/`, `sdmc:/bios/` and `sdmc:/`, preferring `SCPH1001.BIN` over
-`openbios.bin`. If no BIOS is found, the built-in HLE BIOS is used. The emulator creates the
-`psx3ds/` directories on first launch.
+To compress multi-bin `.cue`/`.bin` PlayStation dumps into single-file **CHD v5** archives
+(typically **40–60% smaller** on SD card with lossless FLAC CD-DA audio):
+
+```bash
+chdman createcd -i "Game Title.cue" -o "Game Title.chd"
+```
+
+All CHD v1–v5 CD codecs (`cdzl` Deflate, `cdlz` LZMA, `cdzs` Zstd, `cdfl` FLAC) are decoded natively
+with an 8-hunk LRU cache on New 3DS (`~1.2 MiB`, Core 2 async offload) and a 4-hunk cache on Old 3DS
+(`~0.6 MiB`); `.chd` titles show a `[CHD]` badge in the ROM browser and live cache hit rates on the
+telemetry HUD.
+
+The ROM browser scans `sdmc:/psx3ds/roms`, `sdmc:/psx`, `sdmc:/roms/psx` and `sdmc:/`. BIOS lookup tries
+`sdmc:/psx3ds/bios/`, `sdmc:/psx/`, `sdmc:/bios/` and `sdmc:/` (plus `psx/bios/`), preferring
+`SCPH1001.BIN` over `openbios.bin`. If no BIOS is found, the built-in HLE BIOS is used for PS-EXE
+titles (note: retail CD/CHD games require a PS1 BIOS such as `SCPH1001.BIN` to boot `SYSTEM.CNF`).
+The emulator creates the `psx3ds/` directories on first launch.
 
 > [!NOTE]
-> Run the `.3dsx` through the Homebrew Launcher on **Luma3DS**. psx3ds checks at startup which
-> JIT memory mode is available (Luma's mirror-mapped RW/RX first, then RWX in place). If neither
-> works, it falls back to the cached interpreter, so it never crashes on a restricted system.
-> Old 3DS units are detected automatically and get the `small_mem` profile.
+> At startup `psx3ds` probes Horizon OS JIT permissions in order: hardware W^X dual-mapped RW+RX
+> mirror (`SVC 0x70 MEMOP_MAP`, active on `.cia` and Rosalina Luma3DS), then in-place RWX
+> (`MEMOP_PROT`), falling back safely to the cached interpreter if running inside a restricted
+> environment so it never crashes. Old 3DS units are detected automatically and run the `small_mem`
+> profile (`20 MiB` linear heap + `42.6 MiB` normal heap fitting `26 MiB` arena + `6 MiB` JIT + CHD).
 
 ### Controls
 
@@ -242,8 +304,9 @@ Measured numbers, including before/after tables, are in [`docs/BENCHMARKS.md`](d
 | **Sub-page 64B SMC code-line bitmask** (`Cube` / `PSXNICCC` steady-state, T2) | Recompiles dropped **`69/frame → 0/frame`**, boosting steady-state `jit` FPS **`8.65×`** (`91.2 → 788.8 FPS` on `Cube`) and **`5.03×`** (`102.0 → 512.7 FPS` on `PSXNICCC`) |
 | **100% inline ARMv6K GTE** (all 22 GTE opcodes, `r0–r8`-only) | **`100.0%`** inline GTE in `animated-triangle` (up from `71.4%`); **`5.90×`** faster than interpreter (`2.81×` vs C helper) with **1,150 / 1,150** `gte-test-all` accuracy |
 | **ARMv6K SIMD kernels & zero-div rasterizer** (T2 `gpu_soft` / MDEC / SPU) | MDEC IDCT **`2.66×`**, dithered Gouraud span **`1.99×`**, 4bpp sprite row **`1.94×`**, Gouraud span **`1.79×`**, ABR1 **`1.61×`**, `gpu-benchmark` **`169.9 FPS`** (`12.1×` vs `interp`) |
-| **PICA200 `citro3d` HW GPU + batch fusion** (T1 `.3dsx` in Azahar) | **`2.5×–3.5×`** faster than ARMv6K software GPU (`Cube` **`115.2 FPS`**, `PSXNICCC` **`119.0 FPS`**), draw calls cut **`17–33%`**, Core 1 SPU underruns cut **`92–97%`** |
-| **Old 3DS `small_mem` 64 MiB profile** (`26 MiB` arena + 20-slot `RGBA5551`) | Sustains 600-frame `.3dsx` runs in **`< 30 MiB` FCRAM** using only **`291–402 KiB`** of the `6 MiB` JIT buffer (`0` post-boot flushes) |
+| **PICA200 `citro3d` HW GPU + batch fusion** (T1 `.cia`/`.3dsx` in Azahar) | **`2.5×–3.5×`** faster than ARMv6K software GPU (`Cube` **`120.7 FPS`**, `PSXNICCC` **`119.0 FPS`**), draw calls cut **`17–33%`**, Core 1 SPU underruns cut **`92–97%`** |
+| **CHD v5 disc pipeline + 8-hunk LRU** (`test_periph_chd`, T2 ARM11v6K) | Cold decode **`22.4–48.3 MB/s`** (`75×–161×` PS1 2× CD-ROM; Zstd `48.3`, Deflate `28.7`, LZMA `27.6`, FLAC `22.4 MB/s`), warm 8-slot cache **`1,531 MB/s`** (`87.5%` seq hit rate), Core 2 async offload |
+| **Universal `.cia` + Old 3DS `small_mem` 64 MiB fit** (`20 MiB` linear + `42.6 MiB` heap) | Native `SVC 0x70` W^X JIT + N3DS 804 MHz / 124 MiB; Old 3DS 64 MiB `.cia` sustains **`120+ FPS`** (`Cube` `292 KiB` / `6 MiB` JIT, `0` post-boot flushes) alongside 4-slot CHD cache |
 
 Design decisions that make these numbers possible (details in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
