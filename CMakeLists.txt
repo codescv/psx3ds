@@ -182,6 +182,8 @@ set(PSX3DS_CORE_SRCS
     src/sys/bios.c
     src/sys/hle_bios.c
     src/sys/psexe.c
+    src/sys/cdboot.c
+    src/sys/openbios_blob.S
     src/sys/savestate.c
     src/sys/stats.c
     src/sys/bench.c
@@ -235,6 +237,15 @@ else()
         src/platform/host/audio_wav.c
     )
 endif()
+
+# Embedded 512 KiB OpenBIOS (v0.2.2): `.incbin "openbios.bin"` resolved via the assembler
+# include path so psx_load_bios(sys, "builtin") works on every target with zero external files.
+set(PSX3DS_OPENBIOS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/roms/bios")
+set_source_files_properties(src/sys/openbios_blob.S PROPERTIES
+    LANGUAGE ASM
+    COMPILE_OPTIONS "-Wa,-I${PSX3DS_OPENBIOS_DIR}"
+    OBJECT_DEPENDS "${PSX3DS_OPENBIOS_DIR}/openbios.bin"
+)
 
 add_library(psx3ds_core_objs OBJECT ${PSX3DS_CORE_SRCS})
 target_include_directories(psx3ds_core_objs PUBLIC

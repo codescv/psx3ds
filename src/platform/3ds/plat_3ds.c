@@ -147,6 +147,42 @@ PsxResult ctr_capture_top_screen_ppm(const char *path) {
     return PSX_OK;
 }
 
+/* Un-rotated 320x240 bottom-screen (touch UI) readback, for autorun UI screenshots. */
+PsxResult ctr_capture_bottom_screen_ppm(const char *path) {
+    if (!path || path[0] == '\0') {
+        return PSX_ERR_BAD_ARG;
+    }
+    u16 fb_w = 0u;
+    u16 fb_h = 0u;
+    u8 *gfx_fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fb_w, &fb_h);
+    if (!gfx_fb) {
+        return PSX_ERR_IO;
+    }
+    (void)GSPGPU_InvalidateDataCache(gfx_fb, 320u * 240u * 3u);
+    FILE *ppm = fopen(path, "wb");
+    if (!ppm) {
+        return PSX_ERR_IO;
+    }
+    if (fprintf(ppm, "P6\n320 240\n255\n") < 0) {
+        fclose(ppm);
+        return PSX_ERR_IO;
+    }
+    u8 row[320u * 3u];
+    for (int y = 0; y < 240; y++) {
+        for (int x = 0; x < 320; x++) {
+            int idx = (x * 240 + (239 - y)) * 3;
+            row[x * 3 + 0] = gfx_fb[idx + 2];
+            row[x * 3 + 1] = gfx_fb[idx + 1];
+            row[x * 3 + 2] = gfx_fb[idx + 0];
+        }
+        if (fwrite(row, 1u, sizeof(row), ppm) != sizeof(row)) {
+            fclose(ppm);
+            return PSX_ERR_IO;
+        }
+    }
+    return fclose(ppm) == 0 ? PSX_OK : PSX_ERR_IO;
+}
+
 static u8 scale_stick_axis(s16 v, bool invert) {
     s32 s = invert ? -(s32)v : (s32)v;
     /* Circle pad nominal range is ~[-154, +154] */
@@ -343,6 +379,116 @@ u32 plat_listdir(const char *path, char (*names)[256], u32 max) {
     return count;
 }
 
+/* --------------------------------------------------------------------------
+ * On-screen / SD log (v0.2.2)
+ *
+ * Every plat_log() line (and line-buffered guest TTY via ctr_log_tty_putc) goes to:
+ *   1. svcOutputDebugString (Luma3DS / Azahar debugger),
+ *   2. a 64-line circular buffer rendered by the bottom-screen "4:LOG" tab
+ *      (lines wrapped at CTR_LOG_COLS visible chars),
+ *   3. sdmc:/psx3ds/psx3ds.log (truncated on first open per app run, fflush per line,
+ *      capped at CTR_LOG_FILE_CAP bytes so runaway logging cannot fill the SD card).
+ *
+ * plat_log() may run on Core 1 / Core 2 worker threads, so the ring and the FILE are
+ * guarded by one LightLock. Never call plat_log() from __system_allocateHeaps (newlib and
+ * sdmc are not up yet).
+ * -------------------------------------------------------------------------- */
+#define CTR_LOG_LINES    64u
+#define CTR_LOG_COLS     39u
+#define CTR_LOG_FILE     "sdmc:/psx3ds/psx3ds.log"
+#define CTR_LOG_FILE_CAP (4u * 1024u * 1024u)
+
+/* LightLock: 1 == unlocked (what LightLock_Init stores), so static init is safe from any
+ * thread/ordering without a separate init call. */
+static LightLock g_log_lock = 1;
+static char      g_log_ring[CTR_LOG_LINES][CTR_LOG_COLS + 1u];
+static u32       g_log_head = 0u;  /* index of oldest line */
+static u32       g_log_count = 0u; /* valid lines */
+static FILE     *g_log_fp = NULL;
+static bool      g_log_fp_tried = false;
+static u32       g_log_fp_bytes = 0u;
+static char      g_tty_line[160];
+static u32       g_tty_len = 0u;
+
+/* Caller holds g_log_lock. */
+static void log_ring_push_locked(const char *s, u32 len) {
+    char *dst;
+    if (g_log_count < CTR_LOG_LINES) {
+        dst = g_log_ring[(g_log_head + g_log_count) % CTR_LOG_LINES];
+        g_log_count++;
+    } else {
+        dst = g_log_ring[g_log_head];
+        g_log_head = (g_log_head + 1u) % CTR_LOG_LINES;
+    }
+    u32 n = len < CTR_LOG_COLS ? len : CTR_LOG_COLS;
+    for (u32 i = 0u; i < n; i++) {
+        char c = s[i];
+        dst[i] = (c == '\t') ? ' ' : (((unsigned char)c < 0x20u) ? '?' : c);
+    }
+    dst[n] = '\0';
+}
+
+/* Caller holds g_log_lock. Wraps a single logical line (no '\n') into ring rows. */
+static void log_ring_add_line_locked(const char *s, u32 len) {
+    if (len == 0u) {
+        log_ring_push_locked("", 0u);
+        return;
+    }
+    while (len > 0u) {
+        u32 n = len < CTR_LOG_COLS ? len : CTR_LOG_COLS;
+        log_ring_push_locked(s, n);
+        s += n;
+        len -= n;
+    }
+}
+
+/* Caller holds g_log_lock. */
+static void log_file_write_locked(const char *s, u32 len) {
+    if (!g_log_fp && !g_log_fp_tried) {
+        g_log_fp_tried = true;
+        (void)mkdir("sdmc:/psx3ds", 0777);
+        g_log_fp = fopen(CTR_LOG_FILE, "w"); /* truncate once per app run */
+        g_log_fp_bytes = 0u;
+    }
+    if (!g_log_fp || g_log_fp_bytes >= CTR_LOG_FILE_CAP) {
+        return;
+    }
+    if (len > 0u) {
+        (void)fwrite(s, 1u, len, g_log_fp);
+    }
+    (void)fputc('\n', g_log_fp);
+    g_log_fp_bytes += len + 1u;
+    if (g_log_fp_bytes >= CTR_LOG_FILE_CAP) {
+        (void)fputs("[log] size cap reached, further lines only in ring\n", g_log_fp);
+    }
+    (void)fflush(g_log_fp);
+}
+
+/* Caller holds g_log_lock. */
+static void log_emit_segment_locked(const char *s, u32 len) {
+    while (len > 0u && s[len - 1u] == '\r') {
+        len--;
+    }
+    log_ring_add_line_locked(s, len);
+    log_file_write_locked(s, len);
+}
+
+/* Splits text on '\n' (dropping '\r'), pushes each line to ring + file. */
+static void log_emit_text(const char *text, u32 len) {
+    LightLock_Lock(&g_log_lock);
+    u32 start = 0u;
+    for (u32 i = 0u; i < len; i++) {
+        if (text[i] == '\n') {
+            log_emit_segment_locked(text + start, i - start);
+            start = i + 1u;
+        }
+    }
+    if (start < len) {
+        log_emit_segment_locked(text + start, len - start);
+    }
+    LightLock_Unlock(&g_log_lock);
+}
+
 void plat_log(const char *fmt, ...) {
     char buf[256];
     va_list ap;
@@ -350,7 +496,93 @@ void plat_log(const char *fmt, ...) {
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (n > 0) {
-        svcOutputDebugString(buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1);
+        u32 len = (u32)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1);
+        svcOutputDebugString(buf, (s32)len);
+        log_emit_text(buf, len);
+    }
+}
+
+u32 ctr_log_count(void) {
+    LightLock_Lock(&g_log_lock);
+    u32 n = g_log_count;
+    LightLock_Unlock(&g_log_lock);
+    return n;
+}
+
+u32 ctr_log_get(u32 idx_from_oldest, char *out, u32 cap) {
+    if (!out || cap == 0u) {
+        return 0u;
+    }
+    out[0] = '\0';
+    u32 len = 0u;
+    LightLock_Lock(&g_log_lock);
+    if (idx_from_oldest < g_log_count) {
+        const char *src = g_log_ring[(g_log_head + idx_from_oldest) % CTR_LOG_LINES];
+        while (src[len] != '\0' && len + 1u < cap) {
+            out[len] = src[len];
+            len++;
+        }
+        out[len] = '\0';
+    }
+    LightLock_Unlock(&g_log_lock);
+    return len;
+}
+
+void ctr_log_clear(void) {
+    LightLock_Lock(&g_log_lock);
+    g_log_head = 0u;
+    g_log_count = 0u;
+    LightLock_Unlock(&g_log_lock);
+}
+
+bool ctr_log_dump(const char *path) {
+    if (!path || path[0] == '\0') {
+        return false;
+    }
+    /* Snapshot under the lock, write without it (SD I/O can be slow). */
+    char (*snap)[CTR_LOG_COLS + 1u] = malloc(sizeof(g_log_ring));
+    if (!snap) {
+        return false;
+    }
+    LightLock_Lock(&g_log_lock);
+    u32 n = g_log_count;
+    for (u32 i = 0u; i < n; i++) {
+        memcpy(snap[i], g_log_ring[(g_log_head + i) % CTR_LOG_LINES], CTR_LOG_COLS + 1u);
+    }
+    LightLock_Unlock(&g_log_lock);
+
+    FILE *fp = fopen(path, "w");
+    bool ok = (fp != NULL);
+    if (ok) {
+        ok = fprintf(fp, "# psx3ds v%s on-screen log dump (%u lines)\n",
+                     PSX3DS_VERSION_STR, (unsigned)n) > 0;
+        for (u32 i = 0u; ok && i < n; i++) {
+            ok = fprintf(fp, "%s\n", snap[i]) >= 0;
+        }
+        if (fclose(fp) != 0) {
+            ok = false;
+        }
+    }
+    free(snap);
+    return ok;
+}
+
+void ctr_log_tty_putc(char c) {
+    if (c == '\r' || c == '\0') {
+        return;
+    }
+    if (c != '\n') {
+        g_tty_line[g_tty_len++] = c;
+    }
+    if (c == '\n' || g_tty_len + 1u >= sizeof(g_tty_line) - 6u) {
+        char line[sizeof(g_tty_line) + 8u];
+        int n = snprintf(line, sizeof(line), "[tty] %.*s", (int)g_tty_len, g_tty_line);
+        g_tty_len = 0u;
+        if (n > 0) {
+            u32 len = (u32)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+            svcOutputDebugString(line, (s32)len);
+            log_emit_text(line, len);
+        }
     }
 }
 

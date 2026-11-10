@@ -32,6 +32,7 @@ typedef struct PsxCdrom {
     u32         state_tick;
     u8          vol[4], vol_pending[4];
     u8          region;
+    u32         sectors_read; /* cumulative data/audio sectors delivered (HUD 'CD Rd'); not serialized */
 } PsxCdrom;
 
 void      cdrom_init(PsxSystem *sys);

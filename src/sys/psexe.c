@@ -41,7 +41,7 @@ PsxResult psx_exe_parse_header(const u8 *buf, u32 buf_len, PsxExeHeader *out) {
     return PSX_OK;
 }
 
-static void psexe_write_ram_region(PsxSystem *sys, u32 phys_start, const u8 *src, u32 len) {
+void psx_exe_write_ram(PsxSystem *sys, u32 phys_start, const u8 *src, u32 len) {
     if (!sys || !sys->bus.ram || len == 0u) {
         return;
     }
@@ -90,7 +90,7 @@ PsxResult psx_exe_inject_now(PsxSystem *sys) {
 
     /* Optional BSS zero-fill before loading text/data */
     if (hdr.b_addr != 0u && hdr.b_size != 0u && hdr.b_size <= PSX_RAM_SIZE) {
-        psexe_write_ram_region(sys, hdr.b_addr & PSX_RAM_MASK, NULL, hdr.b_size);
+        psx_exe_write_ram(sys, hdr.b_addr & PSX_RAM_MASK, NULL, hdr.b_size);
     }
 
     /* Copy 0x800-offset payload into RAM */
@@ -112,7 +112,7 @@ PsxResult psx_exe_inject_now(PsxSystem *sys) {
         if (got == 0u) {
             break;
         }
-        psexe_write_ram_region(sys, t_phys + offset, chunk, got);
+        psx_exe_write_ram(sys, t_phys + offset, chunk, got);
         offset += got;
         if (got < step) {
             break;
@@ -121,22 +121,30 @@ PsxResult psx_exe_inject_now(PsxSystem *sys) {
     plat_fclose(f);
 
     if (offset < hdr.t_size) {
-        psexe_write_ram_region(sys, t_phys + offset, NULL, hdr.t_size - offset);
+        psx_exe_write_ram(sys, t_phys + offset, NULL, hdr.t_size - offset);
     }
 
-    /* Set architectural registers per PS-X EXE spec */
     u32 sp_val = (hdr.s_addr != 0u) ? (hdr.s_addr + hdr.s_size) : 0x801FFF00u;
-    sys->bios.exe_pc = hdr.pc0;
-    sys->bios.exe_gp = hdr.gp0;
+    psx_exe_apply_entry(sys, &hdr, sp_val);
+    return PSX_OK;
+}
+
+void psx_exe_apply_entry(PsxSystem *sys, const PsxExeHeader *hdr, u32 sp_val) {
+    if (!sys || !hdr) {
+        return;
+    }
+    /* Set architectural registers per PS-X EXE spec */
+    sys->bios.exe_pc = hdr->pc0;
+    sys->bios.exe_gp = hdr->gp0;
     sys->bios.exe_sp = sp_val;
 
     PsxCpu *c = &sys->cpu;
     c->gpr[0]  = 0u;
-    c->gpr[28] = hdr.gp0; /* $gp */
-    c->gpr[29] = sp_val;  /* $sp */
-    c->gpr[30] = sp_val;  /* $fp */
-    c->pc      = hdr.pc0;
-    c->next_pc = hdr.pc0 + 4u;
+    c->gpr[28] = hdr->gp0; /* $gp */
+    c->gpr[29] = sp_val;   /* $sp */
+    c->gpr[30] = sp_val;   /* $fp */
+    c->pc      = hdr->pc0;
+    c->next_pc = hdr->pc0 + 4u;
     c->in_delay_slot  = 0u;
     c->branch_taken   = 0u;
     c->load_delay_reg = 0u;
@@ -144,6 +152,9 @@ PsxResult psx_exe_inject_now(PsxSystem *sys) {
 
     if (sys->bios.hle) {
         /* Standalone BIOS-less HLE hardware setup (COP2 GTE + IRQ2 + DMA DPCR + unblank GP1) */
+        /* psexe_pending=true keeps install_ram_vectors from planting its idle loop at
+         * 0x80030000, which usually lies inside the EXE text we just loaded. */
+        sys->bios.psexe_pending = true;
         hle_bios_install_ram_vectors(sys);
         c->gpr[31] = 0x80001000u; /* safe return loop if main() returns */
         cpu_set_sr(sys, PSX_SR_CU2 | PSX_SR_IEC | 0x0400u);
@@ -155,12 +166,12 @@ PsxResult psx_exe_inject_now(PsxSystem *sys) {
     }
 
     sys->bios.psexe_pending = false;
+    sys->bios.cdboot_pending = false;
     c->psexe_pending = 0u;
 
     jit_flush_all(sys);
     c->icache_dirty = 1u;
     cpu_request_exit(sys);
-    return PSX_OK;
 }
 
 PsxResult psx_load_exe(PsxSystem *sys, const char *path) {

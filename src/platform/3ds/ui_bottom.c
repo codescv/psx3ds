@@ -128,6 +128,29 @@ static bool is_chd_filename(const char *name) {
            dot[4] == '\0';
 }
 
+/* Case-insensitive prefix/substring checks to keep BIOS images out of the ROM list. */
+static bool name_contains_ci(const char *name, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = name; *p != '\0'; p++) {
+        size_t i = 0u;
+        while (i < nl && p[i] != '\0' &&
+               tolower((unsigned char)p[i]) == (unsigned char)needle[i]) {
+            i++;
+        }
+        if (i == nl) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool looks_like_bios_file(const char *name) {
+    return name_contains_ci(name, "scph") || name_contains_ci(name, "psxonpsp") ||
+           name_contains_ci(name, "openbios") ||
+           (tolower((unsigned char)name[0]) == 'b' && tolower((unsigned char)name[1]) == 'i' &&
+            tolower((unsigned char)name[2]) == 'o' && tolower((unsigned char)name[3]) == 's');
+}
+
 static bool has_rom_extension(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) {
@@ -148,43 +171,30 @@ static bool has_rom_extension(const char *name) {
            strcmp(ext, ".psx") == 0;
 }
 
-static bool file_exists_512k(const char *path) {
-    PlatFile *f = plat_fopen(path, "rb");
-    if (!f) {
-        return false;
+/*
+ * BIOS selection (v0.2.2): an external 512 KiB SD BIOS (SCPH*.BIN, PSXONPSP*.BIN, BIOS*.BIN,
+ * openbios.bin in sdmc:/psx3ds/bios, sdmc:/psx, sdmc:/roms/psx, sdmc:/bios, sdmc:/) wins; else the
+ * embedded OpenBIOS ("builtin") is used. HLE Direct is an explicit opt-in (ui->bios_mode).
+ */
+static void detect_sdmc_bios(CtrUiState *ui) {
+    char path[256];
+    char badge[32];
+    path[0] = '\0';
+    badge[0] = '\0';
+    if (psx_bios_find_external(path, (u32)sizeof(path), badge, (u32)sizeof(badge)) &&
+        path[0] != '\0') {
+        snprintf(ui->bios_path, sizeof(ui->bios_path), "%s", path);
+        snprintf(ui->bios_badge, sizeof(ui->bios_badge), "%s",
+                 badge[0] != '\0' ? badge : "EXT BIOS");
+    } else {
+        snprintf(ui->bios_path, sizeof(ui->bios_path), "%s", PSX_BIOS_BUILTIN_NAME);
+        snprintf(ui->bios_badge, sizeof(ui->bios_badge), "%s", "OPENBIOS");
     }
-    u64 sz = plat_fsize(f);
-    plat_fclose(f);
-    return sz == PSX_BIOS_SIZE;
 }
 
-static void detect_sdmc_bios(CtrUiState *ui) {
-    static const struct {
-        const char *path;
-        const char *badge;
-    } k_bios_candidates[] = {
-        { "sdmc:/psx3ds/bios/SCPH1001.BIN", "SCPH1001" },
-        { "sdmc:/psx3ds/bios/scph1001.bin", "SCPH1001" },
-        { "sdmc:/psx3ds/bios/openbios.bin", "OPENBIOS" },
-        { "sdmc:/psx/SCPH1001.BIN",         "SCPH1001" },
-        { "sdmc:/psx/scph1001.bin",         "SCPH1001" },
-        { "sdmc:/psx/openbios.bin",         "OPENBIOS" },
-        { "sdmc:/bios/SCPH1001.BIN",        "SCPH1001" },
-        { "sdmc:/bios/openbios.bin",        "OPENBIOS" },
-        { "sdmc:/SCPH1001.BIN",             "SCPH1001" },
-        { "sdmc:/scph1001.bin",             "SCPH1001" },
-        { "sdmc:/openbios.bin",             "OPENBIOS" },
-        { "romfs:/openbios.bin",            "OPENBIOS" }
-    };
-    for (size_t i = 0u; i < sizeof(k_bios_candidates) / sizeof(k_bios_candidates[0]); i++) {
-        if (file_exists_512k(k_bios_candidates[i].path)) {
-            snprintf(ui->bios_path, sizeof(ui->bios_path), "%s", k_bios_candidates[i].path);
-            snprintf(ui->bios_badge, sizeof(ui->bios_badge), "%s", k_bios_candidates[i].badge);
-            return;
-        }
-    }
-    ui->bios_path[0] = '\0';
-    strcpy(ui->bios_badge, "HLE BIOS");
+/* Badge text + colour shown in the header for the current BIOS mode. */
+static const char *bios_badge_text(const CtrUiState *ui) {
+    return ui->bios_mode == CTR_BIOS_MODE_HLE ? "HLE BIOS" : ui->bios_badge;
 }
 
 void ctr_ui_scan_roms(CtrUiState *ui) {
@@ -215,8 +225,7 @@ void ctr_ui_scan_roms(CtrUiState *ui) {
                 continue;
             }
             /* Skip BIOS binaries when scanning root directories */
-            if (strstr(entries[i], "SCPH") != NULL || strstr(entries[i], "scph") != NULL ||
-                strstr(entries[i], "openbios") != NULL) {
+            if (looks_like_bios_file(entries[i])) {
                 continue;
             }
             char full[256];
@@ -267,6 +276,41 @@ static bool hit_rect(int tx, int ty, int x, int y, int w, int h) {
     return tx >= x && tx < (x + w) && ty >= y && ty < (y + h);
 }
 
+/*
+ * Bottom-screen geometry (320x240):
+ *   y  0..18  header (version, N3DS/O3DS, BIOS badge)
+ *   y 20..38  tab bar: 4 tabs at x = 2 + i*79, w = 77  (1:ROMS | 2:HUD | 3:CTRL | 4:LOG)
+ *   y 44..202 tab body
+ *   y 208..233 HUD/CTRL: Old-3DS L2/L3/R3/R2 touch pads; LOG: Dump/Clear/Up/Down buttons
+ */
+#define TAB_X0      2
+#define TAB_PITCH   79
+#define TAB_BTN_W   77
+#define PAD_Y       208
+#define PAD_H       26
+#define PAD_W       72
+#define LOG_ROWS    12u
+#define LOG_ROW_Y0  47
+#define LOG_ROW_DY  12
+#define LOG_COLS    39
+#define LOG_PAGE    6u
+
+static const int k_pad_x[4] = { 6, 84, 164, 242 };
+
+static u32 log_max_scroll(void) {
+    u32 n = ctr_log_count();
+    return n > LOG_ROWS ? (n - LOG_ROWS) : 0u;
+}
+
+static void log_scroll_by(CtrUiState *ui, s32 delta) {
+    s32 s = (s32)ui->log_scroll + delta;
+    if (s < 0) {
+        s = 0;
+    }
+    u32 max_s = log_max_scroll();
+    ui->log_scroll = ((u32)s > max_s) ? max_s : (u32)s;
+}
+
 CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
                           u32 keys_down, u32 keys_held, const touchPosition *touch) {
     (void)hw;
@@ -277,15 +321,16 @@ CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
         ui->status_timer--;
     }
 
-    /* Update Old-3DS touch L2/L3/R3/R2 pads along bottom strip (y = 208..236) */
+    /* Old-3DS touch L2/L3/R3/R2 pads along bottom strip (y = 208..233), HUD + CTRL tabs only */
     u16 touch_pads = 0u;
-    if ((keys_held & KEY_TOUCH) && touch && ui->active_tab != 0u) {
+    bool pads_tab = (ui->active_tab == CTR_UI_TAB_HUD || ui->active_tab == CTR_UI_TAB_CTRL);
+    if ((keys_held & KEY_TOUCH) && touch && pads_tab) {
         int tx = touch->px;
         int ty = touch->py;
-        if (hit_rect(tx, ty, 6, 208, 72, 26))   touch_pads |= 0x0100u; /* L2 */
-        if (hit_rect(tx, ty, 84, 208, 72, 26))  touch_pads |= 0x0002u; /* L3 */
-        if (hit_rect(tx, ty, 164, 208, 72, 26)) touch_pads |= 0x0004u; /* R3 */
-        if (hit_rect(tx, ty, 242, 208, 72, 26)) touch_pads |= 0x0200u; /* R2 */
+        if (hit_rect(tx, ty, k_pad_x[0], PAD_Y, PAD_W, PAD_H)) touch_pads |= 0x0100u; /* L2 */
+        if (hit_rect(tx, ty, k_pad_x[1], PAD_Y, PAD_W, PAD_H)) touch_pads |= 0x0002u; /* L3 */
+        if (hit_rect(tx, ty, k_pad_x[2], PAD_Y, PAD_W, PAD_H)) touch_pads |= 0x0004u; /* R3 */
+        if (hit_rect(tx, ty, k_pad_x[3], PAD_Y, PAD_W, PAD_H)) touch_pads |= 0x0200u; /* R2 */
     }
     ui->touch_extra_buttons = touch_pads;
     ctr_input_set_touch_buttons(touch_pads);
@@ -293,7 +338,13 @@ CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
     /* START+SELECT chord switches to Quick Controls tab */
     if ((keys_held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT) &&
         (keys_down & (KEY_START | KEY_SELECT))) {
-        ui->active_tab = 2u;
+        ui->active_tab = CTR_UI_TAB_CTRL;
+        return CTR_UI_NONE;
+    }
+
+    /* SELECT alone cycles tabs while no game is running (SELECT is a PS1 button otherwise) */
+    if (!ui->game_loaded && (keys_down & KEY_SELECT) && !(keys_held & KEY_START)) {
+        ui->active_tab = (u8)((ui->active_tab + 1u) % CTR_UI_TAB_COUNT);
         return CTR_UI_NONE;
     }
 
@@ -301,16 +352,17 @@ CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
     int tx = tapped ? touch->px : -1;
     int ty = tapped ? touch->py : -1;
 
-    /* Top tab bar (y = 20..40) */
+    /* Top tab bar (y = 20..39) */
     if (tapped && ty >= 20 && ty < 40) {
-        if (tx < 106)      ui->active_tab = 0u;
-        else if (tx < 212) ui->active_tab = 1u;
-        else               ui->active_tab = 2u;
+        int t = (tx - TAB_X0) / TAB_PITCH;
+        if (t < 0) t = 0;
+        if (t >= (int)CTR_UI_TAB_COUNT) t = (int)CTR_UI_TAB_COUNT - 1;
+        ui->active_tab = (u8)t;
         return CTR_UI_NONE;
     }
 
-    /* Tab 0: ROM Browser */
-    if (ui->active_tab == 0u) {
+    /* Tab 1: ROM Browser */
+    if (ui->active_tab == CTR_UI_TAB_ROMS) {
         if (!ui->game_loaded && (keys_down & KEY_START)) {
             return CTR_UI_QUIT_APP;
         }
@@ -361,26 +413,66 @@ CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
         return CTR_UI_NONE;
     }
 
-    /* Tab 2: Quick Controls */
-    if (ui->active_tab == 2u && tapped && sys) {
-        if (hit_rect(tx, ty, 8, 48, 148, 28))   return CTR_UI_TOGGLE_GPU;
-        if (hit_rect(tx, ty, 164, 48, 148, 28)) return CTR_UI_CYCLE_SCALE;
-        if (hit_rect(tx, ty, 8, 82, 148, 28))   return CTR_UI_CYCLE_FRAMESKIP;
-        if (hit_rect(tx, ty, 164, 82, 148, 28)) return CTR_UI_TOGGLE_REVERB;
-
+    /* Tab 3: Quick Controls */
+    if (ui->active_tab == CTR_UI_TAB_CTRL && tapped) {
+        /* These work without a running game */
+        if (hit_rect(tx, ty, 8, 182, 148, 20)) {
+            return CTR_UI_TOGGLE_BIOS_MODE;
+        }
+        if (hit_rect(tx, ty, 164, 182, 148, 20)) {
+            return CTR_UI_TOGGLE_CD_BOOT;
+        }
         for (u8 s = 0u; s < 4u; s++) {
-            if (hit_rect(tx, ty, 8 + (int)s * 78, 116, 72, 24)) {
+            if (hit_rect(tx, ty, 8 + (int)s * 78, 102, 72, 22)) {
                 ui->state_slot = s;
                 return CTR_UI_NONE;
             }
         }
-        if (hit_rect(tx, ty, 8, 146, 148, 26))   return CTR_UI_SAVE_STATE;
-        if (hit_rect(tx, ty, 164, 146, 148, 26)) return CTR_UI_LOAD_STATE;
-        if (hit_rect(tx, ty, 8, 176, 148, 26))   return CTR_UI_RESET_SYSTEM;
-        if (hit_rect(tx, ty, 164, 176, 148, 26)) {
-            ui->active_tab = 0u;
+        if (hit_rect(tx, ty, 164, 156, 148, 22)) {
+            ui->active_tab = CTR_UI_TAB_ROMS;
             return CTR_UI_OPEN_BROWSER;
         }
+        if (sys) {
+            if (hit_rect(tx, ty, 8, 46, 148, 24))    return CTR_UI_TOGGLE_GPU;
+            if (hit_rect(tx, ty, 164, 46, 148, 24))  return CTR_UI_CYCLE_SCALE;
+            if (hit_rect(tx, ty, 8, 74, 148, 24))    return CTR_UI_CYCLE_FRAMESKIP;
+            if (hit_rect(tx, ty, 164, 74, 148, 24))  return CTR_UI_TOGGLE_REVERB;
+            if (hit_rect(tx, ty, 8, 128, 148, 24))   return CTR_UI_SAVE_STATE;
+            if (hit_rect(tx, ty, 164, 128, 148, 24)) return CTR_UI_LOAD_STATE;
+            if (hit_rect(tx, ty, 8, 156, 148, 22))   return CTR_UI_RESET_SYSTEM;
+        }
+        return CTR_UI_NONE;
+    }
+
+    /* Tab 4: Log viewer (usable with or without a game) */
+    if (ui->active_tab == CTR_UI_TAB_LOG) {
+        /* D-Pad scrolls only while no game runs: with a game it belongs to the PS1 pad. */
+        if (!ui->game_loaded) {
+            if (keys_down & KEY_DUP)    log_scroll_by(ui, 1);
+            if (keys_down & KEY_DDOWN)  log_scroll_by(ui, -1);
+            if (keys_down & KEY_DLEFT)  log_scroll_by(ui, (s32)LOG_ROWS);
+            if (keys_down & KEY_DRIGHT) log_scroll_by(ui, -(s32)LOG_ROWS);
+        }
+        if (tapped) {
+            if (hit_rect(tx, ty, k_pad_x[0], PAD_Y, PAD_W, PAD_H)) {
+                if (ctr_log_dump(CTR_LOG_DUMP_PATH)) {
+                    ctr_ui_set_status(ui, "Saved " CTR_LOG_DUMP_PATH);
+                    plat_log("[ui] log dumped to %s\n", CTR_LOG_DUMP_PATH);
+                } else {
+                    ctr_ui_set_status(ui, "Log dump failed (SD card?)");
+                }
+            } else if (hit_rect(tx, ty, k_pad_x[1], PAD_Y, PAD_W, PAD_H)) {
+                ctr_log_clear();
+                ui->log_scroll = 0u;
+                ctr_ui_set_status(ui, "Log cleared (SD log file kept)");
+            } else if (hit_rect(tx, ty, k_pad_x[2], PAD_Y, PAD_W, PAD_H)) {
+                log_scroll_by(ui, (s32)LOG_PAGE);
+            } else if (hit_rect(tx, ty, k_pad_x[3], PAD_Y, PAD_W, PAD_H)) {
+                log_scroll_by(ui, -(s32)LOG_PAGE);
+            }
+        }
+        log_scroll_by(ui, 0); /* re-clamp after ring changes */
+        return CTR_UI_NONE;
     }
 
     return CTR_UI_NONE;
@@ -423,24 +515,39 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
         fb_printf(fb, 120, 6, hw->is_n3ds ? COL_OK : COL_WARN,
                   "%s %uMHz", hw->is_n3ds ? "N3DS" : "O3DS", (unsigned)hw->cpu_mhz);
     }
-    fb_printf(fb, 232, 6, ui->bios_path[0] ? COL_OK : COL_WARN, "[%s]", ui->bios_badge);
+    fb_printf(fb, 232, 6, ui->bios_mode == CTR_BIOS_MODE_HLE ? COL_WARN : COL_OK,
+              "[%.8s]", bios_badge_text(ui));
 
     /* Tab Bar */
-    fb_draw_button(fb, 2,   20, 104, 19, "1:ROMS", ui->active_tab == 0u);
-    fb_draw_button(fb, 108, 20, 104, 19, "2:HUD",  ui->active_tab == 1u);
-    fb_draw_button(fb, 214, 20, 104, 19, "3:CTRL", ui->active_tab == 2u);
+    static const char *const k_tab_labels[CTR_UI_TAB_COUNT] = {
+        "1:ROMS", "2:HUD", "3:CTRL", "4:LOG"
+    };
+    for (u32 t = 0u; t < CTR_UI_TAB_COUNT; t++) {
+        fb_draw_button(fb, TAB_X0 + (int)t * TAB_PITCH, 20, TAB_BTN_W, 19, k_tab_labels[t],
+                       ui->active_tab == t);
+    }
 
-    if (ui->active_tab == 0u) {
+    if (ui->active_tab == CTR_UI_TAB_ROMS) {
         /* SD Card ROM Browser */
         fb_fill_rect(fb, 6, 44, 308, 146, COL_CARD);
         fb_draw_border(fb, 6, 44, 308, 146, COL_BORDER);
 
         if (ui->rom_count == 0u) {
-            fb_draw_text(fb, 16, 68, "No PS1 discs/EXEs found on SD.", COL_WARN, 36);
-            fb_draw_text(fb, 16, 86, "Place .chd/.cue/.bin/.iso/.exe in:", COL_DIM, 36);
-            fb_draw_text(fb, 16, 102, "  sdmc:/psx/ or sdmc:/psx3ds/roms/", COL_TEXT, 36);
-            fb_draw_text(fb, 16, 122, "Place SCPH1001.BIN in sdmc:/psx/", COL_DIM, 36);
-            fb_draw_text(fb, 16, 138, "(Built-in HLE BIOS ready!)", COL_OK, 36);
+            bool external = strcmp(ui->bios_path, PSX_BIOS_BUILTIN_NAME) != 0 &&
+                            ui->bios_path[0] != '\0';
+            fb_draw_text(fb, 16, 64, "No PS1 discs/EXEs found on SD.", COL_WARN, 36);
+            fb_draw_text(fb, 16, 82, "Place .chd/.cue/.bin/.iso/.exe in:", COL_DIM, 36);
+            fb_draw_text(fb, 16, 98, "  sdmc:/psx/ or sdmc:/psx3ds/roms/", COL_TEXT, 36);
+            if (ui->bios_mode == CTR_BIOS_MODE_HLE) {
+                fb_draw_text(fb, 16, 118, "HLE Direct BIOS (3:CTRL to change)", COL_WARN, 36);
+            } else if (external) {
+                fb_printf(fb, 16, 118, COL_OK, "SD BIOS ready: %.20s", ui->bios_badge);
+            } else {
+                fb_draw_text(fb, 16, 118, "Built-in OpenBIOS ready!", COL_OK, 36);
+            }
+            fb_draw_text(fb, 16, 136, "Optional: SCPH*.BIN in", COL_DIM, 36);
+            fb_draw_text(fb, 16, 152, "  sdmc:/psx3ds/bios/", COL_TEXT, 36);
+            fb_draw_text(fb, 16, 172, "SELECT: next tab  4:LOG = debug log", COL_DIM, 36);
         } else {
             for (u32 i = 0u; i < 10u && (ui->rom_scroll + i) < ui->rom_count; i++) {
                 u32 idx = ui->rom_scroll + i;
@@ -458,11 +565,11 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                 }
             }
         }
-        fb_draw_button(fb, 8,   196, 148, 24, "Boot BIOS/HLE", false);
+        fb_draw_button(fb, 8,   196, 148, 24, "Boot BIOS Shell", false);
         fb_draw_button(fb, 164, 196, 148, 24, "Rescan SD (X)", false);
         fb_draw_text(fb, 8, 226, ui->status_msg, COL_DIM, 38);
-    } else if (ui->active_tab == 1u) {
-        /* Live HUD & Multi-Core Telemetry */
+    } else if (ui->active_tab == CTR_UI_TAB_HUD) {
+        /* Live HUD & Multi-Core Telemetry (12 px rows, y 48..196) */
         fb_fill_rect(fb, 6, 44, 308, 158, COL_CARD);
         fb_draw_border(fb, 6, 44, 308, 158, COL_BORDER);
 
@@ -482,40 +589,59 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                                    ? "PICA200 HW"
                                    : "ARMv6 SW";
 
-        fb_printf(fb, 12, 50, COL_OK,     "FPS: %5.1f  Frame: %5.2f ms", fps, ms_frame);
-        fb_printf(fb, 12, 64, COL_TEXT,   "CPU: %-10s (%u MHz %s)",
+        fb_printf(fb, 12, 48, COL_OK,     "FPS: %5.1f  Frame: %5.2f ms", fps, ms_frame);
+        fb_printf(fb, 12, 60, COL_TEXT,   "CPU: %-10s (%u MHz %s)",
                   cpu_engine_badge(sys),
                   hw ? (unsigned)hw->cpu_mhz : 268u,
                   (hw && hw->is_n3ds) ? "N3DS" : "O3DS");
-        fb_printf(fb, 12, 78, COL_DIM,    "JIT: %u blks  %u KiB  IBTC %4.1f%%",
+        fb_printf(fb, 12, 72, COL_DIM,    "JIT: %u blks  %u KiB  IBTC %4.1f%%",
                   sys ? (unsigned)sys->stats.jit_blocks_live : 0u,
                   sys ? (unsigned)(sys->stats.jit_code_bytes / 1024u) : 0u,
                   ibtc_pct);
-        fb_printf(fb, 12, 92, COL_TEXT,   "GPU: %-10s  Batches: %u",
+        fb_printf(fb, 12, 84, COL_TEXT,   "GPU: %-10s  Batches: %u",
                   gpu_name,
                   sys ? (unsigned)sys->stats.gpu_batches : 0u);
-        fb_printf(fb, 12, 106, COL_DIM,   "Prims: %u  TexCache Hit: %5.1f%%",
+        fb_printf(fb, 12, 96, COL_DIM,    "Prims: %u  TexCache Hit: %5.1f%%",
                   sys ? (unsigned)sys->stats.gpu_prims : 0u,
                   tc_pct);
-        fb_printf(fb, 12, 120, COL_DIM,   "Time: CPU %4.1fms  GPU %4.1fms", ms_cpu, ms_gpu);
-        fb_printf(fb, 12, 136, (hw && hw->spu_core1_active) ? COL_OK : COL_WARN,
+        fb_printf(fb, 12, 108, COL_DIM,   "Time: CPU %4.1fms  GPU %4.1fms", ms_cpu, ms_gpu);
+        fb_printf(fb, 12, 120, (hw && hw->spu_core1_active) ? COL_OK : COL_WARN,
                   "Core1 SPU: %-4s  NDSP: %-4s",
                   (hw && hw->spu_core1_active) ? "ASYNC" : "SYNC",
                   (hw && hw->ndsp_ok) ? "OK" : "MUTE");
-        fb_printf(fb, 12, 150, (hw && hw->cd_worker_core >= 0) ? COL_OK : COL_DIM,
+        fb_printf(fb, 12, 132, (hw && hw->cd_worker_core >= 0) ? COL_OK : COL_DIM,
                   cdrom_is_chd(sys) ? "CD [CHD]: Core %d (Miss %u)"
                                     : "CD Readahead: Core %d (Miss %u)",
                   hw ? hw->cd_worker_core : -1,
                   sys ? (unsigned)sys->stats.cd_ra_misses : 0u);
-        fb_printf(fb, 12, 166, COL_ACCENT, "%s", ui->status_msg);
+        if (sys) {
+            const GpuDisplay *d = &sys->gpu.disp;
+            fb_printf(fb, 12, 144, COL_TEXT, "PC:%08X CD Rd:%u IRQ:%03X/%03X",
+                      (unsigned)sys->cpu.pc, (unsigned)sys->cdrom.sectors_read,
+                      (unsigned)(sys->irq.stat & 0x7FFu), (unsigned)(sys->irq.mask & 0x7FFu));
+            fb_printf(fb, 12, 156, d->blank ? COL_WARN : COL_OK,
+                      "Disp:%-3s %ux%u%s %s VRAM %u,%u",
+                      d->blank ? "OFF" : "ON",
+                      (unsigned)d->hres, (unsigned)d->vres, d->interlace ? "i" : "",
+                      d->color24 ? "24b" : "15b",
+                      (unsigned)d->vram_x, (unsigned)d->vram_y);
+        } else {
+            fb_draw_text(fb, 12, 144, "PC:-------- CD Rd:- IRQ:---/---", COL_DIM, 38);
+            fb_draw_text(fb, 12, 156, "Disp: (no game running)", COL_DIM, 38);
+        }
+        fb_printf(fb, 12, 172, COL_ACCENT, "%.37s", ui->status_msg);
+        fb_printf(fb, 12, 186, COL_DIM, "BIOS: %s  CD Boot: %s",
+                  ui->bios_mode == CTR_BIOS_MODE_HLE ? "HLE Direct" : ui->bios_badge,
+                  ui->bios_mode == CTR_BIOS_MODE_HLE ? "HLE"
+                                                     : (ui->cd_fast_boot ? "Fast" : "Native"));
 
         /* Old-3DS Touch L2/L3/R3/R2 Virtual Pads */
-        fb_draw_button(fb, 6,   208, 72, 26, "L2", (ui->touch_extra_buttons & 0x0100u) != 0u);
-        fb_draw_button(fb, 84,  208, 72, 26, "L3", (ui->touch_extra_buttons & 0x0002u) != 0u);
-        fb_draw_button(fb, 164, 208, 72, 26, "R3", (ui->touch_extra_buttons & 0x0004u) != 0u);
-        fb_draw_button(fb, 242, 208, 72, 26, "R2", (ui->touch_extra_buttons & 0x0200u) != 0u);
-    } else {
-        /* Tab 2: Touch & D-Pad Quick Controls */
+        fb_draw_button(fb, k_pad_x[0], PAD_Y, PAD_W, PAD_H, "L2", (ui->touch_extra_buttons & 0x0100u) != 0u);
+        fb_draw_button(fb, k_pad_x[1], PAD_Y, PAD_W, PAD_H, "L3", (ui->touch_extra_buttons & 0x0002u) != 0u);
+        fb_draw_button(fb, k_pad_x[2], PAD_Y, PAD_W, PAD_H, "R3", (ui->touch_extra_buttons & 0x0004u) != 0u);
+        fb_draw_button(fb, k_pad_x[3], PAD_Y, PAD_W, PAD_H, "R2", (ui->touch_extra_buttons & 0x0200u) != 0u);
+    } else if (ui->active_tab == CTR_UI_TAB_CTRL) {
+        /* Tab 3: Touch & D-Pad Quick Controls */
         char gpu_lbl[24];
         char scl_lbl[24];
         char skp_lbl[24];
@@ -534,27 +660,76 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
         snprintf(rev_lbl, sizeof(rev_lbl), "Reverb: %s",
                  (sys && sys->cfg.spu_reverb) ? "ON" : "OFF");
 
-        fb_draw_button(fb, 8,   48, 148, 28, gpu_lbl, is_hw);
-        fb_draw_button(fb, 164, 48, 148, 28, scl_lbl, false);
-        fb_draw_button(fb, 8,   82, 148, 28, skp_lbl, false);
-        fb_draw_button(fb, 164, 82, 148, 28, rev_lbl, sys && sys->cfg.spu_reverb);
+        fb_draw_button(fb, 8,   46, 148, 24, gpu_lbl, is_hw);
+        fb_draw_button(fb, 164, 46, 148, 24, scl_lbl, false);
+        fb_draw_button(fb, 8,   74, 148, 24, skp_lbl, false);
+        fb_draw_button(fb, 164, 74, 148, 24, rev_lbl, sys && sys->cfg.spu_reverb);
 
         for (u8 s = 0u; s < 4u; s++) {
             char sl[16];
             snprintf(sl, sizeof(sl), "Slot %u", (unsigned)s);
-            fb_draw_button(fb, 8 + (int)s * 78, 116, 72, 24, sl, ui->state_slot == s);
+            fb_draw_button(fb, 8 + (int)s * 78, 102, 72, 22, sl, ui->state_slot == s);
         }
 
-        fb_draw_button(fb, 8,   146, 148, 26, "Save State", false);
-        fb_draw_button(fb, 164, 146, 148, 26, "Load State", false);
-        fb_draw_button(fb, 8,   176, 148, 26, "Reset PS1",  false);
-        fb_draw_button(fb, 164, 176, 148, 26, "Load Game",  false);
+        fb_draw_button(fb, 8,   128, 148, 24, "Save State", false);
+        fb_draw_button(fb, 164, 128, 148, 24, "Load State", false);
+        fb_draw_button(fb, 8,   156, 148, 22, "Reset PS1",  false);
+        fb_draw_button(fb, 164, 156, 148, 22, "Load Game",  false);
+        /* Both apply on next boot/reset; CD Boot only matters with a real/OpenBIOS BIOS */
+        fb_draw_button(fb, 8,   182, 148, 20,
+                       ui->bios_mode == CTR_BIOS_MODE_HLE ? "BIOS: HLE Direct" : "BIOS:Auto/OpenBIOS",
+                       ui->bios_mode == CTR_BIOS_MODE_HLE);
+        fb_draw_button(fb, 164, 182, 148, 20,
+                       ui->cd_fast_boot ? "CD Boot: Fast" : "CD Boot: Native",
+                       ui->cd_fast_boot);
 
         /* Old-3DS Touch L2/L3/R3/R2 Virtual Pads */
-        fb_draw_button(fb, 6,   208, 72, 26, "L2", (ui->touch_extra_buttons & 0x0100u) != 0u);
-        fb_draw_button(fb, 84,  208, 72, 26, "L3", (ui->touch_extra_buttons & 0x0002u) != 0u);
-        fb_draw_button(fb, 164, 208, 72, 26, "R3", (ui->touch_extra_buttons & 0x0004u) != 0u);
-        fb_draw_button(fb, 242, 208, 72, 26, "R2", (ui->touch_extra_buttons & 0x0200u) != 0u);
+        fb_draw_button(fb, k_pad_x[0], PAD_Y, PAD_W, PAD_H, "L2", (ui->touch_extra_buttons & 0x0100u) != 0u);
+        fb_draw_button(fb, k_pad_x[1], PAD_Y, PAD_W, PAD_H, "L3", (ui->touch_extra_buttons & 0x0002u) != 0u);
+        fb_draw_button(fb, k_pad_x[2], PAD_Y, PAD_W, PAD_H, "R3", (ui->touch_extra_buttons & 0x0004u) != 0u);
+        fb_draw_button(fb, k_pad_x[3], PAD_Y, PAD_W, PAD_H, "R2", (ui->touch_extra_buttons & 0x0200u) != 0u);
+    } else {
+        /* Tab 4: on-screen log (newest at the bottom) */
+        fb_fill_rect(fb, 2, 44, 316, 148, COL_CARD);
+        fb_draw_border(fb, 2, 44, 316, 148, COL_BORDER);
+
+        u32 n = ctr_log_count();
+        u32 max_s = n > LOG_ROWS ? (n - LOG_ROWS) : 0u;
+        u32 scroll = ui->log_scroll > max_s ? max_s : ui->log_scroll;
+        u32 first = n > LOG_ROWS ? (n - LOG_ROWS - scroll) : 0u;
+        if (n == 0u) {
+            fb_draw_text(fb, 8, LOG_ROW_Y0, "(log empty)", COL_DIM, LOG_COLS);
+        }
+        for (u32 i = 0u; i < LOG_ROWS && first + i < n; i++) {
+            char line[48];
+            (void)ctr_log_get(first + i, line, (u32)sizeof(line));
+            u32 col = COL_TEXT;
+            if (strncmp(line, "[tty]", 5) == 0) {
+                col = COL_ACCENT;
+            } else if (strstr(line, "fail") || strstr(line, "FAIL") || strstr(line, "rror") ||
+                       strstr(line, "ERR") || strstr(line, "rc=-")) {
+                col = COL_WARN;
+            } else if (strncmp(line, "[boot]", 6) == 0 || strncmp(line, "[cdboot]", 8) == 0 ||
+                       strncmp(line, "[bios]", 6) == 0) {
+                col = COL_OK;
+            }
+            fb_draw_text(fb, 4, LOG_ROW_Y0 + (int)i * LOG_ROW_DY, line, col, LOG_COLS);
+        }
+
+        if (ui->status_timer > 0u) {
+            fb_printf(fb, 4, 196, COL_ACCENT, "%.39s", ui->status_msg);
+        } else if (scroll > 0u) {
+            fb_printf(fb, 4, 196, COL_WARN, "Scrolled up %u of %u lines", (unsigned)scroll,
+                      (unsigned)n);
+        } else {
+            fb_printf(fb, 4, 196, COL_DIM, "%u lines  %s", (unsigned)n,
+                      ui->game_loaded ? "Up/Down buttons scroll" : "D-Pad/Up/Down scroll");
+        }
+
+        fb_draw_button(fb, k_pad_x[0], PAD_Y, PAD_W, PAD_H, "Dump Log", false);
+        fb_draw_button(fb, k_pad_x[1], PAD_Y, PAD_W, PAD_H, "Clear", false);
+        fb_draw_button(fb, k_pad_x[2], PAD_Y, PAD_W, PAD_H, "Up", false);
+        fb_draw_button(fb, k_pad_x[3], PAD_Y, PAD_W, PAD_H, "Down", false);
     }
 
     GSPGPU_FlushDataCache(fb, UI_W * UI_H * 3u);

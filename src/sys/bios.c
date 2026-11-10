@@ -1,7 +1,111 @@
 #include "psx3ds/system.h"
 
+#include <strings.h>
+
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Embedded 512 KiB OpenBIOS (src/sys/openbios_blob.S) */
+extern const u8  psx_openbios_blob[];
+extern const u32 psx_openbios_blob_size;
+
+const u8 *psx_builtin_openbios(u32 *out_size) {
+    if (out_size) {
+        *out_size = psx_openbios_blob_size;
+    }
+    return psx_openbios_blob;
+}
+
+static bool bios_name_is_candidate(const char *name) {
+    char low[64];
+    size_t n = strlen(name);
+    if (n < 5u || n >= sizeof(low)) {
+        return false;
+    }
+    for (size_t i = 0; i <= n; i++) {
+        low[i] = (char)tolower((unsigned char)name[i]);
+    }
+    const char *ext = strrchr(low, '.');
+    if (!ext || (strcmp(ext, ".bin") != 0 && strcmp(ext, ".rom") != 0)) {
+        return false;
+    }
+    return strncmp(low, "scph", 4) == 0 || strncmp(low, "psxonpsp", 8) == 0 ||
+           strncmp(low, "bios", 4) == 0 || strncmp(low, "ps1_rom", 7) == 0 ||
+           strcmp(low, "openbios.bin") == 0;
+}
+
+/* Prefer Sony retail images (best compatibility), then other dumps, then OpenBIOS */
+static int bios_name_rank(const char *name) {
+    if (strncasecmp(name, "scph", 4) == 0) {
+        return 0;
+    }
+    if (strncasecmp(name, "openbios", 8) == 0) {
+        return 2;
+    }
+    return 1;
+}
+
+bool psx_bios_find_external(char *path_out, u32 path_cap, char *badge_out, u32 badge_cap) {
+    static const char *const k_dirs[] = {
+#if PSX3DS_PLATFORM_3DS
+        "sdmc:/psx3ds/bios", "sdmc:/psx", "sdmc:/roms/psx", "sdmc:/bios", "sdmc:/",
+#else
+        ".", "bios",
+#endif
+    };
+    char (*names)[256] = (char (*)[256])malloc(256u * 256u);
+    if (!names) {
+        return false;
+    }
+    int best_rank = 99;
+    char best_path[256] = { 0 };
+    char best_name[64] = { 0 };
+    for (size_t d = 0; d < sizeof(k_dirs) / sizeof(k_dirs[0]) && best_rank > 0; d++) {
+        u32 n = plat_listdir(k_dirs[d], names, 256u);
+        for (u32 i = 0; i < n; i++) {
+            if (!bios_name_is_candidate(names[i])) {
+                continue;
+            }
+            int rank = bios_name_rank(names[i]);
+            if (rank >= best_rank) {
+                continue;
+            }
+            char full[256];
+            size_t dl = strlen(k_dirs[d]);
+            snprintf(full, sizeof(full), "%s%s%.200s", k_dirs[d],
+                     (dl > 0u && k_dirs[d][dl - 1u] == '/') ? "" : "/", names[i]);
+            PlatFile *f = plat_fopen(full, "rb");
+            if (!f) {
+                continue;
+            }
+            u64 fsz = plat_fsize(f);
+            plat_fclose(f);
+            if (fsz != (u64)PSX_BIOS_SIZE) {
+                continue;
+            }
+            best_rank = rank;
+            snprintf(best_path, sizeof(best_path), "%s", full);
+            snprintf(best_name, sizeof(best_name), "%.63s", names[i]);
+        }
+    }
+    free(names);
+    if (best_rank == 99) {
+        return false;
+    }
+    if (path_out && path_cap > 0u) {
+        snprintf(path_out, path_cap, "%s", best_path);
+    }
+    if (badge_out && badge_cap > 0u) {
+        u32 k = 0u;
+        for (; best_name[k] != '\0' && best_name[k] != '.' && k + 1u < badge_cap && k < 10u; k++) {
+            badge_out[k] = (char)toupper((unsigned char)best_name[k]);
+        }
+        badge_out[k] = '\0';
+    }
+    return true;
+}
 
 #define PSX_TTY_BUF_CAP (64u * 1024u)
 
@@ -148,6 +252,7 @@ void bios_reset(PsxSystem *sys) {
     b->hle_rcnt_auto_ack = 0u;
     b->hle_pad_buf1_addr = 0u;
     b->hle_pad_buf2_addr = 0u;
+    b->hle_pad_dest_addr = 0u;
 
     if (b->loaded && b->bios_rom_backup && sys->bus.bios) {
         memcpy(sys->bus.bios, b->bios_rom_backup, PSX_BIOS_SIZE);
@@ -156,6 +261,10 @@ void bios_reset(PsxSystem *sys) {
         hle_bios_install_ram_vectors(sys);
     }
 
+    memset(b->hle_files, 0, sizeof(b->hle_files));
+    b->cdboot_pending = false;
+    b->cdboot_skip_shell = false;
+    b->cdboot_watch = false;
     if (b->exe_path[0] != '\0') {
         if (b->hle) {
             (void)psx_exe_inject_now(sys);
@@ -166,6 +275,13 @@ void bios_reset(PsxSystem *sys) {
     } else {
         b->psexe_pending = false;
         sys->cpu.psexe_pending = 0u;
+        if (b->cd_boot && b->cdboot.valid) {
+            if (b->hle) {
+                (void)psx_cdboot_inject(sys, &b->cdboot);
+            } else {
+                psx_cdboot_arm_bios(sys);
+            }
+        }
     }
 }
 
@@ -248,60 +364,59 @@ PsxResult psx_load_bios(PsxSystem *sys, const char *path) {
 
     PlatFile *f = NULL;
     char resolved[256] = { 0 };
+    bool use_builtin = (strcmp(path, PSX_BIOS_BUILTIN_NAME) == 0 ||
+                        strcmp(path, "openbios") == 0 || strcmp(path, "OPENBIOS") == 0);
 
-    if (strcmp(path, "auto") == 0) {
-        const char *candidates[] = {
-#if PSX3DS_PLATFORM_3DS
-            "sdmc:/psx3ds/bios/SCPH1001.BIN",
-            "sdmc:/psx3ds/bios/scph1001.bin",
-            "sdmc:/psx/SCPH1001.BIN",
-            "sdmc:/psx/scph1001.bin",
-            "sdmc:/roms/psx/SCPH1001.BIN",
-            "sdmc:/roms/psx/scph1001.bin",
-            "sdmc:/SCPH1001.BIN",
-            "sdmc:/psx3ds/bios/openbios.bin",
-            "sdmc:/psx/openbios.bin",
-            "sdmc:/roms/psx/openbios.bin",
-            "sdmc:/openbios.bin",
-            "romfs:/openbios.bin",
-#else
-            "SCPH1001.BIN",
-            "scph1001.bin",
-            "tests/roms/bios/openbios.bin",
-            "../tests/roms/bios/openbios.bin",
-#endif
-            NULL
-        };
+    if (!use_builtin && strcmp(path, "auto") == 0) {
 #if PSX3DS_PLATFORM_HOST
         const char *env_bios = getenv("PSX3DS_OPENBIOS");
         if (env_bios && env_bios[0] != '\0') {
             f = bios_open_candidate(env_bios, resolved, sizeof(resolved));
         }
 #endif
-        for (int i = 0; !f && candidates[i] != NULL; i++) {
-            f = bios_open_candidate(candidates[i], resolved, sizeof(resolved));
+        if (!f) {
+            char found[256];
+            if (psx_bios_find_external(found, sizeof(found), NULL, 0u)) {
+                f = bios_open_candidate(found, resolved, sizeof(resolved));
+            }
         }
         if (!f) {
-            /* Auto-fallback to standalone HLE when no BIOS image exists on SD/disk */
-            return psx_load_bios(sys, NULL);
+            /* No external 512 KiB BIOS on SD/disk: the embedded OpenBIOS is always there */
+            use_builtin = true;
         }
-    } else {
+    } else if (!use_builtin) {
         f = bios_open_candidate(path, resolved, sizeof(resolved));
         if (!f) {
+            plat_log("[bios] cannot open '%s'\n", path);
             return PSX_ERR_IO;
         }
     }
 
-    u64 sz = plat_fsize(f);
-    if (sz != (u64)PSX_BIOS_SIZE) {
+    if (use_builtin) {
+        u32 bsz = 0u;
+        const u8 *blob = psx_builtin_openbios(&bsz);
+        if (!blob || bsz != PSX_BIOS_SIZE) {
+            plat_log("[bios] built-in OpenBIOS missing (size=%u)\n", (unsigned)bsz);
+            return PSX_ERR_FORMAT;
+        }
+        memcpy(sys->bus.bios, blob, PSX_BIOS_SIZE);
+        snprintf(resolved, sizeof(resolved), "%s", PSX_BIOS_BUILTIN_NAME);
+        plat_log("[bios] Built-in OPENBIOS (512 KiB embedded)\n");
+    } else {
+        u64 sz = plat_fsize(f);
+        if (sz != (u64)PSX_BIOS_SIZE) {
+            plat_fclose(f);
+            plat_log("[bios] '%s' is %llu bytes (need 524288)\n", resolved,
+                     (unsigned long long)sz);
+            return PSX_ERR_FORMAT;
+        }
+        u32 got = plat_fread(f, sys->bus.bios, PSX_BIOS_SIZE);
         plat_fclose(f);
-        return PSX_ERR_FORMAT;
-    }
-
-    u32 got = plat_fread(f, sys->bus.bios, PSX_BIOS_SIZE);
-    plat_fclose(f);
-    if (got != PSX_BIOS_SIZE) {
-        return PSX_ERR_IO;
+        if (got != PSX_BIOS_SIZE) {
+            plat_log("[bios] short read on '%s'\n", resolved);
+            return PSX_ERR_IO;
+        }
+        plat_log("[bios] external BIOS %s\n", resolved);
     }
 
     if (b->bios_rom_backup) {
@@ -332,11 +447,45 @@ bool bios_pc_hook(PsxSystem *sys, u32 pc) {
     }
     u32 phys = pc & 0x1FFFFFFFu;
 
-    /* 1. Shell entry hook (0x80030000): sideload pending PS-X EXE */
-    if (phys == 0x00030000u && (sys->bios.psexe_pending || sys->cpu.psexe_pending != 0u)) {
-        if (psx_exe_inject_now(sys) == PSX_OK) {
+    /* 1. Shell entry hook (0x80030000): sideload pending PS-X EXE / CD boot EXE */
+    if (phys == 0x00030000u && (sys->bios.psexe_pending || sys->bios.cdboot_pending ||
+                                sys->bios.cdboot_skip_shell ||
+                                sys->cpu.psexe_pending != 0u)) {
+        if (sys->bios.exe_path[0] != '\0') {
+            return psx_exe_inject_now(sys) == PSX_OK;
+        }
+        if (sys->bios.cdboot_pending && sys->bios.cdboot.valid) {
+            plat_log("[cdboot] BIOS reached shell entry 0x80030000: sideloading %s\n",
+                     sys->bios.cdboot.boot_path);
+            if (psx_cdboot_inject(sys, &sys->bios.cdboot) == PSX_OK) {
+                return true;
+            }
+        }
+        if (sys->bios.cdboot_skip_shell) {
+            /* Native CD boot: skip the BIOS shell / boot animation by returning to the
+             * kernel immediately (like a real shell that found a licensed disc). The BIOS
+             * then reads SYSTEM.CNF through the CD-ROM controller and boots the EXE. */
+            sys->bios.cdboot_skip_shell = false;
+            sys->bios.cdboot_watch = true;
+            sys->bios.cdboot_watch_frames = 0u;
+            sys->bios.psexe_pending = false;
+            sys->bios.cdboot_pending = false;
+            sys->cpu.psexe_pending = 0u;
+            plat_log("[cdboot] BIOS shell skipped at 0x80030000: native CD boot of %s\n",
+                     sys->bios.cdboot.boot_path);
+            PsxCpu *c = &sys->cpu;
+            c->gpr[2] = 0u;
+            c->in_delay_slot = 0u;
+            c->branch_taken = 0u;
+            c->pc = c->gpr[31];
+            c->next_pc = c->pc + 4u;
+            jit_flush_all(sys);
+            cpu_request_exit(sys);
             return true;
         }
+        sys->bios.psexe_pending = false;
+        sys->bios.cdboot_pending = false;
+        sys->cpu.psexe_pending = 0u;
         return false;
     }
 

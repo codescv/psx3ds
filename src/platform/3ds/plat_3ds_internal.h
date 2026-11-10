@@ -28,19 +28,33 @@ typedef enum CtrUiAction {
     CTR_UI_LOAD_STATE,
     CTR_UI_RESET_SYSTEM,
     CTR_UI_OPEN_BROWSER,
-    CTR_UI_QUIT_APP
+    CTR_UI_QUIT_APP,
+    CTR_UI_TOGGLE_BIOS_MODE,
+    CTR_UI_TOGGLE_CD_BOOT
 } CtrUiAction;
 
+#define CTR_UI_TAB_ROMS 0u
+#define CTR_UI_TAB_HUD  1u
+#define CTR_UI_TAB_CTRL 2u
+#define CTR_UI_TAB_LOG  3u
+#define CTR_UI_TAB_COUNT 4u
+
+#define CTR_BIOS_MODE_AUTO 0u /* external SD BIOS if found, else built-in OpenBIOS */
+#define CTR_BIOS_MODE_HLE  1u /* BIOS-less HLE kernel (direct boot) */
+
 typedef struct CtrUiState {
-    u8   active_tab;      /* 0 = ROM Browser, 1 = Live HUD, 2 = Quick Controls */
+    u8   active_tab;      /* CTR_UI_TAB_*: 0 ROMS, 1 HUD, 2 CTRL, 3 LOG */
+    u8   bios_mode;       /* CTR_BIOS_MODE_* */
+    bool cd_fast_boot;    /* -> PsxConfig.cd_fast_boot: sideload disc EXE vs native BIOS CD boot */
     u8   state_slot;      /* 0..3 */
     u32  rom_count;
     u32  rom_sel;
     u32  rom_scroll;
     char rom_paths[128][256];
     char rom_labels[128][64];
-    char bios_path[256];
-    char bios_badge[32];
+    char bios_path[256];  /* external SD BIOS path, or "builtin" */
+    char bios_badge[32];  /* e.g. "SCPH1001", "OPENBIOS" */
+    u32  log_scroll;      /* LOG tab: lines scrolled up from the newest (0 = follow tail) */
     char status_msg[64];
     u32  status_timer;
     u16  touch_extra_buttons; /* active-high L2/R2/L3/R3 touch pads for Old 3DS */
@@ -67,6 +81,15 @@ u32  ctr_audio_queued_frames(void);
 void      ctr_input_set_touch_buttons(u16 active_high_mask);
 void      ctr_input_set_scale_mode(PsxVideoScale mode);
 PsxResult ctr_capture_top_screen_ppm(const char *path);
+PsxResult ctr_capture_bottom_screen_ppm(const char *path); /* 320x240 touch UI */
+
+/* On-screen log ring (plat_log + guest TTY), mirrored to sdmc:/psx3ds/psx3ds.log */
+#define CTR_LOG_DUMP_PATH "sdmc:/psx3ds/psx3ds_dump.log"
+u32  ctr_log_count(void);
+u32  ctr_log_get(u32 idx_from_oldest, char *out, u32 cap); /* returns strlen(out) */
+void ctr_log_clear(void);
+bool ctr_log_dump(const char *path);
+void ctr_log_tty_putc(char c); /* line-buffers guest TTY as "[tty] ..." lines */
 
 /* ui_bottom.c */
 void        ctr_ui_init(CtrUiState *ui);

@@ -385,6 +385,12 @@ static void hle_update_pad_buffers(PsxSystem *sys) {
             hle_write8(sys, b->hle_pad_buf1_addr + 0u, 0xFFu);
         }
     }
+    if (b->hle_pad_dest_addr != 0u) {
+        /* B0:15 legacy pad driver: raw active-low buttons, pad1 = bits 0-15, pad2 = 16-31 */
+        u32 p1 = sys->pads[0].connected ? sys->pads[0].buttons : 0xFFFFu;
+        u32 p2 = sys->pads[1].connected ? sys->pads[1].buttons : 0xFFFFu;
+        hle_write32(sys, b->hle_pad_dest_addr, (p2 << 16) | (p1 & 0xFFFFu));
+    }
     if (b->hle_pad_buf2_addr != 0u) {
         if (sys->pads[1].connected) {
             hle_write8(sys, b->hle_pad_buf2_addr + 0u, 0x00u);
@@ -520,6 +526,149 @@ static void hle_handle_exception(PsxSystem *sys) {
     c->next_pc = epc + 8u;
 }
 
+static void hle_note_unimplemented(u32 vec, u32 fn);
+
+/* --------------------------------------------------------------------------
+ * HLE "cdrom:" file I/O on top of the ISO9660 reader (src/sys/cdboot.c, v0.2.2)
+ * ------------------------------------------------------------------------ */
+#define HLE_FD_BASE 3u /* fds 0..1 are tty; cdrom handles are 3..10 */
+
+static void hle_read_cstr(const PsxSystem *sys, u32 addr, char *out, u32 cap) {
+    u32 i = 0u;
+    for (; i + 1u < cap; i++) {
+        u8 ch = hle_read8(sys, addr + i);
+        if (ch == 0u) {
+            break;
+        }
+        out[i] = (char)ch;
+    }
+    out[i] = '\0';
+}
+
+static bool hle_is_cdrom_path(const char *p) {
+    return (p[0] == 'c' || p[0] == 'C') && (p[1] == 'd' || p[1] == 'D') &&
+           (p[2] == 'r' || p[2] == 'R') && (p[3] == 'o' || p[3] == 'O') &&
+           (p[4] == 'm' || p[4] == 'M');
+}
+
+static PsxHleFile *hle_fd(PsxSystem *sys, u32 fd) {
+    if (fd < HLE_FD_BASE || fd >= HLE_FD_BASE + PSX_HLE_MAX_FDS) {
+        return NULL;
+    }
+    PsxHleFile *f = &sys->bios.hle_files[fd - HLE_FD_BASE];
+    return f->used ? f : NULL;
+}
+
+static u32 hle_file_open(PsxSystem *sys, u32 name_addr) {
+    char name[128];
+    hle_read_cstr(sys, name_addr, name, sizeof(name));
+    u32 lba = 0u;
+    u32 size = 0u;
+    if (!hle_is_cdrom_path(name) || !psx_cdboot_find_file(sys, name, &lba, &size)) {
+        plat_log("[hle] open('%s') failed\n", name);
+        return 0xFFFFFFFFu;
+    }
+    for (u32 i = 0; i < PSX_HLE_MAX_FDS; i++) {
+        PsxHleFile *f = &sys->bios.hle_files[i];
+        if (!f->used) {
+            f->used = true;
+            f->lba = lba;
+            f->size = size;
+            f->pos = 0u;
+            plat_log("[hle] open('%s') -> fd %u (lba=%u size=%u)\n", name,
+                     (unsigned)(HLE_FD_BASE + i), (unsigned)lba, (unsigned)size);
+            return HLE_FD_BASE + i;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+static u32 hle_file_read(PsxSystem *sys, u32 fd, u32 dst, u32 len) {
+    PsxHleFile *f = hle_fd(sys, fd);
+    if (!f) {
+        return 0xFFFFFFFFu;
+    }
+    if (f->pos >= f->size) {
+        return 0u;
+    }
+    if (len > f->size - f->pos) {
+        len = f->size - f->pos;
+    }
+    u8 buf[2048];
+    u32 done = 0u;
+    while (done < len) {
+        u32 n = len - done > sizeof(buf) ? (u32)sizeof(buf) : len - done;
+        if (!psx_cdboot_read_data(sys, f->lba, f->pos + done, buf, n)) {
+            break;
+        }
+        for (u32 i = 0; i < n; i++) {
+            hle_write8(sys, dst + done + i, buf[i]);
+        }
+        done += n;
+    }
+    f->pos += done;
+    return done;
+}
+
+static u32 hle_file_lseek(PsxSystem *sys, u32 fd, u32 off, u32 whence) {
+    PsxHleFile *f = hle_fd(sys, fd);
+    if (!f) {
+        return 0xFFFFFFFFu;
+    }
+    f->pos = (whence == 1u) ? f->pos + off : off;
+    return f->pos;
+}
+
+static u32 hle_file_close(PsxSystem *sys, u32 fd) {
+    PsxHleFile *f = hle_fd(sys, fd);
+    if (!f) {
+        return 0xFFFFFFFFu;
+    }
+    f->used = false;
+    return fd;
+}
+
+/* A0:42 Load(filename, headerbuf): load PS-X EXE from cdrom:, fill 0x3C-byte exec header */
+static bool hle_load_exe(PsxSystem *sys, u32 name_addr, u32 hdrbuf) {
+    char name[128];
+    hle_read_cstr(sys, name_addr, name, sizeof(name));
+    u32 lba = 0u;
+    u32 size = 0u;
+    PsxExeHeader h;
+    if (!psx_cdboot_find_file(sys, name, &lba, &size) ||
+        psx_cdboot_load_exe(sys, lba, size, &h) != PSX_OK) {
+        plat_log("[hle] Load('%s') failed\n", name);
+        return false;
+    }
+    plat_log("[hle] Load('%s') pc0=0x%08X t_addr=0x%08X t_size=0x%X\n", name,
+             (unsigned)h.pc0, (unsigned)h.t_addr, (unsigned)h.t_size);
+    if (hdrbuf != 0u) {
+        const u32 words[10] = { h.pc0,    h.gp0,    h.t_addr, h.t_size, h.d_addr,
+                                h.d_size, h.b_addr, h.b_size, h.s_addr, h.s_size };
+        for (u32 i = 0; i < 10u; i++) {
+            hle_write32(sys, hdrbuf + i * 4u, words[i]);
+        }
+        for (u32 i = 10u; i < 15u; i++) {
+            hle_write32(sys, hdrbuf + i * 4u, 0u);
+        }
+    }
+    return true;
+}
+
+/* A0:43 Exec(headerbuf, param1, param2) */
+static void hle_exec_header(PsxSystem *sys, u32 hdrbuf, u32 argc, u32 argv) {
+    PsxExeHeader h;
+    memset(&h, 0, sizeof(h));
+    h.pc0 = hle_read32(sys, hdrbuf + 0x00u);
+    h.gp0 = hle_read32(sys, hdrbuf + 0x04u);
+    h.s_addr = hle_read32(sys, hdrbuf + 0x20u);
+    h.s_size = hle_read32(sys, hdrbuf + 0x24u);
+    u32 sp = (h.s_addr != 0u) ? (h.s_addr + h.s_size) : 0x801FFF00u;
+    psx_exe_apply_entry(sys, &h, sp);
+    sys->cpu.gpr[4] = argc;
+    sys->cpu.gpr[5] = argv;
+}
+
 static void hle_dispatch_a0(PsxSystem *sys, u32 fn) {
     PsxCpu *c = &sys->cpu;
     PsxBios *b = &sys->bios;
@@ -528,9 +677,56 @@ static void hle_dispatch_a0(PsxSystem *sys, u32 fn) {
     u32 a2 = c->gpr[6];
 
     switch (fn) {
-        case 0x00u: case 0x01u: case 0x02u: case 0x03u:
-        case 0x04u: case 0x05u: case 0x06u:
-            c->gpr[2] = 0xFFFFFFFFu; /* file stubs return -1 */
+        case 0x00u: /* open(filename, accessmode) */
+            c->gpr[2] = hle_file_open(sys, a0);
+            break;
+        case 0x01u: /* lseek(fd, offset, seektype) */
+            c->gpr[2] = hle_file_lseek(sys, a0, a1, a2);
+            break;
+        case 0x02u: /* read(fd, dst, length) */
+            c->gpr[2] = hle_file_read(sys, a0, a1, a2);
+            break;
+        case 0x04u: /* close(fd) */
+            c->gpr[2] = hle_file_close(sys, a0);
+            break;
+        case 0x03u: case 0x05u: case 0x06u: /* write / ioctl / exit on files */
+            c->gpr[2] = 0xFFFFFFFFu;
+            break;
+        case 0x42u: /* Load(filename, headerbuf) */
+            c->gpr[2] = hle_load_exe(sys, a0, a1) ? 1u : 0u;
+            break;
+        case 0x43u: /* Exec(headerbuf, param1, param2) -- does not return */
+            hle_exec_header(sys, a0, a1, a2);
+            return;
+        case 0x51u: { /* LoadExec(filename, stackbase, stackoffset) -- does not return */
+            u32 hdr = 0x801FFE00u; /* scratch exec header below the default stack */
+            if (hle_load_exe(sys, a0, hdr)) {
+                if (a1 != 0u) {
+                    hle_write32(sys, hdr + 0x20u, a1);
+                    hle_write32(sys, hdr + 0x24u, a2);
+                }
+                hle_exec_header(sys, hdr, 1u, 0u);
+                return;
+            }
+            c->gpr[2] = 0u;
+            break;
+        }
+        case 0xA5u: { /* CdReadSector(count, sector, buffer) */
+            u32 done = 0u;
+            u8 sec[2048];
+            for (; done < a0; done++) {
+                if (!psx_cdboot_read_data(sys, a1 + done, 0u, sec, sizeof(sec))) {
+                    break;
+                }
+                for (u32 i = 0; i < sizeof(sec); i++) {
+                    hle_write8(sys, a2 + done * 2048u + i, sec[i]);
+                }
+            }
+            c->gpr[2] = done == a0 ? a0 : 0xFFFFFFFFu;
+            break;
+        }
+        case 0xA6u: /* CdGetStatus */
+            c->gpr[2] = 0x02u; /* motor on, shell closed */
             break;
 
         case 0x13u: { /* setjmp(jmp_buf) */
@@ -803,6 +999,7 @@ static void hle_dispatch_a0(PsxSystem *sys, u32 fn) {
             c->gpr[2] = 1u;
             break;
         default:
+            hle_note_unimplemented(0xA0u, fn);
             break;
     }
 
@@ -911,8 +1108,13 @@ static void hle_dispatch_b0(PsxSystem *sys, u32 fn) {
         case 0x14u: /* StopPAD */
             b->hle_pad_auto_ack = 0u;
             break;
-        case 0x15u: /* PAD_init */
-            c->gpr[2] = 1u;
+        case 0x15u: /* OutdatedPadInitAndStart(type, button_dest, unused, unused) */
+            b->hle_pad_dest_addr = a1;
+            sys->irq.mask |= (1u << PSX_IRQ_VBLANK);
+            b->hle_pad_auto_ack = 1u;
+            hle_update_pad_buffers(sys);
+            cpu_check_irq(sys);
+            c->gpr[2] = 2u;
             break;
         case 0x16u: /* PAD_dr */
             c->gpr[2] = (u32)sys->pads[0].buttons | 0xFFFF0000u;
@@ -956,6 +1158,18 @@ static void hle_dispatch_b0(PsxSystem *sys, u32 fn) {
             }
             break;
         }
+        case 0x32u: /* open(filename, accessmode) */
+            c->gpr[2] = hle_file_open(sys, a0);
+            break;
+        case 0x33u: /* lseek(fd, offset, seektype) */
+            c->gpr[2] = hle_file_lseek(sys, a0, a1, a2);
+            break;
+        case 0x34u: /* read(fd, dst, length) */
+            c->gpr[2] = hle_file_read(sys, a0, a1, a2);
+            break;
+        case 0x36u: /* close(fd) */
+            c->gpr[2] = hle_file_close(sys, a0);
+            break;
         case 0x35u: { /* write(fd, buf, n) */
             if (a0 == 1u || a0 == 2u) {
                 u32 limit = a2 > 65536u ? 65536u : a2;
@@ -992,6 +1206,7 @@ static void hle_dispatch_b0(PsxSystem *sys, u32 fn) {
             break;
         }
         default:
+            hle_note_unimplemented(0xB0u, fn);
             break;
     }
 
@@ -1035,10 +1250,23 @@ static void hle_dispatch_c0(PsxSystem *sys, u32 fn) {
             break;
         }
         default:
+            hle_note_unimplemented(0xC0u, fn);
             break;
     }
 
     hle_return_to_ra(sys);
+}
+
+/* One-shot diagnostics for HLE kernel calls we do not emulate (shown in the 3DS 4:LOG tab) */
+static u8 g_hle_unimpl_seen[3][32];
+
+static void hle_note_unimplemented(u32 vec, u32 fn) {
+    u32 v = (vec == 0xA0u) ? 0u : (vec == 0xB0u) ? 1u : 2u;
+    u8 bit = (u8)(1u << (fn & 7u));
+    if ((g_hle_unimpl_seen[v][(fn >> 3) & 31u] & bit) == 0u) {
+        g_hle_unimpl_seen[v][(fn >> 3) & 31u] |= bit;
+        plat_log("[hle] unimplemented BIOS call %02X:%02X\n", (unsigned)vec, (unsigned)fn);
+    }
 }
 
 bool hle_bios_dispatch(PsxSystem *sys, u32 vec) {

@@ -39,6 +39,29 @@ typedef struct PsxExeHeader {
     u32  s_size;
 } PsxExeHeader;
 
+typedef struct PsxCdBootInfo {
+    bool         valid;          /* boot EXE located + header parsed */
+    bool         has_pvd;        /* LBA 16 "\x01CD001\x01" present */
+    bool         has_system_cnf; /* SYSTEM.CNF found in root directory */
+    char         volume[33];
+    char         boot_path[128]; /* normalized, e.g. "PSP\GAME.EXE" (no "cdrom:\", no ";1") */
+    bool         cnf_kernel_cfg; /* SYSTEM.CNF also sets TCB + EVENT */
+    u32          exe_lba;
+    u32          exe_size;
+    PsxExeHeader hdr;
+    u32          sig_off;        /* text offset of sig[] (last non-zero 16 B of the EXE) */
+    u8           sig[16];        /* native-boot load-complete detection */
+} PsxCdBootInfo;
+
+#define PSX_HLE_MAX_FDS 8u
+
+typedef struct PsxHleFile {
+    bool used;
+    u32  lba;
+    u32  size;
+    u32  pos;
+} PsxHleFile;
+
 typedef struct PsxBios {
     bool loaded;
     bool hle;
@@ -74,6 +97,16 @@ typedef struct PsxBios {
     u16            hle_rcnt_auto_ack;
     u32            hle_pad_buf1_addr;
     u32            hle_pad_buf2_addr;
+    u32            hle_pad_dest_addr; /* B0:15 OutdatedPadInitAndStart button_dest */
+
+    /* ISO9660 CD-ROM boot (v0.2.2) */
+    bool           cd_boot;        /* a data disc with a bootable EXE is mounted */
+    bool           cdboot_pending; /* sideload cdboot EXE at the 0x80030000 shell hook */
+    bool           cdboot_skip_shell; /* return from 0x80030000 shell so BIOS boots the disc */
+    bool           cdboot_watch;      /* native BIOS CD boot in progress (watchdog armed) */
+    u32            cdboot_watch_frames;
+    PsxCdBootInfo  cdboot;
+    PsxHleFile     hle_files[PSX_HLE_MAX_FDS]; /* HLE kernel cdrom: file handles */
 } PsxBios;
 
 void bios_init(PsxSystem *sys);
@@ -87,7 +120,37 @@ void bios_tty_clear(PsxSystem *sys);
 void bios_set_tty_callback(PsxSystem *sys, PsxTtyCallback cb, void *user);
 void bios_set_stop_pattern(PsxSystem *sys, const char *substr);
 
+/* ---------------------------------------------------------------------------
+ * BIOS image selection (v0.2.2)
+ *   psx_load_bios(sys, "builtin")  -> embedded 512 KiB OpenBIOS (always available)
+ *   psx_load_bios(sys, "auto")     -> external 512 KiB BIOS found by
+ *                                     psx_bios_find_external(), else built-in OpenBIOS
+ *   psx_load_bios(sys, "hle"/NULL) -> standalone BIOS-less HLE kernel
+ * ------------------------------------------------------------------------- */
+#define PSX_BIOS_BUILTIN_NAME "builtin"
+const u8 *psx_builtin_openbios(u32 *out_size);
+/* Scans sdmc:/psx3ds/bios, sdmc:/psx, sdmc:/roms/psx, sdmc:/bios, sdmc:/ (3DS) or
+ * ./, ./bios, tests/roms/bios (host) case-insensitively for a 524,288-byte
+ * scph*.bin / psxonpsp*.bin / bios*.bin / openbios.bin. On success fills path_out and an
+ * upper-case badge (e.g. "SCPH5501", "OPENBIOS") and returns true. */
+bool psx_bios_find_external(char *path_out, u32 path_cap, char *badge_out, u32 badge_cap);
+
+/* ---------------------------------------------------------------------------
+ * ISO9660 CD-ROM boot (src/sys/cdboot.c, v0.2.2)
+ * ------------------------------------------------------------------------- */
+
+PsxResult psx_cdboot_probe(PsxSystem *sys, PsxCdBootInfo *out);
+PsxResult psx_cdboot_inject(PsxSystem *sys, const PsxCdBootInfo *info);
+bool      psx_cdboot_find_file(PsxSystem *sys, const char *path, u32 *out_lba, u32 *out_size);
+bool      psx_cdboot_read_data(PsxSystem *sys, u32 lba, u32 offset, u8 *dst, u32 len);
+
+void      psx_cdboot_arm_bios(PsxSystem *sys);
+void      psx_cdboot_watchdog(PsxSystem *sys); /* once per frame */
+PsxResult psx_cdboot_load_exe(PsxSystem *sys, u32 exe_lba, u32 exe_size, PsxExeHeader *hdr_out);
+
 PsxResult psx_exe_parse_header(const u8 *buf, u32 buf_len, PsxExeHeader *out);
+void      psx_exe_write_ram(PsxSystem *sys, u32 phys_start, const u8 *src, u32 len);
+void      psx_exe_apply_entry(PsxSystem *sys, const PsxExeHeader *hdr, u32 sp_val);
 PsxResult psx_exe_inject_now(PsxSystem *sys);
 
 void hle_bios_install_rom_stub(PsxSystem *sys);

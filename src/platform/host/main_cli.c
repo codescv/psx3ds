@@ -12,7 +12,7 @@ static void print_usage(const char *prog) {
             "psx3ds v" PSX3DS_VERSION_STR " — PlayStation 1 Emulator\n"
             "Usage: %s [options]\n"
             "  --version, -V             Print psx3ds version and exit\n"
-            "  --bios <path>             Path to 512KB PS1 BIOS or openbios.bin (default: auto)\n"
+            "  --bios <path>             512KB PS1 BIOS, 'builtin' (embedded OpenBIOS) or 'auto' (default)\n"
             "  --hle                     Use built-in BIOS-less HLE bootstrap & kernel\n"
             "  --exe <path>              Load and execute PS-X EXE binary\n"
             "  --cd <path>               Mount CD-ROM image (.chd/.cue/.bin/.iso/.img)\n"
@@ -34,6 +34,7 @@ static void print_usage(const char *prog) {
             "  --pad-press <f[-end]:msk> Press pad buttons on frame f..end (hex mask or START+CROSS...)\n"
             "  --input <script.txt>      Load frame:mask input schedule file\n"
             "  --cycle-mult <N>          Override cycle multiplier (256 = 1.0x)\n"
+            "  --cd-fast-boot            Real BIOS: skip native CD boot, sideload SYSTEM.CNF EXE\n"
             "  --small-mem               Test Old-3DS 26 MiB memory arena budget\n"
             "  --no-ibtc | --no-link | --no-idle-skip | --no-align-check | --no-hle-exec\n",
             prog);
@@ -441,6 +442,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--cycle-mult") == 0 && i + 1 < argc) {
             cfg.cycle_mult = (u16)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(a, "--cd-fast-boot") == 0 || strcmp(a, "--fast-boot") == 0) {
+            cfg.cd_fast_boot = true;
         } else if (strcmp(a, "--small-mem") == 0) {
             cfg.small_mem = true;
         } else if (strcmp(a, "--no-ibtc") == 0) {

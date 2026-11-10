@@ -255,3 +255,16 @@ Bit-exact compliance verified across `test_periph_chd` (all 4 codecs + mixed Mod
 | `.cci` New 3DS | **`80.00 MiB`** (`0x05000000`) | `42.57 MiB` @ `0x14000000` | `120.55` | `416` | `236` |
 | `.3dsx` Old 3DS | `74.81 MiB` (`0x04AD0000`) | `20.00 MiB` | `120.29` | `416` | `236` |
 | `.cci` Old 3DS (`64 MiB`) | `42.57 MiB` (`0x02A93000`) | `20.00 MiB` | `120.33` | `416` | `236` |
+
+## 11. `v0.2.2` — Built-in OpenBIOS + ISO9660 `.chd` CD Boot + On-Screen Log
+
+User report (`v0.2.1`, real New 3DS XL): `.chd` game "booted" to a black top screen with `[HLE BIOS]`, `JIT: 6 blks`, `CD [CHD] Miss 0`, `Prims: 0`. Root causes: `openbios.bin` was never packaged (romfs path only), so the app fell back to the HLE BIOS, and the HLE BIOS had no CD boot path (it spun in its `0x80030000` idle loop). `v0.2.2` embeds OpenBIOS (`.incbin`, +512 KiB), adds `src/sys/cdboot.c` (ISO9660 + `SYSTEM.CNF`), native BIOS CD boot (shell skipped at `0x80030000`), fast-boot / HLE direct boot, HLE `B0:15` pad driver + `cdrom:` file I/O, and the `4:LOG` tab / HUD `PC`·`CD Rd`·`IRQ` line.
+
+| `v0.2.2` Azahar E2E (`cube.chd`: ISO9660 + `SYSTEM.CNF` + `Cube.exe`, no SD BIOS, `cpu=jit`, `gpu=hw`) | Boot path | Frames | Emulated FPS | Blocks | GPU prims | CD Rd |
+|---|---|---:|---:|---:|---:|---:|
+| `.cci` New 3DS, built-in OpenBIOS | native BIOS CD boot (EXE loaded at frame 183) | `420` | `53.6` | `1,146` | `232` | `408` |
+| `.3dsx` New 3DS, built-in OpenBIOS | native BIOS CD boot | `420` | `53.8` | `1,146` | `232` | `408` |
+| `.3dsx` New 3DS, `bios=hle` | HLE direct boot | `240` | `68.8` | `15,483` | `238` | `397` |
+| `.3dsx` Old 3DS profile (`small_mem=1`), OpenBIOS `fast_boot=1` | `0x80030000` sideload | `240` | `129.6` | `416` | `236` | `397` |
+
+`ctest`: **`21/21` PASS** on T3 (`x86_64` ASan+UBSan) and T2 (`qemu-arm -cpu arm11mpcore`), including `test_sys_cdboot` (7 `SYSTEM.CNF` variants + non-ISO, HLE `cdrom:` file I/O, HLE `.chd` boot, OpenBIOS native `.chd`/`.cue` boot, fast boot, TCB/EVENT-less `SYSTEM.CNF`). HLE BIOS now also renders `Cube.exe` / `PSXNICCC.exe` (previously `0` prims: missing `B0:15 OutdatedPadInitAndStart`).

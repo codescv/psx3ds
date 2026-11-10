@@ -1,4 +1,5 @@
 #include "psx3ds/system.h"
+#include "../periph/periph_internal.h"
 
 #include <string.h>
 
@@ -403,7 +404,39 @@ PsxResult psx_load_cd(PsxSystem *sys, const char *path) {
     if (!sys) {
         return PSX_ERR_BAD_ARG;
     }
-    return cdrom_load(sys, path);
+    PsxBios *b = &sys->bios;
+    b->cd_boot = false;
+    b->cdboot_pending = false;
+    memset(&b->cdboot, 0, sizeof(b->cdboot));
+
+    PsxResult rc = cdrom_load(sys, path);
+    if (rc != PSX_OK) {
+        plat_log("[cdboot] cannot mount '%s' (rc=%d)\n", path ? path : "(null)", (int)rc);
+        return rc;
+    }
+    const CdImage *img = sys->cdrom.img;
+    plat_log("[cdboot] mounted %s: %u track(s), %u sectors, region '%c'%s\n",
+             path, (unsigned)img->track_count, (unsigned)img->total_lba,
+             img->region_char ? img->region_char : '?', img->chd ? " [CHD]" : "");
+
+    if (psx_cdboot_probe(sys, &b->cdboot) == PSX_OK) {
+        b->cd_boot = true;
+    }
+    if (!b->cd_boot) {
+        /* Not a bootable PS1 data disc: let a real BIOS show its CD player / shell */
+        return PSX_OK;
+    }
+
+    if (b->hle) {
+        /* BIOS-less HLE kernel cannot read the disc itself: boot SYSTEM.CNF's EXE directly */
+        b->exe_path[0] = '\0';
+        b->psexe_pending = false;
+        return psx_cdboot_inject(sys, &b->cdboot);
+    }
+    psx_cdboot_arm_bios(sys);
+    plat_log("[cdboot] %s BIOS will boot the disc%s\n", b->loaded ? "real" : "no",
+             b->cdboot_pending ? " (fast boot: sideload at 0x80030000)" : " natively");
+    return PSX_OK;
 }
 
 static void psx_drain_sync_spu_ring(PsxSystem *sys) {
@@ -507,6 +540,7 @@ void psx_run_frame(PsxSystem *sys) {
     }
 
     psx_drain_sync_spu_ring(sys);
+    psx_cdboot_watchdog(sys);
 
     u64 t_frame_end = plat_time_us();
     sys->stats.us_events += us_events_acc;

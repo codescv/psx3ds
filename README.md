@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.1`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.2`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.1-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.2-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.1-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.2-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -216,7 +216,7 @@ sdmc:/
 │   │   └── psx3ds.smdh           # icon & title metadata
 │   └── dspfirm.cdc               # DSP firmware dump (needed for audio; otherwise silent)
 └── psx3ds/
-    ├── bios/                     # SCPH1001.BIN (yours) or openbios.bin (MIT, included in zip)
+    ├── bios/                     # optional: your SCPH*.BIN (OpenBIOS is built in)
     ├── roms/                     # *.chd (recommended) / *.cue + *.bin / *.iso / *.img / *.exe
     ├── saves/                    # save states: <game>_slot<N>.st
     └── memcards/                 # 128 KiB raw memory-card images
@@ -234,10 +234,27 @@ with an 8-hunk LRU cache on New 3DS (`~1.2 MiB`, Core 2 async offload) and a 4-h
 (`~0.6 MiB`); `.chd` titles show a `[CHD]` badge in the ROM browser and live cache hit rates on the
 telemetry HUD.
 
-The ROM browser scans `sdmc:/psx3ds/roms`, `sdmc:/psx`, `sdmc:/roms/psx` and `sdmc:/`. BIOS lookup tries
-`sdmc:/psx3ds/bios/`, `sdmc:/psx/`, `sdmc:/bios/` and `sdmc:/` (plus `psx/bios/`), preferring
-`SCPH1001.BIN` over `openbios.bin`. If no BIOS is found, the built-in HLE BIOS is used for PS-EXE
-titles (note: retail CD/CHD games require a PS1 BIOS such as `SCPH1001.BIN` to boot `SYSTEM.CNF`).
+The ROM browser scans `sdmc:/psx3ds/roms`, `sdmc:/psx`, `sdmc:/roms/psx` and `sdmc:/`.
+
+**BIOS (`v0.2.2`): no setup required.** A 512 KiB **OpenBIOS** image (MIT, PCSX-Redux) is embedded
+directly in `psx3ds.cia` / `.3dsx` / `.cci`, so `.chd` / `.cue` / `.bin` / `.iso` discs boot out of the
+box (header badge `[OPENBIOS]`). If you place your own 512 KiB BIOS dump (`scph*.bin`, `psxonpsp*.bin`,
+`bios*.bin`; any case) in `sdmc:/psx3ds/bios/`, `sdmc:/psx/`, `sdmc:/roms/psx/`, `sdmc:/bios/` or
+`sdmc:/`, it is used instead (badge e.g. `[SCPH1001]`, `[SCPH5501]`). The `3:CTRL` tab toggles
+`BIOS: Auto/OpenBIOS` ↔ `BIOS: HLE Direct` and `CD Boot: Native` ↔ `CD Boot: Fast`:
+
+* **Native** (default): the BIOS kernel boots, the BIOS shell/logo is skipped, and the BIOS reads
+  `SYSTEM.CNF` → `BOOT = cdrom:\...` → PS-X EXE through the emulated CD-ROM controller (exactly like
+  hardware; ~3 s for an 800 KB EXE). A watchdog sideloads the EXE if the BIOS stalls for 30 s.
+* **Fast**: psx3ds parses ISO9660 itself and sideloads the boot EXE at the BIOS shell entry
+  (`0x80030000`) right after kernel init.
+* **HLE Direct**: no BIOS at all; psx3ds loads the disc's boot EXE straight into RAM and emulates
+  the kernel (events, pads, `cdrom:` `open`/`read`/`Load`/`LoadExec`). Fastest, least compatible.
+
+**Debugging a black screen:** the `2:HUD` tab shows `PC`, `CD Rd` (sectors read) and `IRQ` state, and
+the `4:LOG` tab shows the boot log (`[bios]`, `[cdboot] SYSTEM.CNF BOOT=...`, `[cdrom]`, `[hle]`, guest
+`[tty]` output). The full log is also written to `sdmc:/psx3ds/psx3ds.log` (`Dump Log` saves
+`sdmc:/psx3ds/psx3ds_dump.log`) — a photo of `2:HUD` + `4:LOG` is the best bug report.
 The emulator creates the `psx3ds/` directories on first launch.
 
 > [!NOTE]
@@ -278,8 +295,9 @@ If `sdmc:/psx3ds_autorun.cfg` exists, the `.3dsx` skips the UI. It runs one titl
 number of frames, writes artifacts, and exits. This is how CI drives `azahar-headless`:
 
 ```ini
-bios=sdmc:/bios/openbios.bin     # or: bios=hle
-exe=sdmc:/roms/Cube.exe          # or: cd=sdmc:/roms/game.cue
+bios=builtin                     # or: bios=hle, bios=sdmc:/bios/SCPH1001.BIN (omit = auto)
+cd=sdmc:/roms/game.chd           # or: exe=sdmc:/roms/Cube.exe
+fast_boot=1                      # optional: sideload the disc EXE instead of native BIOS CD boot
 cpu=jit                          # jit | cached | interp
 gpu=hw                           # hw | soft
 frames=220

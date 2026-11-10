@@ -589,9 +589,16 @@ static void cd_exec_command(PsxSystem *sys, u8 cmd) {
         break;
     }
 
-    default:
+    default: {
+        static u8 s_unsupported_seen[32];
+        if ((s_unsupported_seen[cmd >> 3] & (1u << (cmd & 7u))) == 0u) {
+            s_unsupported_seen[cmd >> 3] |= (u8)(1u << (cmd & 7u));
+            plat_log("[cdrom] unsupported command 0x%02X (%u params) -> INT5\n", (unsigned)cmd,
+                     (unsigned)pn);
+        }
         cd_queue_err(sys, CD_STAT_SEEK_ERR, 0x40u);
         break;
+    }
     }
 }
 
@@ -657,8 +664,15 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
         }
 
         u32 read_lba = cd->cur_lba;
-        (void)cdrom_ra_read_sector(sys, read_lba, cd->sector);
+        if (!cdrom_ra_read_sector(sys, read_lba, cd->sector)) {
+            static u32 s_read_errors;
+            if (s_read_errors++ < 8u) {
+                plat_log("[cdrom] read error at LBA %u (disc has %u sectors)\n",
+                         (unsigned)read_lba, (unsigned)cd->img->total_lba);
+            }
+        }
         cd->cur_lba = read_lba + 1u;
+        cd->sectors_read++;
 
         bool xa_en       = (cd->mode & 0x40u) != 0u;
         bool is_mode2    = (cd->sector[15] == 0x02u);

@@ -121,6 +121,9 @@ typedef struct CtrAutorunCfg {
     u32  frames;
     char stop_tty[64];
     char ppm[256];
+    char bottom_ppm[256]; /* optional 320x240 bottom-screen (UI) capture */
+    bool fast_boot;       /* cfg.cd_fast_boot: sideload disc EXE instead of native BIOS CD boot */
+    u32  ui_tab;          /* 1..4 = bottom tab shown during autorun (default 2:HUD) */
     char json[256];
     char tty[256];
     char done[256];
@@ -185,6 +188,12 @@ static bool parse_autorun_cfg(CtrAutorunCfg *ar) {
             snprintf(ar->stop_tty, sizeof(ar->stop_tty), "%s", val);
         } else if (strcmp(key, "ppm") == 0) {
             snprintf(ar->ppm, sizeof(ar->ppm), "%s", val);
+        } else if (strcmp(key, "fast_boot") == 0) {
+            ar->fast_boot = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0);
+        } else if (strcmp(key, "bottom_ppm") == 0) {
+            snprintf(ar->bottom_ppm, sizeof(ar->bottom_ppm), "%s", val);
+        } else if (strcmp(key, "ui_tab") == 0) {
+            ar->ui_tab = (u32)strtoul(val, NULL, 0);
         } else if (strcmp(key, "json") == 0) {
             snprintf(ar->json, sizeof(ar->json), "%s", val);
         } else if (strcmp(key, "tty") == 0) {
@@ -222,6 +231,21 @@ static void format_savestate_path(char *out, size_t cap, const char *boot_path, 
     snprintf(out, cap, "sdmc:/psx3ds/saves/%s_slot%u.st", stem, (unsigned)slot);
 }
 
+/* Guest TTY (BIOS putchar / printf) -> on-screen LOG tab + sdmc:/psx3ds/psx3ds.log */
+static void tty_to_ctr_log(const char *data, u32 len, void *user) {
+    (void)user;
+    for (u32 i = 0u; i < len; i++) {
+        ctr_log_tty_putc(data[i]);
+    }
+}
+
+static const char *cfg_bios_label(const PsxConfig *cfg) {
+    if (cfg->hle_bios) {
+        return "hle";
+    }
+    return cfg->bios_path[0] != '\0' ? cfg->bios_path : PSX_BIOS_BUILTIN_NAME;
+}
+
 static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     plat_log("[main_3ds] autorun config detected: exe='%s' cd='%s' gpu='%s' cpu='%s' frames=%u\n",
              ar->exe, ar->cd, ar->gpu, ar->cpu, (unsigned)ar->frames);
@@ -254,7 +278,10 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     CtrUiState *ui = (CtrUiState *)calloc(1u, sizeof(*ui));
     if (ui) {
         ctr_ui_init(ui);
-        ui->active_tab = 1u;
+        ui->active_tab = (ar->ui_tab >= 1u && ar->ui_tab <= CTR_UI_TAB_COUNT)
+                             ? (u8)(ar->ui_tab - 1u)
+                             : (u8)CTR_UI_TAB_HUD;
+        ui->game_loaded = true;
     }
 
     if (ar->hle) {
@@ -262,10 +289,12 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     } else if (ar->bios[0] != '\0') {
         snprintf(cfg.bios_path, sizeof(cfg.bios_path), "%s", ar->bios);
     } else if (ui && ui->bios_path[0] != '\0') {
+        /* External SD BIOS if detected, else "builtin" OpenBIOS */
         snprintf(cfg.bios_path, sizeof(cfg.bios_path), "%s", ui->bios_path);
     } else {
-        cfg.hle_bios = true;
+        snprintf(cfg.bios_path, sizeof(cfg.bios_path), "%s", PSX_BIOS_BUILTIN_NAME);
     }
+
 
     PsxSystem *sys = (PsxSystem *)calloc(1u, sizeof(*sys));
     if (!sys) {
@@ -273,7 +302,15 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         return 1;
     }
 
+    cfg.cd_fast_boot = ar->fast_boot;
+    if (ui) {
+        ui->cd_fast_boot = ar->fast_boot;
+    }
+    char bios_req[256];
+    snprintf(bios_req, sizeof(bios_req), "%s", cfg_bios_label(&cfg));
     PsxResult init_rc = psx_system_init(sys, &cfg);
+    plat_log("[boot] autorun bios=%s -> %s cd_boot=%s rc=%d\n", bios_req,
+             cfg_bios_label(&sys->cfg), cfg.cd_fast_boot ? "fast" : "native", (int)init_rc);
     if (init_rc != PSX_OK) {
         plat_log("[main_3ds] autorun psx_system_init failed: %d\n", (int)init_rc);
         free(sys);
@@ -281,14 +318,17 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         return 1;
     }
 
+    bios_set_tty_callback(sys, tty_to_ctr_log, NULL);
     if (ar->stop_tty[0] != '\0') {
         bios_set_stop_pattern(sys, ar->stop_tty);
     }
     if (ar->cd[0] != '\0') {
-        (void)psx_load_cd(sys, ar->cd);
+        PsxResult crc = psx_load_cd(sys, ar->cd);
+        plat_log("[boot] autorun cd=%s rc=%d\n", ar->cd, (int)crc);
     }
     if (ar->exe[0] != '\0') {
-        (void)psx_load_exe(sys, ar->exe);
+        PsxResult erc = psx_load_exe(sys, ar->exe);
+        plat_log("[boot] autorun exe=%s rc=%d\n", ar->exe, (int)erc);
     }
 
     ctr_audio_bind_system(sys);
@@ -320,6 +360,13 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     if (ar->ppm[0] != '\0') {
         PsxResult prc = ctr_capture_top_screen_ppm(ar->ppm);
         plat_log("[main_3ds] autorun ppm '%s' rc=%d\n", ar->ppm, (int)prc);
+    }
+    if (ar->bottom_ppm[0] != '\0') {
+        if (ui) {
+            ctr_ui_render(ui, sys, hw); /* fresh frame incl. the lines logged above */
+        }
+        PsxResult brc = ctr_capture_bottom_screen_ppm(ar->bottom_ppm);
+        plat_log("[main_3ds] autorun bottom_ppm '%s' rc=%d\n", ar->bottom_ppm, (int)brc);
     }
 
     /* 2. Write TTY stdout capture */
@@ -389,17 +436,27 @@ static PsxResult boot_game_into_system(PsxSystem *sys, CtrUiState *ui, CtrHwInfo
 
     PsxConfig cfg;
     psx_config_defaults(&cfg, hw->is_n3ds);
-    if (ui->bios_path[0] != '\0') {
-        cfg.hle_bios = false;
-        snprintf(cfg.bios_path, sizeof(cfg.bios_path), "%s", ui->bios_path);
-    } else {
+    if (ui->bios_mode == CTR_BIOS_MODE_HLE) {
         cfg.hle_bios = true;
+        cfg.bios_path[0] = '\0';
+    } else {
+        /* Auto: external SD BIOS found at scan time, else the embedded OpenBIOS */
+        cfg.hle_bios = false;
+        snprintf(cfg.bios_path, sizeof(cfg.bios_path), "%s",
+                 ui->bios_path[0] != '\0' ? ui->bios_path : PSX_BIOS_BUILTIN_NAME);
     }
+    cfg.cd_fast_boot = ui->cd_fast_boot;
+    const char *path_lbl = (boot_path && boot_path[0] != '\0') ? boot_path : "(bios shell)";
+    char bios_req[256];
+    snprintf(bios_req, sizeof(bios_req), "%s", cfg_bios_label(&cfg));
 
     PsxResult rc = psx_system_init(sys, &cfg);
     if (rc != PSX_OK) {
+        plat_log("[boot] path=%s bios=%s rc=%d (system init failed)\n", path_lbl, bios_req,
+                 (int)rc);
         return rc;
     }
+    bios_set_tty_callback(sys, tty_to_ctr_log, NULL);
 
     if (boot_path && boot_path[0] != '\0') {
         if (has_exe_ext(boot_path)) {
@@ -408,9 +465,13 @@ static PsxResult boot_game_into_system(PsxSystem *sys, CtrUiState *ui, CtrHwInfo
             rc = psx_load_cd(sys, boot_path);
         }
         if (rc != PSX_OK) {
+            plat_log("[boot] path=%s bios=%s rc=%d (load failed)\n", path_lbl,
+                     cfg_bios_label(&sys->cfg), (int)rc);
             return rc;
         }
     }
+    plat_log("[boot] path=%s bios=%s cd_boot=%s rc=%d\n", path_lbl, cfg_bios_label(&sys->cfg),
+             sys->cfg.cd_fast_boot ? "fast" : "native", (int)rc);
 
     ctr_input_set_scale_mode((PsxVideoScale)sys->cfg.scale);
     ctr_audio_bind_system(sys);
@@ -468,6 +529,8 @@ int main(int argc, char **argv) {
     }
 
     ctr_ui_init(ui);
+    plat_log("[main_3ds] BIOS: %s (%s), %u ROM(s) found; log: sdmc:/psx3ds/psx3ds.log\n",
+             ui->bios_badge, ui->bios_path, (unsigned)ui->rom_count);
     char current_game[256] = { 0 };
     u32 ui_frame_div = 0u;
 
@@ -484,12 +547,29 @@ int main(int argc, char **argv) {
                                         kdown, kheld, (kheld & KEY_TOUCH) ? &touch : NULL);
         if (act == CTR_UI_QUIT_APP) {
             break;
+        } else if (act == CTR_UI_TOGGLE_BIOS_MODE) {
+            ui->bios_mode = (ui->bios_mode == CTR_BIOS_MODE_HLE) ? CTR_BIOS_MODE_AUTO
+                                                                 : CTR_BIOS_MODE_HLE;
+            plat_log("[ui] BIOS mode -> %s\n", ui->bios_mode == CTR_BIOS_MODE_HLE
+                                                   ? "HLE Direct"
+                                                   : ui->bios_path);
+            ctr_ui_set_status(ui, "BIOS mode applies on next boot/reset");
+        } else if (act == CTR_UI_TOGGLE_CD_BOOT) {
+            ui->cd_fast_boot = !ui->cd_fast_boot;
+            plat_log("[ui] CD boot -> %s\n", ui->cd_fast_boot ? "Fast (sideload EXE)"
+                                                               : "Native (BIOS reads SYSTEM.CNF)");
+            ctr_ui_set_status(ui, ui->bios_mode == CTR_BIOS_MODE_HLE
+                                      ? "CD Boot mode only used with OpenBIOS/SD BIOS"
+                                      : "CD Boot mode applies on next boot/reset");
         } else if (act == CTR_UI_BOOT_PATH) {
             snprintf(current_game, sizeof(current_game), "%s", ui->pending_boot_path);
-            if (boot_game_into_system(sys, ui, &hw, current_game) == PSX_OK) {
+            PsxResult brc = boot_game_into_system(sys, ui, &hw, current_game);
+            if (brc == PSX_OK) {
                 ctr_ui_set_status(ui, current_game[0] ? "Game booted" : "Booted BIOS shell");
             } else {
-                ctr_ui_set_status(ui, "Failed to load selected title");
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Boot failed rc=%d (see 4:LOG)", (int)brc);
+                ctr_ui_set_status(ui, msg);
             }
         } else if (ui->game_loaded) {
             char st_path[256];
@@ -536,10 +616,17 @@ int main(int argc, char **argv) {
                         ctr_ui_set_status(ui, "State slot empty or invalid");
                     }
                     break;
-                case CTR_UI_RESET_SYSTEM:
-                    (void)boot_game_into_system(sys, ui, &hw, current_game);
-                    ctr_ui_set_status(ui, "System reset");
+                case CTR_UI_RESET_SYSTEM: {
+                    PsxResult rrc = boot_game_into_system(sys, ui, &hw, current_game);
+                    if (rrc == PSX_OK) {
+                        ctr_ui_set_status(ui, "System reset");
+                    } else {
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "Reset failed rc=%d (see 4:LOG)", (int)rrc);
+                        ctr_ui_set_status(ui, msg);
+                    }
                     break;
+                }
                 default:
                     break;
             }

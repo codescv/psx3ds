@@ -9,7 +9,7 @@
 #define PSX3DS_VERSION_MAJOR 0
 #define PSX3DS_VERSION_MINOR 2
 #define PSX3DS_VERSION_PATCH 1
-#define PSX3DS_VERSION_STR   "0.2.1"
+#define PSX3DS_VERSION_STR   "0.2.2"
 
 /* --------------------------------------------------------------------------
  * Compile-time platform & architecture detection (single source of truth)
@@ -102,6 +102,7 @@ typedef struct PsxConfig {
     bool small_mem;
     bool hle_bios;
     bool dither_hw;
+    bool cd_fast_boot; /* real BIOS: skip native CD boot, sideload SYSTEM.CNF EXE at 0x80030000 */
 
     u32 smc_trap_budget;          /* default UINT32_MAX (adaptive VERIFY disabled) */
     u32 jit_code_bytes;
