@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.0`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.1`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.0-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.1-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.0-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.1-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -245,7 +245,9 @@ The emulator creates the `psx3ds/` directories on first launch.
 > mirror (`SVC 0x70 MEMOP_MAP`, active on `.cia` and Rosalina Luma3DS), then in-place RWX
 > (`MEMOP_PROT`), falling back safely to the cached interpreter if running inside a restricted
 > environment so it never crashes. Old 3DS units are detected automatically and run the `small_mem`
-> profile (`20 MiB` linear heap + `42.6 MiB` normal heap fitting `26 MiB` arena + `6 MiB` JIT + CHD).
+> profile (`20 MiB` linear heap + `42.6 MiB` normal heap fitting `26 MiB` arena + `6 MiB` JIT + CHD);
+> New 3DS gets an `80 MiB` normal heap + `42.6 MiB` linear heap (`v0.2.1` fixes the `v0.2.0` boot
+> crash where the normal heap overflowed the 96 MiB Kernel11 heap window on New 3DS).
 
 ### Controls
 

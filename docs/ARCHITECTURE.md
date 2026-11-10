@@ -1259,7 +1259,9 @@ CI gate order: unit → T3 goldens → T2 goldens + trace_diff on `psxtest_cpu/p
 
 ## 12. Memory Budget & Performance Targets
 
-Single arena allocated once in `psx_system_init()` (`src/core/arena.c`, 4 KiB-aligned bump allocator; `PSX3DS_SMALL_MEM` chosen at runtime by `APT_CheckNew3DS` / `osGetMemRegionFree`).
+Single arena allocated once in `psx_system_init()` (`src/core/arena.c`, 4 KiB-aligned bump allocator; `PSX3DS_SMALL_MEM` chosen at runtime by `APT_CheckNew3DS` / `envGetHeapSize() < 64 MiB`).
+
+**Startup heap split (`v0.2.1`)**: `main_3ds.c` overrides libctru's weak `__system_allocateHeaps` using `psx_ctr_compute_heap_split()` (`include/psx3ds/ctr_heap.h`): normal heap = `min(RESLIMIT_COMMIT remaining - 20 MiB, 80 MiB)` at `0x08000000` (must stay inside the Kernel11 heap VA window `[0x08000000, 0x0E000000)` = 96 MiB, else `svcControlMemory` fails and libctru panics before `main()` — the `v0.2.0` N3DS crash), linear heap = remainder (≥ 20 MiB). O3DS 64 MiB → 42.6 + 20 MiB; N3DS 124 MiB → 80 + 42.6 MiB. Covered by `tests/unit/test_ctr_heap.c`.
 
 | Item | N3DS | O3DS (`SMALL_MEM`) | host |
 |---|---|---|---|

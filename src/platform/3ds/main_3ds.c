@@ -7,18 +7,106 @@
 #include <strings.h>
 
 #include "plat_3ds_internal.h"
+#include "psx3ds/ctr_heap.h"
 
 /* Override libctru's weak 32 KiB default main-thread stack size with 256 KiB */
 PSX_USED u32 __stacksize__ = 256u * 1024u;
 
 /*
- * Cap libctru's linear heap at 20 MiB instead of its 32 MiB default.
- * On Old 3DS 64 MiB CIA/CCI (`SystemMode: 64MB`), a 32 MiB linear heap leaves
- * only ~29.1 MiB of normal heap — starving `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`.
- * 20 MiB gives citro3d/ndsp ~7–10 MiB headroom while leaving ~42.5 MiB normal heap
- * on Old 3DS (and ~102.5 MiB on New 3DS 124 MiB) for arena + ARM11 JIT + CHD codecs.
+ * Startup heap split (v0.2.1): override libctru's weak `__system_allocateHeaps`.
+ *
+ * v0.2.0 set `__ctru_linear_heap_size = 20 MiB` with `__ctru_heap_size = 0`, which made
+ * libctru compute an *uncapped* normal heap of 102.58 MiB (0x06694000) on New 3DS
+ * (124 MiB RESLIMIT_COMMIT). That overflows the Kernel11 heap VA window
+ * [0x08000000, 0x0E000000) (96 MiB), svcControlMemory fails, and libctru calls
+ * svcBreak(USERBREAK_PANIC) before main() (Luma3DS "prefetch abort / debug event").
+ *
+ * We now size both heaps ourselves via psx_ctr_compute_heap_split() (unit-tested in
+ * tests/unit/test_ctr_heap.c): normal heap = min(remaining - 20 MiB, 80 MiB), linear heap
+ * gets the rest. Old 3DS keeps ~42.5 MiB normal + 20 MiB linear; New 3DS gets 80 MiB
+ * normal + ~42.5 MiB linear. If the kernel still rejects a size, we shrink and retry
+ * instead of panicking. Runs before newlib/malloc init: no libc calls allowed here.
  */
-PSX_USED u32 __ctru_linear_heap_size = 20u * 1024u * 1024u;
+extern u32   __ctru_heap;
+extern u32   __ctru_linear_heap;
+extern u32   __ctru_heap_size;
+extern u32   __ctru_linear_heap_size;
+extern char *fake_heap_start;
+extern char *fake_heap_end;
+
+#define CTR_HEAP_RETRY_STEP  PSX_CTR_MIB(8)
+#define CTR_HEAP_RETRY_FLOOR PSX_CTR_MIB(8)
+
+PSX_USED void __system_allocateHeaps(void) {
+    s64 commit_limit = 0;
+    s64 commit_current = 0;
+    Handle reslimit = 0;
+    ResourceLimitType res_type = RESLIMIT_COMMIT;
+
+    if (svcGetResourceLimit(&reslimit, CUR_PROCESS_HANDLE) < 0) {
+        svcBreak(USERBREAK_PANIC);
+    }
+    (void)svcGetResourceLimitLimitValues(&commit_limit, reslimit, &res_type, 1);
+    (void)svcGetResourceLimitCurrentValues(&commit_current, reslimit, &res_type, 1);
+    svcCloseHandle(reslimit);
+
+    PsxCtrHeapSplit split;
+    if (!psx_ctr_compute_heap_split(commit_limit, commit_current, &split)) {
+        svcBreak(USERBREAK_PANIC);
+    }
+
+    /* Normal heap at OS_HEAP_AREA_BEGIN; never larger than the 96 MiB VA window. */
+    u32 heap_size = split.heap_size;
+    if (!psx_ctr_heap_fits_va(heap_size)) {
+        heap_size = PSX_CTR_HEAP_MAX_BYTES;
+    }
+    u32 heap_addr = 0u;
+    for (;;) {
+        Result rc = svcControlMemory(&heap_addr, PSX_CTR_HEAP_AREA_BEGIN, 0x0u, heap_size,
+                                     MEMOP_ALLOC, MEMPERM_READ | MEMPERM_WRITE);
+        if (rc >= 0) {
+            break;
+        }
+        if (heap_size <= CTR_HEAP_RETRY_FLOOR) {
+            svcBreak(USERBREAK_PANIC);
+        }
+        heap_size = (heap_size > CTR_HEAP_RETRY_STEP + CTR_HEAP_RETRY_FLOOR)
+                        ? (heap_size - CTR_HEAP_RETRY_STEP)
+                        : CTR_HEAP_RETRY_FLOOR;
+    }
+
+    /* Linear heap: everything the normal heap did not take (capped to its VA window). */
+    u32 linear_size = split.remaining - heap_size;
+    if (linear_size > PSX_CTR_LINEAR_AREA_BYTES) {
+        linear_size = PSX_CTR_LINEAR_AREA_BYTES;
+    }
+    u32 linear_addr = 0u;
+    for (;;) {
+        Result rc = svcControlMemory(&linear_addr, 0x0u, 0x0u, linear_size, MEMOP_ALLOC_LINEAR,
+                                     MEMPERM_READ | MEMPERM_WRITE);
+        if (rc >= 0) {
+            break;
+        }
+        if (linear_size <= CTR_HEAP_RETRY_FLOOR) {
+            svcBreak(USERBREAK_PANIC);
+        }
+        linear_size = (linear_size > CTR_HEAP_RETRY_STEP + CTR_HEAP_RETRY_FLOOR)
+                          ? (linear_size - CTR_HEAP_RETRY_STEP)
+                          : CTR_HEAP_RETRY_FLOOR;
+    }
+
+    __ctru_heap = heap_addr;
+    __ctru_heap_size = heap_size;
+    __ctru_linear_heap = linear_addr;
+    __ctru_linear_heap_size = linear_size;
+
+    /* Mappable VA allocator window (svcMapMemoryBlock / svcControlProcessMemory users). */
+    mappableInit(OS_MAP_AREA_BEGIN, OS_MAP_AREA_END);
+
+    /* newlib sbrk() window */
+    fake_heap_start = (char *)(uintptr_t)__ctru_heap;
+    fake_heap_end = (char *)(uintptr_t)(__ctru_heap + __ctru_heap_size);
+}
 
 #define AUTORUN_CFG_PATH "sdmc:/psx3ds_autorun.cfg"
 
@@ -340,6 +428,10 @@ int main(int argc, char **argv) {
     ctr_threads_init_hardware(&hw);
     plat_log("[main_3ds] psx3ds v%s starting (n3ds=%d, cpu=%u MHz)\n",
              PSX3DS_VERSION_STR, (int)hw.is_n3ds, (unsigned)hw.cpu_mhz);
+    plat_log("[main_3ds] heap=0x%08lX (%lu KiB) @0x%08lX linear=0x%08lX (%lu KiB) @0x%08lX\n",
+             (unsigned long)__ctru_heap_size, (unsigned long)(__ctru_heap_size >> 10),
+             (unsigned long)__ctru_heap, (unsigned long)__ctru_linear_heap_size,
+             (unsigned long)(__ctru_linear_heap_size >> 10), (unsigned long)__ctru_linear_heap);
 
     gfxInitDefault();
     C3D_Init(0x40000u);

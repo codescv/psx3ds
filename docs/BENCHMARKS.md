@@ -175,7 +175,7 @@ Measured by running the release LTO `psx3ds.3dsx` (`748 KiB`) inside `azahar-hea
 | `citro3d` upload shadow (`1 MiB`) + dual 12 B vertex rings (`96 KiB`) | `1.1 MiB` linear | `1.1 MiB` linear | — |
 | `disp24_tex` (`2 MiB`) + VRAM `readback_buf` (`1 MiB`) | **Lazy** (`0 B` unless 24bpp / `GP0(C0h)` used) | **Lazy** (`0 B` unless triggered) | — |
 | `libchdr` LRU hunk cache (`8 × 19,584 B` hunk slots; `4` slots on O3DS) | `~1.2 MiB` heap (incl. codec state) | **`~0.6 MiB`** heap | `~1.2 MiB` heap |
-| `libctru` `__ctru_linear_heap_size` vs normal heap (`main_3ds.c`) | `20.0 MiB` linear + **`102.6 MiB`** heap (`124 MiB` CIA) | **`20.0 MiB` linear + `42.6 MiB` heap** (`64 MiB` CIA) | — |
+| `__system_allocateHeaps` override (`main_3ds.c`, `v0.2.1`) | `42.6 MiB` linear + **`80.0 MiB`** heap (`124 MiB` CIA; `v0.2.0` requested `102.6 MiB` → boot panic) | **`20.0 MiB` linear + `42.6 MiB` heap** (`64 MiB` CIA) | — |
 | **Total Typical FCRAM Footprint (15bpp 3D Game + CHD v5)** | **~34–44 MiB** (`> 80 MiB` free on N3DS) | **~30.5–34 MiB** (fits cleanly inside `64 MiB` O3DS `.cia`!) | — |
 
 ### Old 3DS (`small_mem=1`) Extended 600-Frame `.3dsx` Stress Runs (`azahar-headless`)
@@ -231,7 +231,7 @@ Bit-exact compliance verified across `test_periph_chd` (all 4 codecs + mixed Mod
 | `psx3ds.3dsx` | **`1,007 KiB`** (`1,030,692 B`) | Homebrew Launcher executable with embedded custom SMDH and statically linked `libchdr` + `zlib`/`liblzma`/`zstd`/`libFLAC` |
 | `psx3ds.cci` | **`776 KiB`** (`794,624 B`) | NCCH cartridge image sharing the exact `psx3ds.rsf` ExHeader as `psx3ds.cia` for automated `azahar-headless` verification |
 
-> **Old 3DS 64 MiB `.cia` Heap Split (`__ctru_linear_heap_size = 20 MiB`)**: Under strict `SystemMode: 64MB`, `libctru`'s default 32 MiB linear heap leaves only `29.15 MiB` of normal heap — insufficient for `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`. Capping `__ctru_linear_heap_size` to `20 MiB` provides `>12 MiB` linear headroom for `citro3d`/`ndsp` while expanding normal heap to **`42.57 MiB`** on Old 3DS (`102.57 MiB` on New 3DS 124 MiB), enabling full-speed ARM11 `CPU_JIT` + CHD v5 caching on 64 MiB Old 3DS `.cia` installs.
+> **Old 3DS 64 MiB `.cia` Heap Split (`__ctru_linear_heap_size = 20 MiB`)**: Under strict `SystemMode: 64MB`, `libctru`'s default 32 MiB linear heap leaves only `29.15 MiB` of normal heap — insufficient for `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`. Capping `__ctru_linear_heap_size` to `20 MiB` provides `>12 MiB` linear headroom for `citro3d`/`ndsp` while expanding normal heap to **`42.57 MiB`** on Old 3DS (`v0.2.0` requested `102.57 MiB` on New 3DS 124 MiB, overflowing the 96 MiB heap VA window and panicking at boot — `v0.2.1` caps the normal heap at `80 MiB` via a `__system_allocateHeaps` override), enabling full-speed ARM11 `CPU_JIT` + CHD v5 caching on 64 MiB Old 3DS `.cia` installs.
 
 | `v0.2.0` Azahar E2E Case (`cpu=jit`, `gpu=hw`) | Format | Console Profile | Frames | Emulated FPS (`Speed %`) | JIT Code (`Blocks`) | SMC Inv | GPU Batches (`Prims`) | Non-Black / TTY |
 |---|---|---|---:|---:|---:|---:|---:|---|
@@ -244,3 +244,14 @@ Bit-exact compliance verified across `test_periph_chd` (all 4 codecs + mixed Mod
 | `cdrom-getloc.exe` + `cube_v5.chd` | **`.cci` & `.3dsx`** | New 3DS & **Old 3DS `64 MiB`** | `600` | **PASS** (`cpu_mode=3`) | `327.8 KiB` (`1,125`) | `0` | `599` | `GetlocL [00:02:16] mode 2` (`0` diff `.cci` vs `.3dsx` vs T2) |
 
 *(Note: In Azahar 2126.2 HLE, ExHeader `SVC 0x70` passes kernel permission checks and falls back cleanly from unimplemented HLE `ControlProcessMemory` to `mode=2` `JIT_MEM_RWX_INPLACE` (`cpu_mode=3 = CPU_JIT`); on real Luma3DS hardware, Kernel11 `SVC 0x70` returns `0` and activates `mode=1` `JIT_MEM_MIRROR_RWRX` hardware W^X dual-mapped JIT.)*
+
+## 10. `v0.2.1` Hotfix — New 3DS Startup Heap Split (`__system_allocateHeaps` override)
+
+`v0.2.0` panicked on real New 3DS (Luma3DS) before `main()`: libctru requested a `0x06694000` (`102.58 MiB`) normal heap, overflowing the Kernel11 heap VA window `[0x08000000, 0x0E000000)`. Azahar's HLE kernel allows a 128 MiB heap window, so emulator runs did not reproduce it. `v0.2.1` sizes heaps via `psx_ctr_compute_heap_split()` (normal heap ≤ `80 MiB`); `tests/unit/test_ctr_heap.c` pins the math (incl. the exact user crash dump values) on T1/T2/T3.
+
+| `v0.2.1` Azahar E2E (`Cube.exe`, openbios, `cpu=jit`, `gpu=hw`, 240 frames) | Normal heap @ `0x08000000` | Linear heap | Emulated FPS | Blocks | GPU prims |
+|---|---:|---:|---:|---:|---:|
+| `.3dsx` New 3DS | **`80.00 MiB`** (`0x05000000`) | `42.81 MiB` @ `0x30000000` | `120.75` | `416` | `236` |
+| `.cci` New 3DS | **`80.00 MiB`** (`0x05000000`) | `42.57 MiB` @ `0x14000000` | `120.55` | `416` | `236` |
+| `.3dsx` Old 3DS | `74.81 MiB` (`0x04AD0000`) | `20.00 MiB` | `120.29` | `416` | `236` |
+| `.cci` Old 3DS (`64 MiB`) | `42.57 MiB` (`0x02A93000`) | `20.00 MiB` | `120.33` | `416` | `236` |

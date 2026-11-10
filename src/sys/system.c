@@ -4,6 +4,7 @@
 
 #if PSX3DS_PLATFORM_3DS
 #include <3ds.h>
+#include "psx3ds/ctr_heap.h"
 extern void jit_mem_3ds_set_allow_hle_exec(bool allow);
 #endif
 
@@ -235,9 +236,14 @@ PsxResult psx_system_init(PsxSystem *sys, const PsxConfig *cfg) {
     }
 
 #if PSX3DS_PLATFORM_3DS
-    /* Auto-detect constrained Old-3DS / launcher FCRAM envelope */
-    u32 free_fcram = (u32)osGetMemRegionFree(MEMREGION_APPLICATION);
-    if (free_fcram > 0u && free_fcram < (68u * 1024u * 1024u) && !sys->cfg.small_mem) {
+    /*
+     * Auto-detect constrained Old-3DS / launcher FCRAM envelope from the normal heap
+     * actually committed by our __system_allocateHeaps override (main_3ds.c). The
+     * previous osGetMemRegionFree() probe was meaningless after startup commits all
+     * of RESLIMIT_COMMIT (it reads ~0 on both O3DS and N3DS).
+     */
+    u32 heap_bytes = envGetHeapSize();
+    if (heap_bytes > 0u && heap_bytes < PSX_CTR_HEAP_FULL_PROFILE_BYTES && !sys->cfg.small_mem) {
         sys->cfg.small_mem = true;
         if (sys->cfg.jit_code_bytes > 6u * 1024u * 1024u) {
             sys->cfg.jit_code_bytes = 6u * 1024u * 1024u;

@@ -114,9 +114,11 @@ cmake --build build-3ds
 #   build-3ds/psx3ds.smdh, build-3ds/psx3ds.bnr, build-3ds/psx3ds.elf
 ```
 
-> **Universal `.cia` / `.cci` RSF ExHeader & Old 3DS 64 MiB Heap Split (`v0.2.0`):**
+> **Universal `.cia` / `.cci` RSF ExHeader & O3DS/N3DS Startup Heap Split (`v0.2.1`):**
 > - `assets/3ds/psx3ds.rsf` specifies `SystemMode: 64MB` (Old 3DS compatible) + `SystemModeExt: 124MB`, `CpuSpeed: 804MHz`, `EnableL2Cache: true`, `CanAccessCore2: true`, `SVC 0x70` (`ControlProcessMemory` for native `JIT_MEM_MIRROR_RWRX` hardware W^X JIT on Luma3DS), `OpenProcess (0x33)`, I/D-cache SVCs, DSP memory mapping `1ff00000-1ff7ffff`, and `ir:rst`/`qtm:s` (New 3DS C-Stick & ZL/ZR).
-> - On strict 64 MiB Old 3DS `.cia`/`.cci`, `libctru`'s default 32 MiB linear heap leaves only `29.15 MiB` of normal heap — starving `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`. `src/platform/3ds/main_3ds.c` sets `u32 __ctru_linear_heap_size = 20u * 1024u * 1024u`, leaving **`42.57 MiB`** of normal heap on Old 3DS (`102.57 MiB` on New 3DS 124 MiB) while keeping ample linear memory for `citro3d` and `ndsp`.
+> - On strict 64 MiB Old 3DS `.cia`/`.cci`, `libctru`'s default 32 MiB linear heap leaves only `29.15 MiB` of normal heap — starving `arena_init(26 MiB) + jit_mem_alloc(6 MiB)`.
+> - **`v0.2.0` New 3DS crash (fixed in `v0.2.1`)**: `v0.2.0` set only `__ctru_linear_heap_size = 20 MiB`, so `libctru` took its *uncapped* branch (`heap = remaining - linear`) and requested a **`102.58 MiB` (`0x06694000`)** normal heap on New 3DS (124 MiB `RESLIMIT_COMMIT`). That overflows the Kernel11 heap VA window `[0x08000000, 0x0E000000)` (96 MiB), so `svcControlMemory` failed and `__system_allocateHeaps` called `svcBreak(USERBREAK_PANIC)` before `main()` (Luma3DS: *prefetch abort / Debug event*, `LR = __system_allocateHeaps+0x1bc`).
+> - **`v0.2.1`**: `src/platform/3ds/main_3ds.c` overrides libctru's weak `__system_allocateHeaps` and sizes both heaps with `psx_ctr_compute_heap_split()` (`include/psx3ds/ctr_heap.h`, regression-tested in `tests/unit/test_ctr_heap.c` on all tiers): **normal heap = `min(remaining - 20 MiB, 80 MiB)`**, linear heap = the rest. O3DS 64 MiB → `42.58 MiB` heap + `20 MiB` linear; O3DS 80 MiB `.3dsx` → `58.58` + `20`; N3DS 124 MiB → **`80 MiB` + `42.58 MiB`**; N3DS 178 MiB `.3dsx` → `80` + `96.58`. The heap never exceeds `0x0D000000`; on unexpected kernel rejection it shrinks in 8 MiB steps instead of panicking. `psx_system_init()` selects the Old-3DS `small_mem` profile when `envGetHeapSize() < 64 MiB`.
 
 #### Option B: Direct CLI Compilation (`picasso` + `bin2s` + `arm-none-eabi-gcc` + `3dsxtool`)
 
