@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(psx3ds LANGUAGES C ASM)
+project(psx3ds VERSION 0.2.6 LANGUAGES C ASM)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/options.cmake")
 

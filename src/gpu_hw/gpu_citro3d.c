@@ -1659,7 +1659,12 @@ static void hw_present(void *self, const GpuDisplay *d) {
     }
 
     if (!st->in_frame) {
-        begin_frame(st, C3D_FRAME_SYNCDRAW);
+        /*
+         * v0.2.6: no C3D_FRAME_SYNCDRAW here. Only frames with zero draws (e.g. the odd
+         * frame of a 30 Hz VSync(2) game) reach this path; syncing them stalled an extra
+         * VBlank (30-80 FPS jitter). Frame pacing is done by main_3ds.c's 60 Hz pacer.
+         */
+        begin_frame(st, 0);
     }
 
     C3D_RenderTargetClear(st->top_rt, C3D_CLEAR_COLOR, 0x000000FFu, 0u);

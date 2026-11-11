@@ -265,6 +265,31 @@ void ctr_ui_init(CtrUiState *ui) {
     ctr_ui_set_status(ui, "Select a PS1 disc or PS-EXE to boot");
 }
 
+void ctr_ui_reset_frame_stats(CtrUiState *ui) {
+    if (!ui) {
+        return;
+    }
+    memset(ui->frame_us_ring, 0, sizeof(ui->frame_us_ring));
+    memset(ui->cpu_us_ring, 0, sizeof(ui->cpu_us_ring));
+    memset(ui->gpu_us_ring, 0, sizeof(ui->gpu_us_ring));
+    ui->frame_ring_pos = 0u;
+    ui->frame_ring_count = 0u;
+}
+
+void ctr_ui_record_frame_time(CtrUiState *ui, u32 paced_us, u32 cpu_us, u32 gpu_us) {
+    if (!ui) {
+        return;
+    }
+    u32 pos = ui->frame_ring_pos % CTR_UI_FRAME_RING;
+    ui->frame_us_ring[pos] = paced_us;
+    ui->cpu_us_ring[pos] = cpu_us;
+    ui->gpu_us_ring[pos] = gpu_us;
+    ui->frame_ring_pos = (u8)((pos + 1u) % CTR_UI_FRAME_RING);
+    if (ui->frame_ring_count < CTR_UI_FRAME_RING) {
+        ui->frame_ring_count++;
+    }
+}
+
 void ctr_ui_set_status(CtrUiState *ui, const char *msg) {
     if (!ui || !msg) {
         return;
@@ -579,6 +604,30 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
         double ms_frame = (double)us_frame / 1000.0;
         double ms_cpu = sys ? ((double)sys->stats.us_cpu / 1000.0) : 0.0;
         double ms_gpu = sys ? ((double)sys->stats.us_gpu / 1000.0) : 0.0;
+        if (sys && ui->frame_ring_count > 0u) {
+            /*
+             * v0.2.6: rolling average of the last <= 32 PACED frames, so the heavy even and
+             * empty odd frames of 30 Hz VSync(2) games are weighted equally.
+             */
+            u64 sum_f = 0u, sum_c = 0u, sum_g = 0u;
+            u32 n = ui->frame_ring_count;
+            for (u32 i = 0u; i < n; i++) {
+                sum_f += ui->frame_us_ring[i];
+                sum_c += ui->cpu_us_ring[i];
+                sum_g += ui->gpu_us_ring[i];
+            }
+            ms_frame = (double)sum_f / (double)n / 1000.0;
+            ms_cpu = (double)sum_c / (double)n / 1000.0;
+            ms_gpu = (double)sum_g / (double)n / 1000.0;
+            fps = sum_f > 0u ? (1000000.0 * (double)n / (double)sum_f) : 0.0;
+            /* Sleep wake-up jitter must never read as 60.2 FPS under the 60 Hz lock */
+            if (fps >= 60.0) {
+                fps = 60.0;
+                if (ms_frame < 16.67) {
+                    ms_frame = 16.67;
+                }
+            }
+        }
 
         u64 tc_total = sys ? ((u64)sys->stats.gpu_tex_hits + (u64)sys->stats.gpu_tex_uploads) : 0ULL;
         double tc_pct = tc_total ? (100.0 * (double)sys->stats.gpu_tex_hits / (double)tc_total) : 100.0;

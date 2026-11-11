@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.5`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.6`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.5-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.6-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.5-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.6-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -277,6 +277,23 @@ The emulator creates the `psx3ds/` directories on first launch.
 > buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
 > every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
 > offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
+
+> [!NOTE]
+> **`v0.2.6` fixes (real New 3DS: no sound, 30–80 FPS jitter):**
+> - **Audio on real hardware:** the Core 1 (SysCore) SPU worker ran at `main_prio + 1` (`0x31`),
+>   below the `0x30` APT SysCore quota thread, and was starved (or silently fell back to Core 0,
+>   where `main()` never yields) while the HUD still said `ASYNC`. It now runs at `main_prio - 1`
+>   (`0x2F`) with a Core 1 priority ladder and a sleeping-worker-safe Core 0 fallback; the HUD only
+>   shows `ASYNC` when the worker really is on Core 1. Core 0 also pumps the (trylock-guarded) NDSP
+>   feeder once per frame as a backstop.
+> - **NDSP feeder:** 4 x 735-frame wavebufs (66.7 ms), refilled in strict FIFO order and only with a
+>   full buffer of real samples — partial buffers are no longer padded with flat DC (which locked
+>   NDSP into tens of ms of silence). A gentle (≤ 1.1%) resample keeps latency bounded under the
+>   60.00 Hz lock.
+> - **Steady 60 FPS:** a drift-free 60.00 Hz (PAL 50.00 Hz) wall-clock pacer with a 2-frame catch-up
+>   window replaces the uncapped loop, and empty odd frames of 30 Hz `VSync(2)` games no longer wait
+>   an extra VBlank in `C3D_FRAME_SYNCDRAW`. The HUD shows a 32-frame rolling average (even and odd
+>   frames weighted equally) and redraws every 15th frame (odd divisor).
 
 > [!NOTE]
 > **`v0.2.5` fixes (Winning Eleven 3 ~20 FPS and texture glitches on real New 3DS):**

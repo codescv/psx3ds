@@ -365,6 +365,129 @@ static int test_spu_voices_reverb_xa_async(void) {
     return 0;
 }
 
+/*
+ * v0.2.6: queue `batches` SPU_CMD_REG_ADVANCE(32) commands on "Core 0" and drain them the
+ * way the 3DS NDSP feeder does (spu_render_queued_async in 64-frame chunks).
+ */
+static u32 run_async_batches(u32 batches) {
+    u32 rendered = 0u;
+    for (u32 b = 0u; b < batches; b++) {
+        spu_event_cb(&g_sys, 0u);
+        if ((b & 7u) == 7u) {
+            u32 n;
+            while ((n = spu_render_queued_async(&g_sys, 64u)) != 0u) {
+                rendered += n;
+            }
+        }
+    }
+    u32 n;
+    while ((n = spu_render_queued_async(&g_sys, 64u)) != 0u) {
+        rendered += n;
+    }
+    return rendered;
+}
+
+static void start_dc_voice(void) {
+    const u32 v0 = PSX_REG_SPU_BASE;
+    /* One self-looping block (Loop Start | Loop End | Repeat), constant +6 << 11 */
+    write_adpcm_block(g_sys.spu.ram, 0x2000u, 0x01u, 0x07u, 0x66u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_L, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_R, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPUCNT, 0xC000u, 2u);
+    spu_mmio_write(&g_sys, v0 + 0x00u, 0x3FFFu, 2u); /* vol L */
+    spu_mmio_write(&g_sys, v0 + 0x02u, 0x3FFFu, 2u); /* vol R */
+    spu_mmio_write(&g_sys, v0 + 0x04u, 0x1000u, 2u); /* pitch 1.0 */
+    spu_mmio_write(&g_sys, v0 + 0x06u, 0x0400u, 2u); /* start 0x2000 */
+    spu_mmio_write(&g_sys, v0 + 0x08u, 0x000Fu, 2u); /* ADSR1: fastest attack */
+    spu_mmio_write(&g_sys, v0 + 0x0Au, 0x0000u, 2u); /* ADSR2: hold sustain */
+    spu_mmio_write(&g_sys, PSX_REG_SPU_KON_LO, 0x0001u, 2u);
+}
+
+static u8 g_state_buf[1536u * 1024u];
+
+static int test_spu_async_savestate_and_ring(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async  = false; /* the savestate comes from a sync (host CLI) system */
+    g_sys.cfg.spu_reverb = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init SPU state");
+    spu_init(&g_sys);
+    CHECK_TRUE(!g_sys.spu.async_mode, "sync SPU before save");
+    start_dc_voice();
+    spu_render_batch(&g_sys, 64u);
+    g_sys.spu.out_r = g_sys.spu.out_w;
+
+    StateIO st;
+    memset(&st, 0, sizeof(st));
+    st.writing = true;
+    st.buf     = g_state_buf;
+    st.cap     = (u32)sizeof(g_state_buf);
+    spu_state(&g_sys, &st);
+    CHECK_TRUE(!st.error && st.pos > 0u, "spu_state save (async_mode = false)");
+    u32 saved_len = st.pos;
+
+    /* 3DS system: cfg.spu_async = true; load the sync savestate into it */
+    g_sys.cfg.spu_async = true;
+    spu_reset(&g_sys);
+    CHECK_TRUE(g_sys.spu.async_mode, "3DS config runs async SPU");
+    memset(&st, 0, sizeof(st));
+    st.writing = false;
+    st.buf     = g_state_buf;
+    st.cap     = saved_len;
+    spu_state(&g_sys, &st);
+    CHECK_TRUE(!st.error, "spu_state load");
+    CHECK_TRUE(g_sys.spu.async_mode, "savestate load keeps async_mode = cfg.spu_async (true)");
+    CHECK_TRUE(!g_sys.spu.irq_enabled, "IRQ9 off -> SpuCmd queue path");
+    CHECK_TRUE(g_sys.spu.out_w == g_sys.spu.out_r, "out_ring empty after load");
+
+    /* Loaded voice keeps playing through queued SpuCmd batches (4 NDSP buffers' worth) */
+    const u32 batches = (735u * 4u + 31u) / 32u;
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "no backlog after load");
+    u32 rendered = run_async_batches(batches);
+    CHECK_TRUE(rendered == batches * 32u, "spu_render_queued_async rendered every queued frame");
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "SpuCmd ring fully drained");
+    u32 queued = g_sys.spu.out_w - g_sys.spu.out_r;
+    CHECK_TRUE(queued == rendered, "out_ring holds every rendered frame (no drops)");
+
+    /* Contiguous non-zero stereo: once the voice is audible, no silent gaps */
+    u32 first_nz = queued;
+    u32 nonzero  = 0u;
+    s32 max_abs  = 0;
+    for (u32 i = 0u; i < queued; i++) {
+        u32 idx = (g_sys.spu.out_r + i) & (g_sys.spu.out_cap - 1u);
+        s32 l = g_sys.spu.out_ring[idx * 2u + 0u];
+        s32 r = g_sys.spu.out_ring[idx * 2u + 1u];
+        if (l != 0 || r != 0) {
+            if (first_nz == queued) {
+                first_nz = i;
+            }
+            nonzero++;
+        } else if (first_nz != queued) {
+            fprintf(stderr, "FAIL: silent frame %u after audio started at %u\n", (unsigned)i,
+                    (unsigned)first_nz);
+            return 1;
+        }
+        if (l < 0) l = -l;
+        if (r < 0) r = -r;
+        if (l > max_abs) max_abs = l;
+        if (r > max_abs) max_abs = r;
+    }
+    CHECK_TRUE(first_nz < 32u, "voice audible within the first batch");
+    CHECK_TRUE(nonzero + first_nz == queued, "contiguous non-zero stereo samples");
+    CHECK_TRUE(max_abs > 1000, "loud async output after savestate load");
+
+    /* Consumer drains (NDSP feeder) and producer keeps going: still contiguous, no drops */
+    g_sys.spu.out_r = g_sys.spu.out_w;
+    u32 before = g_sys.spu.out_w;
+    rendered = run_async_batches(64u);
+    CHECK_TRUE(g_sys.spu.out_w - before == 64u * 32u && rendered == 64u * 32u,
+               "second async run rendered 2048 contiguous frames");
+
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     if (test_adpcm_decoder() != 0) {
         return 1;
@@ -373,6 +496,9 @@ int main(void) {
         return 1;
     }
     if (test_spu_voices_reverb_xa_async() != 0) {
+        return 1;
+    }
+    if (test_spu_async_savestate_and_ring() != 0) {
         return 1;
     }
     printf("test_periph_spu PASS (arch_armv6k=%d)\n", PSX3DS_ARCH_ARMV6K);

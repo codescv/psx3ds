@@ -1,5 +1,5 @@
 # =============================================================================
-# PSX3DS v0.2.5 — Nintendo 3DS Universal CIA / CCI ROM Spec File (RSF)
+# PSX3DS v0.2.6 — Nintendo 3DS Universal CIA / CCI ROM Spec File (RSF)
 # Compatible with BOTH Old 3DS (64 MB / 268 MHz) and New 3DS (124 MB / 804 MHz)
 # Unlocks hardware W^X dual-mapped RW+RX JIT (`SVC 0x70`), Core 1 SPU, Core 2
 # CD-ROM/CHD async prefetch, and New 3DS C-Stick + ZL/ZR (`ir:rst` / `qtm:s`).
@@ -16,7 +16,7 @@ TitleInfo:
   Category                : Application
   UniqueId                : 0xf853d
   # TitleID low-byte variation = 0x00 -> Program ID 000400000F853D00
-  # (CIA TMD semantic version v0.2.5 is encoded via makerom -major 0 -minor 2 -micro 5)
+  # (CIA TMD semantic version v0.2.6 is encoded via makerom -major 0 -minor 2 -micro 6)
   Version                 : 0
 
 Option:

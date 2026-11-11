@@ -42,6 +42,8 @@ typedef enum CtrUiAction {
 #define CTR_BIOS_MODE_AUTO 0u /* external SD BIOS if found, else built-in OpenBIOS */
 #define CTR_BIOS_MODE_HLE  1u /* BIOS-less HLE kernel (direct boot) */
 
+#define CTR_UI_FRAME_RING  32u
+
 typedef struct CtrUiState {
     u8   active_tab;      /* CTR_UI_TAB_*: 0 ROMS, 1 HUD, 2 CTRL, 3 LOG */
     u8   bios_mode;       /* CTR_BIOS_MODE_* */
@@ -60,6 +62,12 @@ typedef struct CtrUiState {
     u16  touch_extra_buttons; /* active-high L2/R2/L3/R3 touch pads for Old 3DS */
     bool game_loaded;
     char pending_boot_path[256];
+    /* v0.2.6: rolling 32-frame paced frame-time window for the HUD (even + odd frames) */
+    u32  frame_us_ring[CTR_UI_FRAME_RING];
+    u32  cpu_us_ring[CTR_UI_FRAME_RING];
+    u32  gpu_us_ring[CTR_UI_FRAME_RING];
+    u8   frame_ring_pos;
+    u8   frame_ring_count;
 } CtrUiState;
 
 /* jit_mem_3ds.c */
@@ -95,6 +103,8 @@ void ctr_log_tty_putc(char c); /* line-buffers guest TTY as "[tty] ..." lines */
 void        ctr_ui_init(CtrUiState *ui);
 void        ctr_ui_scan_roms(CtrUiState *ui);
 void        ctr_ui_set_status(CtrUiState *ui, const char *msg);
+void        ctr_ui_reset_frame_stats(CtrUiState *ui);
+void        ctr_ui_record_frame_time(CtrUiState *ui, u32 paced_us, u32 cpu_us, u32 gpu_us);
 CtrUiAction ctr_ui_update(CtrUiState *ui, PsxSystem *sys, const CtrHwInfo *hw,
                           u32 keys_down, u32 keys_held, const touchPosition *touch);
 void        ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *hw);

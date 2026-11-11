@@ -368,6 +368,7 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         plat_input_poll(sys->pads, &hkeys);
 
         psx_run_frame(sys);
+        ctr_audio_step_core1(sys); /* Core 0 NDSP backstop (no-op if Core 1 kept up) */
         psx_stats_accumulate(&accum, &sys->stats);
         frames_ran++;
 
@@ -439,6 +440,58 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     return 0;
 }
 
+/*
+ * v0.2.6 drift-free wall-clock frame pacer: 60.00 Hz NTSC (50,000 us per 3 frames =
+ * 16667 + 16667 + 16666 us) / 50.00 Hz PAL (20,000 us). A frame that overruns its slot may
+ * be caught up by up to 2 frames (33,334 us), so a 30 Hz VSync(2) game whose heavy even
+ * frame takes ~22 ms and empty odd frame ~6 ms still completes each pair in exactly
+ * 33.33 ms; beyond that (CD seek, HOME Menu, long stall) the deadline is re-based instead
+ * of fast-forwarding.
+ */
+typedef struct CtrFramePacer {
+    u64 deadline_us;  /* 0 = re-arm on the next frame */
+    u64 last_end_us;
+    u32 step;
+} CtrFramePacer;
+
+#define CTR_PACE_CATCHUP_US 33334ULL
+
+static void pacer_reset(CtrFramePacer *p) {
+    p->deadline_us = 0ULL;
+    p->last_end_us = 0ULL;
+    p->step = 0u;
+}
+
+/* Sleeps until this frame's deadline; returns the paced wall time of the frame (us) */
+static u32 pacer_wait(CtrFramePacer *p, bool pal) {
+    u64 step_us;
+    if (pal) {
+        step_us = 20000ULL;
+    } else {
+        step_us = (p->step % 3u == 2u) ? 16666ULL : 16667ULL;
+    }
+    p->step++;
+    u64 now_us = plat_time_us();
+    if (p->deadline_us == 0ULL) {
+        p->deadline_us = now_us;
+        p->last_end_us = now_us - step_us;
+    }
+    p->deadline_us += step_us;
+    if (now_us < p->deadline_us) {
+        u64 sleep_us = p->deadline_us - now_us;
+        if (sleep_us > CTR_PACE_CATCHUP_US) {
+            sleep_us = CTR_PACE_CATCHUP_US; /* clock anomaly guard */
+        }
+        plat_sleep_us((u32)sleep_us);
+        now_us = plat_time_us();
+    } else if (now_us > p->deadline_us + CTR_PACE_CATCHUP_US) {
+        p->deadline_us = now_us;
+    }
+    u64 paced = now_us - p->last_end_us;
+    p->last_end_us = now_us;
+    return (paced > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (u32)paced;
+}
+
 /* Save/load with Core 1 (SPU) and Core 2 (CD readahead) workers quiesced */
 static PsxResult state_io_quiesced(PsxSystem *sys, CtrHwInfo *hw, const char *path, bool save) {
     ctr_threads_stop_workers(sys, hw);
@@ -501,6 +554,7 @@ static PsxResult boot_game_into_system(PsxSystem *sys, CtrUiState *ui, CtrHwInfo
     ctr_threads_start_workers(sys, hw);
     ui->game_loaded = true;
     ui->active_tab = 1u;
+    ctr_ui_reset_frame_stats(ui);
     return PSX_OK;
 }
 
@@ -556,6 +610,8 @@ int main(int argc, char **argv) {
              ui->bios_badge, ui->bios_path, (unsigned)ui->rom_count);
     char current_game[256] = { 0 };
     u32 ui_frame_div = 0u;
+    CtrFramePacer pacer;
+    pacer_reset(&pacer);
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -585,6 +641,7 @@ int main(int argc, char **argv) {
                                       ? "CD Boot mode only used with OpenBIOS/SD BIOS"
                                       : "CD Boot mode applies on next boot/reset");
         } else if (act == CTR_UI_BOOT_PATH) {
+            pacer_reset(&pacer);
             snprintf(current_game, sizeof(current_game), "%s", ui->pending_boot_path);
             PsxResult brc = boot_game_into_system(sys, ui, &hw, current_game);
             if (brc == PSX_OK) {
@@ -624,6 +681,7 @@ int main(int argc, char **argv) {
                     ctr_ui_set_status(ui, sys->cfg.spu_reverb ? "SPU Reverb ON" : "SPU Reverb OFF");
                     break;
                 case CTR_UI_SAVE_STATE:
+                    pacer_reset(&pacer);
                     format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
                     if (state_io_quiesced(sys, &hw, st_path, true) == PSX_OK) {
                         ctr_ui_set_status(ui, "Saved state to SD card");
@@ -632,6 +690,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case CTR_UI_LOAD_STATE:
+                    pacer_reset(&pacer);
                     format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
                     if (state_io_quiesced(sys, &hw, st_path, false) == PSX_OK) {
                         ctr_ui_set_status(ui, "Loaded state from SD card");
@@ -640,6 +699,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case CTR_UI_RESET_SYSTEM: {
+                    pacer_reset(&pacer);
                     PsxResult rrc = boot_game_into_system(sys, ui, &hw, current_game);
                     if (rrc == PSX_OK) {
                         ctr_ui_set_status(ui, "System reset");
@@ -663,18 +723,30 @@ int main(int argc, char **argv) {
                 format_savestate_path(st_path, sizeof(st_path), current_game, ui->state_slot);
                 (void)state_io_quiesced(sys, &hw, st_path, true);
                 ctr_ui_set_status(ui, "Quick-saved state (L+R+X)");
+                pacer_reset(&pacer);
             }
             psx_run_frame(sys);
+            /* Core 0 NDSP backstop: < 1 us when Core 1 kept up, else feeds NDSP itself */
+            ctr_audio_step_core1(sys);
             /*
-             * v0.2.5: the bottom-screen UI is software-rendered on the ARM11 (~1-2 ms per
-             * redraw on real hardware). While idle during gameplay redraw it only every 16th
-             * frame (~3.75 Hz); any new button press or touch redraws it immediately.
+             * The bottom-screen UI is software-rendered on the ARM11 (~1-2 ms per redraw on
+             * real hardware). While idle during gameplay redraw it every 15th frame (4 Hz);
+             * any new button press or touch redraws it immediately. v0.2.6: 15 is ODD so the
+             * redraw alternates the even/odd frame parity of 30 Hz VSync(2) games. Drawn
+             * before the pacer so its cost is absorbed by the frame's sleep.
              */
             bool ui_input = (kdown != 0u) || ((kheld & KEY_TOUCH) != 0u);
-            if (ui_input || (ui_frame_div++ & 15u) == 0u) {
+            if (++ui_frame_div >= 15u) {
+                ui_frame_div = 0u;
+                ui_input = true;
+            }
+            if (ui_input) {
                 ctr_ui_render(ui, sys, &hw);
             }
+            u32 paced_us = pacer_wait(&pacer, sys->gpu.disp.pal != 0u);
+            ctr_ui_record_frame_time(ui, paced_us, sys->stats.us_cpu, sys->stats.us_gpu);
         } else {
+            pacer_reset(&pacer);
             ctr_ui_render(ui, ui->game_loaded ? sys : NULL, &hw);
             gspWaitForVBlank();
         }

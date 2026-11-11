@@ -106,17 +106,40 @@ PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int pri
         target_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
     }
 
+    s32 below_main = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
+    s32 above_main = (main_prio < 0x3F) ? (main_prio + 1) : 0x3F;
+
     int chosen_core = core;
     Thread t = threadCreate(fn, arg, stack, target_prio, chosen_core, false);
+    if (!t && chosen_core == 1) {
+        /*
+         * v0.2.6: SysCore (Core 1) priority ladder. The APT SysCore quota thread runs at
+         * 0x30 on Core 1, so prefer main_prio - 1 (0x2F); only if the kernel rejects that
+         * retry main_prio (0x30) and finally main_prio + 1 (0x31), staying on Core 1.
+         */
+        if (target_prio != main_prio) {
+            t = threadCreate(fn, arg, stack, main_prio, 1, false);
+        }
+        if (!t && target_prio != above_main) {
+            t = threadCreate(fn, arg, stack, above_main, 1, false);
+        }
+    }
     if (!t && chosen_core == 2) {
         /* Fallback from N3DS Core 2 to Core 1 (O3DS or restricted affinity) */
         chosen_core = 1;
-        s32 retry_prio = (main_prio < 0x3E) ? (main_prio + 1) : 0x3F;
-        t = threadCreate(fn, arg, stack, retry_prio, chosen_core, false);
+        t = threadCreate(fn, arg, stack, above_main, chosen_core, false);
     }
     if (!t && chosen_core != -2) {
+        /*
+         * Core 0 fallback just ABOVE the main thread (0x2F): main() on Core 0 never yields,
+         * so a worker at main_prio would never run. Our workers sleep between steps, so a
+         * slightly higher priority only lets them wake briefly when their timer fires.
+         */
         chosen_core = -2;
-        t = threadCreate(fn, arg, stack, main_prio, chosen_core, false);
+        t = threadCreate(fn, arg, stack, below_main, chosen_core, false);
+        if (!t) {
+            t = threadCreate(fn, arg, stack, main_prio, chosen_core, false);
+        }
     }
     if (!t) {
         return NULL;
@@ -204,13 +227,16 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
 
     if (hw->syscore_pct > 0u) {
         /*
-         * Core 1 is SysCore, shared with the Home Menu / APT / GSP / DSP handlers: run the
-         * SPU worker cooperatively BELOW the main thread (higher number = lower priority)
-         * so it can never starve system transitions such as HOME -> Close.
+         * Core 1 is SysCore, shared with the Home Menu / APT / GSP / DSP handlers.
+         * v0.2.6: run the SPU worker at main_prio - 1 (0x2F). At main_prio + 1 (0x31,
+         * v0.2.4/v0.2.5) it sat below the 0x30 SysCore quota thread and was starved (or
+         * fell back to Core 0, where main() never yields) -> no audio on real hardware.
+         * The worker sleeps 500 us per step and parks 10 ms on APT suspend, so 0x2F never
+         * blocks HOME Menu transitions. Core 0 also pumps NDSP every frame as a backstop.
          */
-        s32 spu_prio = (main_prio < 0x3E) ? (main_prio + 1) : 0x3F;
+        s32 spu_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
         g_spu_worker = plat_thread_create(spu_core1_worker, sys, 32768u, spu_prio, 1);
-        hw->spu_core1_active = (g_spu_worker != NULL);
+        hw->spu_core1_active = (g_spu_worker != NULL && g_spu_worker->actual_core == 1);
     }
 
     int target_cd_core = hw->is_n3ds ? 2 : 1;
@@ -224,8 +250,9 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
         hw->cd_core2_active = false;
     }
 
-    plat_log("[threads_3ds] workers started: spu_core1=%d cd_core=%d\n",
-             (int)hw->spu_core1_active, hw->cd_worker_core);
+    plat_log("[threads_3ds] workers started: spu_core1=%d spu_core=%d cd_core=%d\n",
+             (int)hw->spu_core1_active, g_spu_worker ? g_spu_worker->actual_core : -1,
+             hw->cd_worker_core);
 }
 
 void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw) {
