@@ -156,9 +156,14 @@ void spu_xa_decode_sector(PsxSystem *sys, const u8 sector_2352[2352], const u8 v
         s32 prv_r = g_xa_prev_lr[1];
 
         while (g_xa_phase < 44100u) {
-            s32 frac_num = (s32)g_xa_phase;
-            s32 l = prv_l + ((cur_l - prv_l) * frac_num) / (s32)44100;
-            s32 r = prv_r + ((cur_r - prv_r) * frac_num) / (s32)44100;
+            /*
+             * v0.2.8: Q14 fraction phase/44100 via exact reciprocal multiply (UMULL) —
+             * floor((p << 14) / 44100) == (p * 1595663134) >> 32 for all 0 <= p < 44100 —
+             * instead of two software __aeabi_idiv calls per output sample on ARM11.
+             */
+            s32 frac14 = (s32)(((u64)(u32)g_xa_phase * 1595663134ULL) >> 32);
+            s32 l = prv_l + (((cur_l - prv_l) * frac14) >> 14);
+            s32 r = prv_r + (((cur_r - prv_r) * frac14) >> 14);
             xa_apply_cd_vol(l, r, vol, &out_batch[batch_n * 2u + 0u], &out_batch[batch_n * 2u + 1u]);
             batch_n++;
             if (batch_n == 512u) {

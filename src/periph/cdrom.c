@@ -53,6 +53,85 @@ static u32 cd_sector_period(const PsxCdrom *cd) {
     return cd->double_speed ? PSX_CD_SECTOR_CYCLES_2X : PSX_CD_SECTOR_CYCLES_1X;
 }
 
+/* Sector period of the active stream: data reads honour Setmode speed, CD-DA plays at 1x */
+static u32 cd_stream_period(const PsxCdrom *cd) {
+    return cd->reading ? cd_sector_period(cd) : PSX_CD_SECTOR_CYCLES_1X;
+}
+
+static void cd_sector_clock_stop(PsxCdrom *cd) {
+    if (cd->img) {
+        cd->img->sector_clock_armed = false;
+        cd->img->next_sector_cycle  = 0u;
+    }
+}
+
+/* Play / ReadN / ReadS: first sector is due one period after the INT3 acknowledge */
+static void cd_sector_clock_start(PsxSystem *sys) {
+    PsxCdrom *cd = &sys->cdrom;
+    if (cd->img) {
+        cd->img->next_sector_cycle  = sched_now(sys) + PSX_CD_ACK_CYCLES + cd_stream_period(cd);
+        cd->img->sector_clock_armed = true;
+    }
+}
+
+/*
+ * v0.2.8: a sector was just read at `due` (= now - late_cycles): advance the phase-locked
+ * clock by exactly one period. Re-sync if it is more than one period ahead (fired early)
+ * or more than one period behind (long stall, e.g. INT1 left unacknowledged).
+ */
+static void cd_sector_clock_advance(PsxSystem *sys, u32 late_cycles) {
+    PsxCdrom *cd = &sys->cdrom;
+    if (!cd->img) {
+        return;
+    }
+    u32 period = cd_stream_period(cd);
+    u32 now    = sched_now(sys);
+    if (!cd->img->sector_clock_armed) {
+        cd->img->next_sector_cycle  = now - late_cycles + period;
+        cd->img->sector_clock_armed = true;
+        return;
+    }
+    cd->img->next_sector_cycle += period;
+    s32 ahead = (s32)(cd->img->next_sector_cycle - now);
+    if (ahead > (s32)period || ahead + (s32)period < 0) {
+        cd->img->next_sector_cycle = now + period;
+    }
+}
+
+/*
+ * v0.2.8: schedule EV_CDROM for the next sector of the active stream at its phase-locked
+ * due time (never later than one period from now, never sooner than 256 cycles). Called
+ * when INT1 is delivered AND again when the guest acknowledges it, so the guest's
+ * acknowledge latency no longer adds to every sector period (which starved xa_ring every
+ * 8 sectors in v0.2.7: ~2,490 SPU samples consumed per 2,352 XA samples produced).
+ */
+static void cd_schedule_next_sector(PsxSystem *sys) {
+    PsxCdrom *cd = &sys->cdrom;
+    if (!cd->reading && !cd->playing) {
+        return;
+    }
+    u32 period = cd_stream_period(cd);
+    u32 delay  = period;
+    if (cd->img) {
+        u32 now = sched_now(sys);
+        if (cd->img->sector_clock_armed) {
+            s32 rem = (s32)(cd->img->next_sector_cycle - now);
+            if (rem <= 0) {
+                delay = 256u;
+            } else {
+                delay = ((u32)rem > period) ? period : (u32)rem;
+            }
+        } else {
+            cd->img->next_sector_cycle  = now + period;
+            cd->img->sector_clock_armed = true;
+        }
+    }
+    if (delay < 256u) {
+        delay = 256u;
+    }
+    sched_schedule(sys, EV_CDROM, delay);
+}
+
 static void cd_load_data_fifo(PsxCdrom *cd) {
     bool whole = (cd->mode & 0x20u) != 0u;
     u32  off   = whole ? 12u : ((cd->sector[15] == 0x01u) ? 16u : 24u);
@@ -209,6 +288,7 @@ static void cd_exec_command(PsxSystem *sys, u8 cmd) {
         cd->playing       = true;
         cd->paused        = false;
         cdrom_ra_seek(sys, cd->cur_lba);
+        cd_sector_clock_start(sys);
         cd_queue_int_1b(sys, CD_INT3_ACK, cd_make_stat(cd), PSX_CD_ACK_CYCLES);
         break;
     }
@@ -250,6 +330,7 @@ static void cd_exec_command(PsxSystem *sys, u8 cmd) {
         cd->reading       = true;
         cd->playing       = false;
         cd->paused        = false;
+        cd_sector_clock_start(sys);
         cd_queue_int_1b(sys, CD_INT3_ACK, cd_make_stat(cd), PSX_CD_ACK_CYCLES);
         break;
     }
@@ -610,10 +691,14 @@ static void cd_exec_command(PsxSystem *sys, u8 cmd) {
         break;
     }
     }
+
+    /* Standby / Stop / Pause / Init / SetSession / SeekL / SeekP: stream clock stops */
+    if (!cd->reading && !cd->playing) {
+        cd_sector_clock_stop(cd);
+    }
 }
 
 void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
-    (void)late_cycles;
     PsxCdrom *cd = &sys->cdrom;
 
     /* Never overwrite an unacknowledged interrupt; re-poll after ack delay */
@@ -683,6 +768,7 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
         }
         cd->cur_lba = read_lba + 1u;
         cd->sectors_read++;
+        cd_sector_clock_advance(sys, late_cycles);
 
         bool xa_en       = (cd->mode & 0x40u) != 0u;
         bool is_mode2    = (cd->sector[15] == 0x02u);
@@ -702,7 +788,7 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
                 cd_deliver_int_now(sys, CD_INT4_DATAEND, &st, 1u);
                 return;
             }
-            sched_schedule(sys, EV_CDROM, cd_sector_period(cd));
+            cd_schedule_next_sector(sys);
             return;
         }
 
@@ -719,6 +805,7 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
 
         u8 st = cd_make_stat(cd);
         cd_deliver_int_now(sys, CD_INT1_DATARDY, &st, 1u);
+        cd_schedule_next_sector(sys); /* phase-locked: not re-armed only on guest ack */
         return;
     }
 
@@ -736,6 +823,7 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
             spu_cdda_push_sector(sys, cd->sector, cd->vol);
         }
         cd->cur_lba = play_lba + 1u;
+        cd_sector_clock_advance(sys, late_cycles);
 
         if ((cd->mode & 0x02u) != 0u) {
             const CdTrack *tc = cd_image_find_track(cd->img, play_lba);
@@ -771,10 +859,11 @@ void cdrom_event_cb(PsxSystem *sys, u32 late_cycles) {
             rep[6] = 0x00u;
             rep[7] = 0x00u;
             cd_deliver_int_now(sys, CD_INT1_DATARDY, rep, 8u);
+            cd_schedule_next_sector(sys);
             return;
         }
 
-        sched_schedule(sys, EV_CDROM, PSX_CD_SECTOR_CYCLES_1X);
+        cd_schedule_next_sector(sys);
     }
 }
 
@@ -910,10 +999,8 @@ void cdrom_mmio_write(PsxSystem *sys, u32 addr, u32 val, u32 width) {
                                 ? cd->img->pending_delay[0]
                                 : PSX_CD_ACK_CYCLES;
                     sched_schedule(sys, EV_CDROM, d);
-                } else if (cd->reading) {
-                    sched_schedule(sys, EV_CDROM, cd_sector_period(cd));
-                } else if (cd->playing) {
-                    sched_schedule(sys, EV_CDROM, PSX_CD_SECTOR_CYCLES_1X);
+                } else if (cd->reading || cd->playing) {
+                    cd_schedule_next_sector(sys);
                 }
             }
         }
@@ -1002,6 +1089,8 @@ void cdrom_reset(PsxSystem *sys) {
         memset(img->last_header, 0, sizeof(img->last_header));
         img->pending_delay[0] = 0u;
         img->pending_delay[1] = 0u;
+        img->next_sector_cycle  = 0u;
+        img->sector_clock_armed = false;
         cd->region            = img->region_char ? img->region_char : 'A';
     } else {
         cd->region = 'A';
@@ -1096,6 +1185,7 @@ void cdrom_state(PsxSystem *sys, StateIO *st) {
     }
 
     if (!st->writing) {
+        cd_sector_clock_stop(cd); /* re-armed from the next scheduled sector */
         cdrom_ra_seek(sys, cd->cur_lba);
     }
 }

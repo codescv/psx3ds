@@ -31,6 +31,9 @@ typedef struct SpuExt {
     u32 main_ticks_r;
     u32 noise_timer;
     u32 capture_pos;
+    /* v0.2.8: last CD-DA / XA frame, decayed (not snapped to 0) across xa_ring gaps */
+    s16 last_cd_l;
+    s16 last_cd_r;
 } SpuExt;
 
 #define SPU_EXT_OFFSET_HWORD 16u
@@ -647,22 +650,53 @@ static bool spu_cmd_push(PsxSystem *sys, u16 reg, u16 val) {
     return true;
 }
 
-/* Core 0: apply every queued register write (drops queued ADVANCE time) */
+static void spu_render_frames_core(PsxSystem *sys, u32 frames);
+
+/*
+ * Core 0: consume every queued command in issue order — register writes are applied and
+ * queued SPU_CMD_REG_ADVANCE emulated time is RENDERED into out_ring (v0.2.8: it used to
+ * be dropped, losing up to a whole frame of audio whenever a game enabled SPU IRQ9, DMA'd
+ * new samples or a savestate was taken). IRQ9 raised while rendering is latched and
+ * delivered after the lock is released.
+ */
 static void spu_drain_all_cmds(PsxSystem *sys) {
     PsxSpu *spu = &sys->spu;
     if (!spu->cmd_ring) {
         return;
     }
     spu_lock(spu);
+    u8 prev_defer = spu->defer_irq;
+    spu->defer_irq = 1u;
     u32 slot = 0u;
+    u32 rendered = 0u;
     while (spsc_begin_pop(&spu->cmd_head, &spu->cmd_tail, PSX_SPU_CMD_CAP, &slot)) {
         SpuCmd cmd = spu->cmd_ring[slot];
         spsc_commit_pop(&spu->cmd_tail);
-        if (cmd.reg < 0x400u) {
+        if (cmd.reg == SPU_CMD_REG_ADVANCE) {
+            if (cmd.val > 0u) {
+                spu_render_frames_core(sys, cmd.val);
+                rendered += cmd.val;
+            }
+        } else if (cmd.reg < 0x400u) {
             spu_apply_queued_reg16(sys, cmd.reg, cmd.val);
         }
     }
+    spu->defer_irq = prev_defer;
     spu_unlock(spu);
+    if (rendered > 0u) {
+        __atomic_fetch_add(&sys->stats.spu_batches, 1u, __ATOMIC_RELAXED);
+    }
+    if (prev_defer == 0u) {
+        spu_deliver_pending_irq(sys);
+    }
+}
+
+void spu_drain_all_cmds_sync(PsxSystem *sys) {
+    if (!sys || !sys->spu.async_mode || spu_cmd_backlog(sys) == 0u) {
+        return;
+    }
+    spu_drain_all_cmds(sys);
+    spu_deliver_pending_irq(sys);
 }
 
 /* Core 0: apply one register write immediately, serialized against Core 1 */
@@ -809,6 +843,13 @@ void spu_dma_write_words(PsxSystem *sys, const u32 *src, u32 n) {
     PsxSpu *spu = &sys->spu;
     if (!spu->ram || !src || n == 0u) {
         return;
+    }
+    /*
+     * v0.2.8: render queued ADVANCE time / KON / KOFF against the SPU RAM contents that
+     * existed when they were issued, before this DMA overwrites the sample data.
+     */
+    if (spu->async_mode && spu_cmd_backlog(sys) > 0u) {
+        spu_drain_all_cmds(sys);
     }
     spu_lock(spu);
     for (u32 i = 0u; i < n; i++) {
@@ -1031,13 +1072,24 @@ static void spu_render_frames_core(PsxSystem *sys, u32 frames) {
         }
 
         /* Pop one 44.1 kHz stereo frame from CD-DA / XA ring */
-        s16 cd_raw_l = 0, cd_raw_r = 0;
+        s16 cd_raw_l, cd_raw_r;
         if (xa_r != xa_w) {
             u32 xidx = xa_r & 4095u;
             cd_raw_l = spu->xa_ring[0][xidx];
             cd_raw_r = spu->xa_ring[1][xidx];
             xa_r++;
+        } else {
+            /*
+             * v0.2.8: brief xa_ring gap between XA/CD-DA sectors: decay the last frame
+             * toward 0 (~1.6% per sample) instead of a full-scale step to 0 (click).
+             * "/ 256" (shift + sign fixup, no division) truncates toward 0 so negative
+             * values decay all the way too (an arithmetic ">> 8" sticks at -1..-63).
+             */
+            cd_raw_l = (s16)(((s32)ext->last_cd_l * 252) / 256);
+            cd_raw_r = (s16)(((s32)ext->last_cd_r * 252) / 256);
         }
+        ext->last_cd_l = cd_raw_l;
+        ext->last_cd_r = cd_raw_r;
 
         if (cd_en) {
             s32 cd_vol_l = (s16)spu->regs[(0x1DB0u - 0x1C00u) >> 1];

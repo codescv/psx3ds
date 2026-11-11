@@ -51,13 +51,40 @@ PSX_INLINE s32 rev_mul(s32 a, s32 b) {
     return (s32)(((s64)a * (s64)b) >> 15);
 }
 
+/*
+ * v0.2.8: division-free ring wrap. reverb_pos < size_bytes and |rel_bytes| < 0x80000, so
+ * one add/subtract of size_bytes covers every normal case; the 64-bit "%" (software
+ * __aeabi_ldivmod on ARM11, 29x per 22.05 kHz tick = ~640k calls/s) only remains as a
+ * cold fallback for tiny work areas (mBASE near the end of SPU RAM).
+ */
 static u32 rev_calc_addr(const PsxSpu *spu, u32 base_byte, u32 size_bytes, s32 rel_bytes) {
-    s64 off = (s64)spu->reverb_pos + (s64)rel_bytes;
-    off %= (s64)size_bytes;
+    s32 off = (s32)spu->reverb_pos + rel_bytes;
     if (off < 0) {
-        off += (s64)size_bytes;
+        off += (s32)size_bytes;
+        if (PSX_UNLIKELY(off < 0)) {
+            off %= (s32)size_bytes;
+            if (off < 0) {
+                off += (s32)size_bytes;
+            }
+        }
+    } else if ((u32)off >= size_bytes) {
+        off -= (s32)size_bytes;
+        if (PSX_UNLIKELY((u32)off >= size_bytes)) {
+            off = (s32)((u32)off % size_bytes);
+        }
     }
     return (base_byte + (u32)off) & 0x7FFFEu;
+}
+
+PSX_INLINE u32 rev_next_pos(u32 pos, u32 size_bytes) {
+    u32 next_pos = pos + 2u;
+    if (next_pos >= size_bytes) {
+        next_pos -= size_bytes;
+        if (PSX_UNLIKELY(next_pos >= size_bytes)) {
+            next_pos %= size_bytes;
+        }
+    }
+    return next_pos;
 }
 
 static s32 rev_read16(PsxSystem *sys, u32 base_byte, u32 size_bytes, s32 rel_bytes) {
@@ -119,6 +146,22 @@ void spu_reverb_process(PsxSystem *sys, s32 in_l, s32 in_r, s32 *out_l, s32 *out
     u32 size_bytes = PSX_SPU_RAM_BYTES - base_byte;
     if (size_bytes < 8u) {
         size_bytes = 8u;
+    }
+
+    /*
+     * v0.2.8 fast path: reverb output muted (vLOUT = vROUT = 0), work-area writes disabled
+     * (SPUCNT.7) and SPU IRQ9 disabled (SPUCNT.6): the 28 RAM reads / 8 writes can have no
+     * audible or guest-visible effect, so only advance the work-area position.
+     */
+    if (vlout == 0 && vrout == 0 && (spu->spucnt & 0x00C0u) == 0u) {
+        spu->reverb_pos = rev_next_pos(spu->reverb_pos, size_bytes);
+        if (spu->reverb_buf) {
+            spu->reverb_buf[0] = 0;
+            spu->reverb_buf[1] = 0;
+        }
+        *out_l = 0;
+        *out_r = 0;
+        return;
     }
 
     const s32 *r = spu->reverb_regs;
@@ -215,7 +258,7 @@ void spu_reverb_process(PsxSystem *sys, s32 in_l, s32 in_r, s32 *out_l, s32 *out
     rev_write16(sys, base_byte, size_bytes, mRAPF2, (s16)rout);
     rout = rev_clamp16(rapf2_del + rev_mul(rout, vAPF2));
 
-    spu->reverb_pos = (spu->reverb_pos + 2u) % size_bytes;
+    spu->reverb_pos = rev_next_pos(spu->reverb_pos, size_bytes);
 
     if (spu->reverb_buf) {
         spu->reverb_buf[0] = (s16)lout;

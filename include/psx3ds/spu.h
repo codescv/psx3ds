@@ -64,6 +64,12 @@ void spu_render_batch(PsxSystem *sys, u32 frames);
 u32  spu_render_queued_async(PsxSystem *sys, u32 max_frames);
 /* Number of queued SpuCmd entries not yet consumed (any core). */
 u32  spu_cmd_backlog(const PsxSystem *sys);
+/*
+ * Core 0 (v0.2.8): synchronously render every queued SpuCmd (register writes AND
+ * SPU_CMD_REG_ADVANCE emulated time) into out_ring, blocking on the SPU render lock if
+ * Core 1 holds it, then deliver any latched IRQ9. No-op unless async_mode with backlog.
+ */
+void spu_drain_all_cmds_sync(PsxSystem *sys);
 void spu_push_xa(PsxSystem *sys, const s16 *stereo, u32 frames);
 
 void spu_dma_write_words(PsxSystem *sys, const u32 *src, u32 n);

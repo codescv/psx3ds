@@ -557,6 +557,123 @@ static int test_spu_async_readback_coherency(void) {
     return 0;
 }
 
+/* Queue `batches` x 32 frames of SPU_CMD_REG_ADVANCE without rendering (Core 0 only) */
+static void queue_async_batches(u32 batches) {
+    for (u32 b = 0u; b < batches; b++) {
+        spu_event_cb(&g_sys, 0u);
+    }
+}
+
+static int check_contiguous_audio(u32 from, u32 count, const char *what) {
+    for (u32 i = 0u; i < count; i++) {
+        u32 idx = (from + i) & (g_sys.spu.out_cap - 1u);
+        if (g_sys.spu.out_ring[idx * 2u + 0u] == 0 && g_sys.spu.out_ring[idx * 2u + 1u] == 0) {
+            fprintf(stderr, "FAIL: %s: silent frame %u of %u\n", what, (unsigned)i,
+                    (unsigned)count);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * v0.2.8: spu_drain_all_cmds() must RENDER queued SPU_CMD_REG_ADVANCE time (it used to drop
+ * up to a whole frame) — when a game enables SPU IRQ9 (SPUCNT 0x8040), when SPU DMA is about
+ * to overwrite sample RAM, and via spu_drain_all_cmds_sync() from the 3DS NDSP pump.
+ */
+static int test_spu_drain_renders_queued_advance(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async  = true;
+    g_sys.cfg.spu_reverb = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init SPU drain");
+    spu_init(&g_sys);
+    CHECK_TRUE(g_sys.spu.async_mode && !g_sys.spu.irq_enabled, "async SPSC SPU path");
+    start_dc_voice();
+    (void)run_async_batches(8u);
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "voice setup drained");
+    g_sys.spu.out_r = g_sys.spu.out_w;
+
+    /* 1. One NTSC frame (23 x 32 = 736 frames) queued, then the NDSP pump's sync drain */
+    queue_async_batches(23u);
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 23u, "736 frames of ADVANCE queued");
+    u32 before = g_sys.spu.out_w;
+    spu_drain_all_cmds_sync(&g_sys);
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "spu_drain_all_cmds_sync drained cmd_ring");
+    CHECK_TRUE(g_sys.spu.out_w - before == 736u, "sync drain rendered all 736 queued frames");
+    CHECK_TRUE(check_contiguous_audio(before, 736u, "sync drain") == 0, "sync drain audio");
+    g_sys.spu.out_r = g_sys.spu.out_w;
+
+    /* 2. SPU DMA write renders queued time against the pre-DMA SPU RAM first */
+    queue_async_batches(10u);
+    g_sys.spu.xfer_addr = 0x40000u; /* far away from the voice's block at 0x2000 */
+    u32 words[16];
+    memset(words, 0, sizeof(words));
+    before = g_sys.spu.out_w;
+    spu_dma_write_words(&g_sys, words, 16u);
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "DMA write drained cmd_ring first");
+    CHECK_TRUE(g_sys.spu.out_w - before == 320u, "DMA write rendered the 320 queued frames");
+    CHECK_TRUE(check_contiguous_audio(before, 320u, "pre-DMA drain") == 0, "pre-DMA audio");
+    g_sys.spu.out_r = g_sys.spu.out_w;
+
+    /* 3. SPUCNT |= IRQ9 enable (0x8040) in async mode: queued ADVANCE rendered, not dropped */
+    queue_async_batches(23u);
+    before = g_sys.spu.out_w;
+    spu_mmio_write(&g_sys, PSX_REG_SPUCNT, 0xC040u, 2u);
+    CHECK_TRUE(g_sys.spu.irq_enabled, "SPUCNT 0x8040 -> sample-exact IRQ9 mode");
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "IRQ9 switch drained cmd_ring");
+    CHECK_TRUE(g_sys.spu.out_w - before == 736u,
+               "IRQ9 switch rendered all 736 queued frames (zero dropped samples)");
+    CHECK_TRUE(check_contiguous_audio(before, 736u, "IRQ9 switch") == 0, "IRQ9 switch audio");
+
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
+/* v0.2.8: an xa_ring gap between CD sectors decays the last CD sample instead of a step to 0 */
+static int test_spu_xa_gap_decay(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async  = false;
+    g_sys.cfg.spu_reverb = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init XA gap");
+    spu_init(&g_sys);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_L, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_R, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, 0x1F801DB0u, 0x7FFFu, 2u); /* CD volume L */
+    spu_mmio_write(&g_sys, 0x1F801DB2u, 0x7FFFu, 2u); /* CD volume R */
+    spu_mmio_write(&g_sys, PSX_REG_SPUCNT, 0xC001u, 2u); /* SPU on, unmuted, CD audio on */
+    spu_render_batch(&g_sys, 8u);
+    g_sys.spu.out_r = g_sys.spu.out_w;
+
+    s16 xa[8 * 2];
+    for (u32 i = 0u; i < 16u; i++) {
+        xa[i] = (i & 1u) ? (s16)-20000 : (s16)20000;
+    }
+    spu_push_xa(&g_sys, xa, 8u);
+    u32 base = g_sys.spu.out_w;
+    spu_render_batch(&g_sys, 8u + 512u);
+    s32 prev_l = g_sys.spu.out_ring[((base + 7u) & (g_sys.spu.out_cap - 1u)) * 2u + 0u];
+    s32 prev_r = g_sys.spu.out_ring[((base + 7u) & (g_sys.spu.out_cap - 1u)) * 2u + 1u];
+    CHECK_TRUE(prev_l > 8000 && prev_r < -8000, "XA frames audible");
+    for (u32 i = 8u; i < 8u + 512u; i++) {
+        u32 idx = (base + i) & (g_sys.spu.out_cap - 1u);
+        s32 l = g_sys.spu.out_ring[idx * 2u + 0u];
+        s32 r = g_sys.spu.out_ring[idx * 2u + 1u];
+        CHECK_TRUE(l >= 0 && l <= prev_l && r <= 0 && r >= prev_r, "monotonic decay toward 0");
+        CHECK_TRUE(prev_l - l <= prev_l / 32 + 2 && r - prev_r <= -prev_r / 32 + 2,
+                   "no step to 0 across the xa_ring gap");
+        prev_l = l;
+        prev_r = r;
+    }
+    CHECK_TRUE(prev_l == 0 && prev_r == 0, "gap decays fully to 0 (both signs)");
+
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     if (test_adpcm_decoder() != 0) {
         return 1;
@@ -571,6 +688,12 @@ int main(void) {
         return 1;
     }
     if (test_spu_async_readback_coherency() != 0) {
+        return 1;
+    }
+    if (test_spu_drain_renders_queued_advance() != 0) {
+        return 1;
+    }
+    if (test_spu_xa_gap_decay() != 0) {
         return 1;
     }
     printf("test_periph_spu PASS (arch_armv6k=%d)\n", PSX3DS_ARCH_ARMV6K);

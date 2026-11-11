@@ -194,6 +194,14 @@ struct CdImage {
     bool        bfrd;
     u8          last_header[8];
     u32         pending_delay[2];
+    /*
+     * v0.2.8 phase-locked sector clock: emulated cycle (wrap-safe psx_tick_t) at which the
+     * next data / XA / CD-DA sector is due while reading or playing. Advanced by exactly
+     * one sector period per sector, so a late guest INT1 acknowledge never stretches the
+     * stream. sector_clock_armed == false means "not running" (tick 0 is a valid time).
+     */
+    u32         next_sector_cycle;
+    bool        sector_clock_armed;
     alignas(32) u32 ra_prod_lba;
     alignas(32) u8  io_lock;
 };

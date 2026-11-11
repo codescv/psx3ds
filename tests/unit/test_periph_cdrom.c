@@ -526,6 +526,119 @@ static int test_cdrom_scex_counters(void) {
     return 0;
 }
 
+/* Jump emulated time to `t` (no CPU slice active) */
+static void cd_set_time(psx_tick_t t) {
+    g_sys.sched.slice_start = t;
+    g_sys.cpu.slice_len     = 0;
+    g_sys.cpu.cycles_left   = 0;
+}
+
+/* Fire the pending EV_CDROM event at its exact due time; returns false if none is armed */
+static bool cd_fire_next_event(void) {
+    if ((g_sys.sched.active_mask & (1u << (u32)EV_CDROM)) == 0u) {
+        return false;
+    }
+    psx_tick_t when = g_sys.sched.when_by_id[EV_CDROM];
+    cd_set_time(when);
+    sched_cancel(&g_sys, EV_CDROM);
+    cdrom_event_cb(&g_sys, 0u);
+    return true;
+}
+
+/*
+ * v0.2.8 phase-locked sector clock: ReadS at 2x with XA enabled streams 7 data sectors
+ * (LBA 3..9, INT1 each) + 1 XA 37.8 kHz stereo sector (LBA 10). The guest acknowledges
+ * every INT1 20,000 cycles late; the 8 sector slots must still take exactly
+ * 8 * PSX_CD_SECTOR_CYCLES_2X = 1,806,336 cycles (v0.2.7: + 7 * ~20,000 cumulative drift,
+ * so the 2,352 XA samples per 8 sectors no longer covered the SPU's consumption).
+ */
+static int test_cdrom_sector_clock_no_ack_drift(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init sector clock");
+    spu_init(&g_sys);
+    cdrom_init(&g_sys);
+    cd_write_idx(1u);
+    cdrom_mmio_write(&g_sys, PSX_REG_CDROM_REG2, 0x1Fu, 1u);
+    CHECK_TRUE(cdrom_load(&g_sys, TEST_CUE_PATH) == PSX_OK, "cdrom_load (sector clock)");
+
+    u8 resp[16];
+    cd_push_param(1u);
+    cd_push_param(2u);
+    cd_send_cmd(0x0Du); /* Setfilter(file 1, channel 2) */
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+
+    cd_push_param(0xC8u); /* 2x speed + XA-ADPCM enable + XA filter */
+    cd_send_cmd(0x0Eu);
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+
+    cd_push_param(0x00u);
+    cd_push_param(0x02u);
+    cd_push_param(0x03u); /* 00:02:03 = LBA 3 */
+    cd_send_cmd(0x02u);
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    sched_cancel(&g_sys, EV_CDROM);
+
+    const psx_tick_t t_start   = 0xFFF00000u; /* crosses the u32 tick wrap mid-stream */
+    const u32        ack_delay = 20000u;
+    cd_set_time(t_start);
+    cd_send_cmd(0x1Bu); /* ReadS */
+    CHECK_TRUE(cd_fire_next_event(), "ReadS INT3 scheduled");
+    CHECK_TRUE(cd_irq_flag() == 3u, "ReadS -> INT3");
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    CHECK_TRUE(g_sys.cdrom.reading, "ReadS streaming");
+
+    psx_tick_t sector_time[10];
+    u32        n_sectors = 0u;
+    u32        n_int1    = 0u;
+    u32        xa_before = g_sys.spu.xa_w;
+    for (u32 guard = 0u; guard < 64u && n_sectors < 9u; guard++) {
+        u32 lba_before = g_sys.cdrom.cur_lba;
+        CHECK_TRUE(cd_fire_next_event(), "next sector event armed");
+        if (g_sys.cdrom.cur_lba != lba_before) {
+            sector_time[n_sectors++] = sched_now(&g_sys);
+        }
+        if (cd_irq_flag() == 1u) {
+            n_int1++;
+            /* Guest IRQ handler acknowledges INT1 20,000 cycles later */
+            cd_set_time(sched_now(&g_sys) + ack_delay);
+            (void)cd_drain_resp(resp, 16u);
+            cd_ack_irq(0x07u);
+        }
+    }
+    CHECK_TRUE(n_sectors == 9u, "streamed 9 sector slots");
+    CHECK_TRUE(n_int1 >= 7u, "7 data sectors delivered INT1");
+    CHECK_TRUE(g_sys.cdrom.cur_lba == 12u, "LBA 3..11 read");
+    CHECK_TRUE(g_sys.spu.xa_w > xa_before, "XA sector (LBA 10) decoded into xa_ring");
+    for (u32 i = 1u; i < n_sectors; i++) {
+        if ((u32)(sector_time[i] - sector_time[i - 1u]) != PSX_CD_SECTOR_CYCLES_2X) {
+            fprintf(stderr, "FAIL: sector %u -> %u took %u cycles (expected %u)\n",
+                    (unsigned)(i - 1u), (unsigned)i,
+                    (unsigned)(sector_time[i] - sector_time[i - 1u]),
+                    (unsigned)PSX_CD_SECTOR_CYCLES_2X);
+            return 1;
+        }
+    }
+    CHECK_TRUE((u32)(sector_time[8] - sector_time[0]) == 8u * PSX_CD_SECTOR_CYCLES_2X,
+               "8 sectors (7 data + 1 XA) take exactly 1,806,336 cycles despite late INT1 acks");
+    CHECK_TRUE((u32)(sector_time[0] - t_start) ==
+                   PSX_CD_ACK_CYCLES + PSX_CD_SECTOR_CYCLES_2X,
+               "first sector due one 2x period after the ReadS INT3");
+
+    cdrom_shutdown(&g_sys);
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     cleanup_temp_files();
     if (build_test_disc_images() != 0) {
@@ -541,6 +654,10 @@ int main(void) {
         return 1;
     }
     if (test_cdrom_scex_counters() != 0) {
+        cleanup_temp_files();
+        return 1;
+    }
+    if (test_cdrom_sector_clock_no_ack_drift() != 0) {
         cleanup_temp_files();
         return 1;
     }

@@ -475,7 +475,7 @@ static void pacer_reset(CtrFramePacer *p) {
 
 /*
  * Sleeps until this frame's deadline, in <= 4 ms slices with a Core 0 NDSP pump between
- * them, so the 66.7 ms wavebuf ring is topped up even during a 16.67 ms frame sleep.
+ * them, so the 133.3 ms wavebuf ring (v0.2.8) is topped up during a 16.67 ms frame sleep.
  * Returns the paced wall time of the frame (us).
  */
 static u32 pacer_wait(CtrFramePacer *p, PsxSystem *sys, bool pal) {

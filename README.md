@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.7`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.8`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.7-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.8-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.7-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.8-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -277,6 +277,24 @@ The emulator creates the `psx3ds/` directories on first launch.
 > buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
 > every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
 > offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
+
+> [!NOTE]
+> **`v0.2.8` fixes (real New 3DS: smooth video but choppy sound, `画面流畅, 声音卡顿`):**
+> - **No more silence splices:** the Core 0 NDSP pump no longer pads a wavebuf with ~700 frames of
+>   fade-to-zero whenever only one wavebuf was still playing (KOF '97: ~8 holes/s). It submits full
+>   735-frame buffers only, synchronously drains queued SPU commands first (`spu_drain_all_cmds_sync`),
+>   uses an 8 x 735-frame (`133 ms`) ring with a 3-buffer (`50 ms`) prime, and re-primes only on a
+>   genuine hardware underrun.
+> - **Hardware rate matching:** the NDSP resampler runs at the paced PS1 rate (`44,228 Hz` NTSC at
+>   60.00 Hz, `44,312 Hz` PAL at 50.00 Hz) and is nudged ±0.3% to keep ~3 wavebufs queued.
+> - **Phase-locked CD-ROM sector clock:** the next sector is scheduled when `INT1` is delivered, not
+>   after the guest acknowledges it, so 8 sectors take exactly `8 x 225,792` cycles at 2x and XA
+>   streams (`2,352` samples per 8 sectors) no longer starve every ~53 ms; XA gaps decay instead of
+>   clicking to 0.
+> - **No dropped SPU time:** `spu_drain_all_cmds` renders queued `ADVANCE` frames (SPU IRQ enable,
+>   savestates) and runs before SPU DMA writes overwrite sample RAM.
+> - **ARM11 CPU savings:** division-free reverb ring addressing (~640k `__aeabi_ldivmod`/s removed),
+>   muted-reverb fast path, and a reciprocal-multiply XA resampler.
 
 > [!NOTE]
 > **`v0.2.7` fixes (real New 3DS: `libctru` NDSP stop-race & D-cache coherency; *Winning Eleven 4* anti-modchip lockout):**

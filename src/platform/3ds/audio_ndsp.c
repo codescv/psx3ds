@@ -5,7 +5,7 @@
 #include "plat_3ds_internal.h"
 
 /*
- * Nintendo 3DS NDSP Quad-Buffered 44.1 kHz Stereo PCM16 Audio Backend (v0.2.7)
+ * Nintendo 3DS NDSP 8-Buffer 44.1 kHz Stereo PCM16 Audio Backend (v0.2.8)
  *
  *  Core 1 (spu_core1_worker) -> ctr_audio_render_core1():
  *      renders ONLY Core-0-queued emulated time (spu_render_queued_async) into the PsxSpu
@@ -25,18 +25,40 @@
  *  Sync SPU: Core 0 forwards out_ring via plat_audio_push() into a lock-free SPSC staging
  *  ring that Core 0 itself drains here.
  *  Degrades cleanly to silent audio if sdmc:/3ds/dspfirm.cdc is missing.
+ *
+ *  v0.2.8 smooth-audio pump:
+ *   - never splices silence into a wavebuf while NDSP is still playing (v0.2.7 padded
+ *     ~700 frames of fade-to-zero whenever only 1 wavebuf remained: ~8 holes/s);
+ *   - synchronously drains Core-0-queued SPU commands before checking availability, so a
+ *     Core 1 render-lock hold can no longer leave part of a frame unrendered;
+ *   - 8 x 735-frame ring, 3-wavebuf (50 ms) prime, re-prime only on a genuine underrun;
+ *   - the NDSP hardware resampler rate tracks the paced PS1 sample rate (60.00 Hz pacer x
+ *     737.13 frames = 44,228 Hz NTSC; 50.00 Hz x 886.23 = 44,312 Hz PAL) and is nudged
+ *     +-0.3% to keep ~3 wavebufs queued, instead of step-resampling or underrunning.
  */
 
 #define CTR_NDSP_CH             0
-#define CTR_NDSP_RATE           44100u
-#define CTR_NDSP_BUF_COUNT      4u /* 4 x 16.67 ms = 66.7 ms NDSP ring */
+#define CTR_NDSP_BUF_COUNT      8u /* 8 x 16.67 ms = 133.3 ms NDSP ring */
 #define CTR_NDSP_BUF_FRAMES     735u /* 44100 / 60 = 735 stereo frames (16.67 ms) */
-#define CTR_NDSP_PRIME_FRAMES   (CTR_NDSP_BUF_FRAMES * 2u) /* 33.3 ms before (re)start */
+#define CTR_NDSP_PRIME_FRAMES   (CTR_NDSP_BUF_FRAMES * 3u) /* 50.0 ms before (re)start */
+
+/*
+ * NDSP resampler rates (Hz). The host pacer runs NTSC frames (566,124 cycles = 737.13
+ * SPU frames) at 60.00 Hz and PAL frames (680,628 cycles = 886.23 SPU frames) at 50.00 Hz.
+ */
+#define CTR_NDSP_RATE_NTSC      44228.0f
+#define CTR_NDSP_RATE_NTSC_FAST 44360.0f
+#define CTR_NDSP_RATE_NTSC_SLOW 44100.0f
+#define CTR_NDSP_RATE_PAL       44312.0f
+#define CTR_NDSP_RATE_PAL_FAST  44440.0f
+#define CTR_NDSP_RATE_PAL_SLOW  44180.0f
+#define CTR_NDSP_QUEUE_HIGH     (CTR_NDSP_BUF_FRAMES * 4u) /* > 66.7 ms queued: speed up */
+#define CTR_NDSP_QUEUE_LOW      (CTR_NDSP_BUF_FRAMES * 2u) /* < 33.3 ms queued: slow down */
 #define CTR_NDSP_RING_FRAMES    8192u
 #define CTR_NDSP_RING_MASK      (CTR_NDSP_RING_FRAMES - 1u)
 
-/* NDSP stall watchdog: > 2x the whole 66.7 ms ring without wavebuf progress */
-#define CTR_NDSP_STALL_US       150000ULL
+/* NDSP stall watchdog: well past the whole 133.3 ms ring without wavebuf progress */
+#define CTR_NDSP_STALL_US       250000ULL
 #define CTR_NDSP_STOPPED_US     35000ULL
 
 /* Async rendering: keep ~4 NDSP buffers (~67 ms) of rendered audio queued */
@@ -46,12 +68,11 @@
 #define CTR_SPU_PRESSURE_CMDS   256u   /* render past the target if Core 0 queue backs up */
 
 /*
- * Drift control: the 60.00 Hz pacer runs the emulated ~59.8 Hz PS1 slightly fast (~0.3%
- * more samples than NDSP consumes). Above the high-water mark each wavebuf is filled from
- * 735 + 4..8 frames (linear resample, <= 1.1% / ~19 cents for one buffer) so latency stays
- * bounded instead of creeping into the command ring.
+ * Overflow safety net only (v0.2.8: rate matching is done by the NDSP resampler): above
+ * the high-water mark each wavebuf is filled from 735 + 4..8 frames (linear resample,
+ * <= 1.1% for one buffer) so latency stays bounded instead of creeping into cmd_ring.
  */
-#define CTR_SPU_HIGH_WATER      (CTR_SPU_TARGET_FRAMES + CTR_NDSP_BUF_FRAMES * 2u)
+#define CTR_SPU_HIGH_WATER      (CTR_NDSP_BUF_FRAMES * 6u) /* 100.0 ms */
 #define CTR_SPU_DRIFT_MAX       8u
 
 static bool        g_ndsp_ready = false;
@@ -66,6 +87,7 @@ static u64         g_last_wb_progress_us = 0ULL;
 static alignas(32) u32 g_render_lock = 0u; /* Core 1 render vs Core 0 fallback (trylock) */
 static alignas(32) u32 g_pump_lock = 0u;   /* re-entrancy guard for the Core 0 pump */
 static s16         g_stretch[(CTR_NDSP_BUF_FRAMES + CTR_SPU_DRIFT_MAX) * 2u];
+static float       g_ndsp_rate = CTR_NDSP_RATE_NTSC; /* last rate sent to ndspChnSetRate */
 
 /* Live diagnostics for the 2:HUD tab (written on Core 0, read on Core 0) */
 static u32  g_wb_submitted = 0u;
@@ -89,7 +111,8 @@ static void configure_ndsp_channel_locked(void) {
     ndspSetClippingMode(NDSP_CLIP_SOFT);
     ndspSetMasterVol(1.0f);
     ndspChnSetInterp(CTR_NDSP_CH, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(CTR_NDSP_CH, (float)CTR_NDSP_RATE);
+    g_ndsp_rate = CTR_NDSP_RATE_NTSC;
+    ndspChnSetRate(CTR_NDSP_CH, g_ndsp_rate);
     ndspChnSetFormat(CTR_NDSP_CH, NDSP_FORMAT_STEREO_PCM16);
     float mix[12];
     memset(mix, 0, sizeof(mix));
@@ -147,8 +170,9 @@ bool ctr_audio_init(PsxSystem *sys) {
     configure_ndsp_channel_locked();
 
     g_ndsp_ready = true;
-    plat_log("[audio_ndsp] initialized 44100Hz stereo PCM16 (%ux%u frames)\n",
-             (unsigned)CTR_NDSP_BUF_COUNT, (unsigned)CTR_NDSP_BUF_FRAMES);
+    plat_log("[audio_ndsp] initialized %uHz stereo PCM16 (%ux%u frames)\n",
+             (unsigned)CTR_NDSP_RATE_NTSC, (unsigned)CTR_NDSP_BUF_COUNT,
+             (unsigned)CTR_NDSP_BUF_FRAMES);
     return true;
 }
 
@@ -312,12 +336,54 @@ static void reset_wavebufs_for_restart(void) {
     ndspChnSetPaused(CTR_NDSP_CH, false);
 }
 
+/*
+ * Frames queued in NDSP (submitted, not yet played) + frames ready in the SPU rings.
+ * ndspChnGetSamplePos() is the play position inside the wavebuf currently playing.
+ */
+static u32 total_queued_frames(PsxSystem *sys, u32 active_wbufs) {
+    u32 q = active_wbufs * CTR_NDSP_BUF_FRAMES;
+    if (active_wbufs > 0u) {
+        u32 pos = ndspChnGetSamplePos(CTR_NDSP_CH);
+        q -= (pos < CTR_NDSP_BUF_FRAMES) ? pos : CTR_NDSP_BUF_FRAMES;
+    }
+    return q + queued_frames_for(sys);
+}
+
+/*
+ * v0.2.8 rate matching: steer the TeakLite DSP resampler around the paced PS1 sample rate
+ * so ~3 wavebufs stay queued (no pitch steps, no overruns, no underruns). Only issues
+ * ndspChnSetRate when the target changes.
+ */
+static void update_ndsp_rate(PsxSystem *sys, u32 queued) {
+    if (!sys) {
+        return;
+    }
+    bool  pal  = (sys->gpu.disp.pal != 0u); /* the same flag pacer_wait() paces by */
+    float rate = pal ? CTR_NDSP_RATE_PAL : CTR_NDSP_RATE_NTSC;
+    if (queued > CTR_NDSP_QUEUE_HIGH) {
+        rate = pal ? CTR_NDSP_RATE_PAL_FAST : CTR_NDSP_RATE_NTSC_FAST;
+    } else if (queued < CTR_NDSP_QUEUE_LOW) {
+        rate = pal ? CTR_NDSP_RATE_PAL_SLOW : CTR_NDSP_RATE_NTSC_SLOW;
+    }
+    if (rate != g_ndsp_rate) {
+        g_ndsp_rate = rate;
+        ndspChnSetRate(CTR_NDSP_CH, rate);
+    }
+}
+
 static void audio_pump_locked(PsxSystem *sys) {
-    /* Core 0 fallback render in case the Core 1 worker is throttled by the SysCore quota */
-    if (sys && sys->spu.async_mode && !sys->spu.irq_enabled &&
-        (queued_frames_for(sys) < CTR_NDSP_PRIME_FRAMES ||
-         spu_cmd_backlog(sys) >= CTR_SPU_PRESSURE_CMDS)) {
-        ctr_audio_render_core1(sys);
+    if (sys && sys->spu.async_mode && !sys->spu.irq_enabled && spu_cmd_backlog(sys) > 0u) {
+        if (queued_frames_for(sys) < CTR_NDSP_BUF_FRAMES * 2u) {
+            /*
+             * v0.2.8: render 100% of the audio Core 0 already emulated (blocking on the
+             * SPU lock if Core 1 is mid-chunk) before deciding whether a full wavebuf is
+             * available — a trylock miss used to leave part of the frame in cmd_ring.
+             */
+            spu_drain_all_cmds_sync(sys);
+        } else if (spu_cmd_backlog(sys) >= CTR_SPU_PRESSURE_CMDS) {
+            /* Core 0 fallback render in case Core 1 is throttled by the SysCore quota */
+            ctr_audio_render_core1(sys);
+        }
     }
 
     u64 now_us = plat_time_us();
@@ -330,10 +396,10 @@ static void audio_pump_locked(PsxSystem *sys) {
 
     if (active_wbufs == 0u) {
         /*
-         * NDSP fully drained. Count ONE underrun per active->drained transition, then
-         * re-prime with 2 full buffers (33.3 ms) before restarting. The channel is re-armed
-         * with ndspChnWaveBufClear() first, so libctru restarts the DSP channel instead of
-         * appending to a stopped one.
+         * Genuine hardware underrun: NDSP fully drained. Count ONE underrun per
+         * active->drained transition, then re-prime with 3 full buffers (50 ms) before
+         * restarting. The channel is re-armed with ndspChnWaveBufClear() first, so libctru
+         * restarts the DSP channel instead of appending to a stopped one.
          */
         if (g_stream_active) {
             g_stream_active = false;
@@ -370,53 +436,41 @@ static void audio_pump_locked(PsxSystem *sys) {
         }
     }
 
-    /* Refill wavebufs in strict FIFO order (Core 0 only) */
+    update_ndsp_rate(sys, total_queued_frames(sys, active_wbufs));
+
+    /*
+     * Refill wavebufs in strict FIFO order (Core 0 only), FULL buffers only. While at
+     * least one wavebuf is still playing there is no reason to pad: the next
+     * psx_run_frame() supplies ~737 more frames well before NDSP needs them.
+     */
     while (g_wbufs[g_wbuf_next].status == NDSP_WBUF_DONE ||
            g_wbufs[g_wbuf_next].status == NDSP_WBUF_FREE) {
         u32          avail = queued_frames_for(sys);
         ndspWaveBuf *wb    = &g_wbufs[g_wbuf_next];
         s16         *dst   = (s16 *)wb->data_vaddr;
         u32          got;
-        if (avail >= CTR_NDSP_BUF_FRAMES) {
-            if (avail >= CTR_SPU_HIGH_WATER + CTR_NDSP_BUF_FRAMES) {
-                u32 extra = (avail >= CTR_SPU_HIGH_WATER + CTR_NDSP_BUF_FRAMES * 3u)
-                                ? CTR_SPU_DRIFT_MAX
-                                : (CTR_SPU_DRIFT_MAX / 2u);
-                u32 n = pop_samples(sys, g_stretch, CTR_NDSP_BUF_FRAMES + extra);
-                got = resample_into(dst, CTR_NDSP_BUF_FRAMES, g_stretch, n);
-            } else {
-                got = pop_samples(sys, dst, CTR_NDSP_BUF_FRAMES);
-            }
-            if (got == 0u) {
-                break;
-            }
-            g_last_l = dst[(got - 1u) * 2u + 0u];
-            g_last_r = dst[(got - 1u) * 2u + 1u];
-        } else if (active_wbufs <= 1u) {
-            /*
-             * NDSP is down to its last buffer and would run dry (stopping the DSP channel):
-             * send what we have and fade the tail toward 0 instead of a hard DC step.
-             */
-            got = pop_samples(sys, dst, CTR_NDSP_BUF_FRAMES);
-            if (got > 0u) {
-                g_last_l = dst[(got - 1u) * 2u + 0u];
-                g_last_r = dst[(got - 1u) * 2u + 1u];
-            }
-            for (u32 i = got; i < CTR_NDSP_BUF_FRAMES; i++) {
-                g_last_l = (s16)(((s32)g_last_l * 252) >> 8);
-                g_last_r = (s16)(((s32)g_last_r * 252) >> 8);
-                dst[i * 2u + 0u] = g_last_l;
-                dst[i * 2u + 1u] = g_last_r;
-            }
-            got = CTR_NDSP_BUF_FRAMES;
-        } else {
-            break; /* >= 2 buffers still playing: wait for more samples, no padding */
+        if (avail < CTR_NDSP_BUF_FRAMES) {
+            break; /* wait for the next frame's samples — never splice silence */
         }
+        if (avail >= CTR_SPU_HIGH_WATER + CTR_NDSP_BUF_FRAMES) {
+            u32 extra = (avail >= CTR_SPU_HIGH_WATER + CTR_NDSP_BUF_FRAMES * 3u)
+                            ? CTR_SPU_DRIFT_MAX
+                            : (CTR_SPU_DRIFT_MAX / 2u);
+            u32 n = pop_samples(sys, g_stretch, CTR_NDSP_BUF_FRAMES + extra);
+            got = resample_into(dst, CTR_NDSP_BUF_FRAMES, g_stretch, n);
+        } else {
+            got = pop_samples(sys, dst, CTR_NDSP_BUF_FRAMES);
+        }
+        if (got == 0u) {
+            break;
+        }
+        g_last_l = dst[(got - 1u) * 2u + 0u];
+        g_last_r = dst[(got - 1u) * 2u + 1u];
 
         u32 buf_peak = 0u;
         for (u32 i = 0u; i < got * 2u; i++) {
-            s32 s = dst[i];
-            u32 a = (u32)(s < 0 ? -s : s);
+            s32 smp = dst[i];
+            u32 a = (u32)(smp < 0 ? -smp : smp);
             if (a > buf_peak) {
                 buf_peak = a;
             }
