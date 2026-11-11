@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.4-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.5-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.4-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.5-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
