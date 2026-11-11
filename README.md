@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.6`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.7`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.6-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.7-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.6-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.7-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -277,6 +277,22 @@ The emulator creates the `psx3ds/` directories on first launch.
 > buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
 > every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
 > offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
+
+> [!NOTE]
+> **`v0.2.7` fixes (real New 3DS: `libctru` NDSP stop-race & D-cache coherency; *Winning Eleven 4* anti-modchip lockout):**
+> - **Real-hardware NDSP audio:** `libctru`'s `ndspiReadChnState` retires the final wavebuf with
+>   `wavebuf_queued_count = 0` while leaving `chn->playing = 1`, so queuing silence buffers in the
+>   ROM menu (or draining during BIOS boot) caused later `ndspChnWaveBufAdd` calls without
+>   `ndspChnWaveBufClear` to stick in `NDSP_WBUF_PLAYING` on a stopped DSP channel forever. `v0.2.7`
+>   drops menu silence buffers, calls `ndspChnWaveBufClear` before every game boot and underrun/stall
+>   re-prime (`150 ms` / `35 ms` watchdog), splits Core 1 (`ctr_audio_render_core1` SPU-only) from
+>   Core 0 (exclusive wavebuf owner, pumped every `<= 4 ms` slice of `pacer_wait`, flushing Core 0's
+>   L1/L2 cache directly via Kernel11 `svcFlushProcessDataCache` instead of racing `dspHandle`),
+>   makes async SPU `ENDX`/voice readback coherent on Core 0, and adds live `WB:sub/act Pk:n`
+>   diagnostics on `2:HUD`.
+> - ***Winning Eleven 4* (`SLPM_862.91`) anti-modchip fix:** `CD-ROM Test 0x19 0x05`
+>   (`GetSCExCounters`) now returns `{ stat, 0x00, 0x00 }` outside the Lead-In (`cur_lba >= 150`) or
+>   while playing/reading, matching genuine PS1 hardware instead of tripping 1999+ modchip checks.
 
 > [!NOTE]
 > **`v0.2.6` fixes (real New 3DS: no sound, 30–80 FPS jitter):**
