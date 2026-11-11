@@ -406,27 +406,32 @@ static u32 timers_next_line_cycles(PsxSystem *sys) {
     return sum >> 16;
 }
 
+/*
+ * Standalone (GPU-less) GPUSTAT bit 31 approximation. When gpu_init() has hooked EV_HBLANK,
+ * gpu_refresh_scanline_bits() recomputes bits 13/31 right after this, so both must agree:
+ * bit 31 is 0 during VBlank, and in 480i (bit 22 interlace + bit 19 vres=480) it tracks
+ * the field parity (frame & 1) during active video, otherwise the scanline parity.
+ */
 static void timers_update_gpustat_line(PsxSystem *sys) {
-    bool interlace_480 = (sys->gpu.gpustat & (1u << 22)) != 0u;
-    if (sys->timers.in_vblank) {
-        if (interlace_480) {
-            if ((sys->gpu.frame & 1u) != 0u) sys->gpu.gpustat |= (1u << 31);
-            else sys->gpu.gpustat &= ~(1u << 31);
-        } else {
-            sys->gpu.gpustat &= ~(1u << 31);
-        }
-    } else {
-        u32 bit = interlace_480 ? (sys->gpu.frame & 1u) : (sys->timers.scanline & 1u);
-        if (bit != 0u) sys->gpu.gpustat |= (1u << 31);
-        else sys->gpu.gpustat &= ~(1u << 31);
+    u32 gs = sys->gpu.gpustat;
+    bool interlace_480 = ((gs & (1u << 22)) != 0u) && ((gs & (1u << 19)) != 0u);
+    u32 bit = 0u;
+    if (!sys->timers.in_vblank) {
+        bit = interlace_480 ? (sys->gpu.frame & 1u) : (sys->timers.scanline & 1u);
     }
+    if (bit != 0u) sys->gpu.gpustat |= (1u << 31);
+    else sys->gpu.gpustat &= ~(1u << 31);
 }
 
+/*
+ * Fallback EV_VBLANK handler when no GPU is attached. Frame statistics are counted once
+ * per psx_run_frame() (src/sys/system.c), never here, so a GPU chaining to this callback
+ * from gpu_on_vblank() does not double-count frames.
+ */
 static void timers_vblank_default_cb(PsxSystem *sys, u32 late_cycles) {
     (void)late_cycles;
     irq_raise(sys, PSX_IRQ_VBLANK);
     sys->frame_done = true;
-    sys->stats.frames++;
 }
 
 static void timers_hblank_cb(PsxSystem *sys, u32 late_cycles) {
@@ -478,15 +483,24 @@ static void timers_hblank_cb(PsxSystem *sys, u32 late_cycles) {
         sys->timers.scanline = 0u;
         if (sys->timers.in_vblank) {
             sys->timers.in_vblank = false;
-            sys->gpu.frame++;
             timer_on_blank_edge(sys, 1u, false, now);
         }
     } else if (sys->timers.scanline == vblank_line) {
         sys->timers.in_vblank = true;
         timer_on_blank_edge(sys, 1u, true, now);
-        if ((sys->sched.active_mask & (1u << EV_VBLANK)) == 0u &&
-            sys->sched.fn[EV_VBLANK] != NULL) {
-            sys->sched.fn[EV_VBLANK](sys, late_cycles);
+        PsxEventFn vb_fn = sys->sched.fn[EV_VBLANK];
+        /*
+         * The interlace field counter advances exactly once per frame at VBlank entry.
+         * When the GPU owns EV_VBLANK, gpu_on_vblank() does it (before raising IRQ0);
+         * only advance it here when no GPU handler is hooked. Advancing it both here and
+         * in gpu_on_vblank() kept (frame & 1) constant during active video, freezing
+         * GPUSTAT bit 31 in 480i and hanging Psy-Q VSync(0) forever.
+         */
+        if (vb_fn == NULL || vb_fn == timers_vblank_default_cb) {
+            sys->gpu.frame++;
+        }
+        if ((sys->sched.active_mask & (1u << EV_VBLANK)) == 0u && vb_fn != NULL) {
+            vb_fn(sys, late_cycles);
         }
     }
 

@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.3`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.4`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.3-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.4-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.3-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.4-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -277,6 +277,21 @@ The emulator creates the `psx3ds/` directories on first launch.
 > buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
 > every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
 > offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
+
+> [!NOTE]
+> **`v0.2.4` fixes (Winning Eleven 3 freeze after the logo, HOME -> Close hang):**
+> - **480i `VSync(0)` freeze:** `sys->gpu.frame` was advanced twice per frame (at VBlank entry in
+>   `gpu_on_vblank()` *and* at scanline 0 in `timers_hblank_cb()`), so in interlaced 480i mode the
+>   field parity never changed during active video and `GPUSTAT` bit 31 stayed `0`; Psy-Q `VSync(0)`
+>   spins until bit 31 toggles and hung forever. The field now advances exactly once per frame, and
+>   `GPUSTAT` bits 13/31 are latched before `IRQ0` (VBlank) is raised.
+> - **FMV `MDEC_in_sync timeout`:** Psy-Q arms `DecDCTout()` (DMA1, SyncMode 1) before
+>   `DecDCTin()` (DMA0). DMA1 is now paced by the MDEC Data-Out request: it stays armed until decoded
+>   words exist (MDEC wakes it), instead of draining zeros early and stranding a decoded slice.
+> - **HOME -> Close hang ("Closing software..."):** the citro3d backend submits any open frame on
+>   `APTHOOK_ONSUSPEND` and never calls `C3D_FrameSync()` / `C3D_FrameBegin()` unless
+>   `aptIsActive() && !aptShouldClose()`. The Core 1 (SysCore) SPU worker now runs below the main
+>   thread priority, and both worker threads idle (no NDSP/DSP/SDMC access) while suspended/asleep.
 
 ### Controls
 

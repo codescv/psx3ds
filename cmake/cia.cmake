@@ -1,6 +1,6 @@
 # =============================================================================
 # Nintendo 3DS Custom SMDH Icon, Home Menu Banner (.bnr), Installable .cia,
-# and Emulator-Bootable .cci Packaging Rules (PSX3DS v0.2.3)
+# and Emulator-Bootable .cci Packaging Rules (PSX3DS v0.2.4)
 #
 # Include in CMakeLists.txt right after ctr_create_3dsx(psx3ds ...):
 #   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/cia.cmake")
@@ -11,7 +11,7 @@ if(NINTENDO_3DS AND TARGET psx3ds)
 
     set(PSX3DS_CIA_VERSION_MAJOR 0)
     set(PSX3DS_CIA_VERSION_MINOR 2)
-    set(PSX3DS_CIA_VERSION_PATCH 3)
+    set(PSX3DS_CIA_VERSION_PATCH 4)
 
     set(PSX3DS_ASSETS_3DS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/3ds")
     set(PSX3DS_ICON_PNG       "${PSX3DS_ASSETS_3DS_DIR}/icon.png")
@@ -34,7 +34,7 @@ if(NINTENDO_3DS AND TARGET psx3ds)
             OUTPUT "${PSX3DS_CUSTOM_SMDH}"
             COMMAND "${CTR_SMDHTOOL_EXE}" --create
                     "PSX3DS"
-                    "PlayStation 1 Emulator for Nintendo 3DS (v0.2.3)"
+                    "PlayStation 1 Emulator for Nintendo 3DS (v0.2.4)"
                     "psx3ds"
                     "${PSX3DS_ICON_PNG}"
                     "${PSX3DS_CUSTOM_SMDH}"
@@ -108,7 +108,7 @@ if(NINTENDO_3DS AND TARGET psx3ds)
                         -minor "${PSX3DS_CIA_VERSION_MINOR}"
                         -micro "${PSX3DS_CIA_VERSION_PATCH}"
                 DEPENDS psx3ds "${PSX3DS_RSF_FILE}" "${PSX3DS_BNR_FILE}" ${_psx3ds_cia_smdh_dep}
-                COMMENT "Packaging Nintendo 3DS installable archive psx3ds.cia (v0.2.3)"
+                COMMENT "Packaging Nintendo 3DS installable archive psx3ds.cia (v0.2.4)"
                 VERBATIM
             )
 
@@ -125,7 +125,7 @@ if(NINTENDO_3DS AND TARGET psx3ds)
                         -icon "${_psx3ds_cia_icon_file}"
                         -banner "${PSX3DS_BNR_FILE}"
                 DEPENDS psx3ds "${PSX3DS_RSF_FILE}" "${PSX3DS_BNR_FILE}" ${_psx3ds_cia_smdh_dep}
-                COMMENT "Packaging Nintendo 3DS cartridge image psx3ds.cci (v0.2.3)"
+                COMMENT "Packaging Nintendo 3DS cartridge image psx3ds.cci (v0.2.4)"
                 VERBATIM
             )
 

@@ -344,11 +344,129 @@ static int test_mdec_macroblock_depths_and_dma(void) {
     return 0;
 }
 
+static void mdec_dma_advance(u32 cyc) {
+    PsxCpu *c = &g_sys.cpu;
+    u32 rem = cyc;
+    while (rem > 0u) {
+        u32 step = (rem > 1000u) ? 1000u : rem;
+        c->slice_len = (s32)step;
+        c->cycles_left = 0;
+        sched_run(&g_sys);
+        rem -= step;
+    }
+}
+
+/*
+ * v0.2.4 regression (Winning Eleven 3 FMV "MDEC_in_sync timeout"): Psy-Q arms
+ * DecDCTout() = DMA1 (MDEC-Out, SyncMode 1) BEFORE DecDCTin() = DMA0. DMA1 must stay armed
+ * until the MDEC has decoded output, instead of instantly draining zeros from an empty
+ * Data-Out FIFO and leaving a decoded slice stranded (Command Busy stuck at 1).
+ */
+static int test_mdec_dma1_armed_before_dma0(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.cycle_mult = 256u;
+    CHECK_TRUE(arena_init(&g_sys.arena, 20u * 1024u * 1024u) == PSX_OK, "arena_init MDEC+DMA");
+    sched_init(&g_sys.sched);
+    bus_init(&g_sys);
+    irq_init(&g_sys);
+    cpu_init(&g_sys);
+    dma_init(&g_sys);
+    mdec_init(&g_sys);
+    cpu_set_sr(&g_sys, 0u);
+    PsxCpu *c = &g_sys.cpu;
+
+    upload_tables(&g_sys);
+    psx_write32(c, PSX_REG_DPCR, PSX_DPCR_DEFAULT | 0x08888888u);
+
+    /* Bitstream: 2 x 15bpp macroblocks (12 words) padded with 0xFE00 to one 32-word block */
+    u16 mb_hw[64];
+    for (u32 i = 0u; i < 64u; i++) {
+        mb_hw[i] = 0xFE00u;
+    }
+    for (u32 b = 0u; b < 6u; b++) {
+        mb_hw[b * 2u + 0u] = pack_dc(8u, 0);
+        mb_hw[b * 2u + 1u] = 0xFE00u;
+    }
+    mb_hw[12] = pack_dc(8u, 64);
+    mb_hw[14] = pack_dc(8u, 0);
+    for (u32 b = 2u; b < 6u; b++) {
+        mb_hw[12u + b * 2u] = pack_dc(8u, 32);
+    }
+    u32 in_words[32];
+    memcpy(in_words, mb_hw, sizeof(in_words));
+    const u32 src_phys = 0x00010000u;
+    const u32 dst_phys = 0x00020000u;
+    bus_dma_write_words(&g_sys, src_phys, in_words, 32u);
+
+    static u32 sentinel[256];
+    for (u32 i = 0u; i < 256u; i++) {
+        sentinel[i] = 0xDEADBEEFu;
+    }
+    bus_dma_write_words(&g_sys, dst_phys, sentinel, 256u);
+
+    /* 1. DecDCTout first: DMA1 to RAM, SyncMode 1, 8 blocks x 32 words (2 MBs = 256 words) */
+    psx_write32(c, PSX_REG_DMA_MADR(PSX_DMA_CH_MDEC_OUT), dst_phys);
+    psx_write32(c, PSX_REG_DMA_BCR(PSX_DMA_CH_MDEC_OUT), (8u << 16) | 32u);
+    psx_write32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_OUT), 0x01000200u);
+    mdec_dma_advance(20000u);
+
+    CHECK_TRUE((psx_read32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_OUT)) & (1u << 24)) != 0u,
+               "DMA1 stays armed (busy) while MDEC Data-Out FIFO is empty");
+    CHECK_TRUE(psx_read32(c, PSX_REG_DMA_MADR(PSX_DMA_CH_MDEC_OUT)) == dst_phys,
+               "DMA1 MADR not advanced before DMA0 delivers input");
+    u32 probe[256];
+    bus_dma_read_words(&g_sys, dst_phys, probe, 256u);
+    for (u32 i = 0u; i < 256u; i++) {
+        CHECK_TRUE(probe[i] == 0xDEADBEEFu, "DMA1 wrote no zeros before MDEC output exists");
+    }
+
+    /* 2. DecDCTin second: MDEC cmd 1 (15bpp, bit15=1, 32 words) + DMA0 1 x 32-word block */
+    psx_write32(c, PSX_REG_MDEC_CMD, (1u << 29) | (3u << 27) | (1u << 25) | 32u);
+    psx_write32(c, PSX_REG_DMA_MADR(PSX_DMA_CH_MDEC_IN), src_phys);
+    psx_write32(c, PSX_REG_DMA_BCR(PSX_DMA_CH_MDEC_IN), (1u << 16) | 32u);
+    psx_write32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_IN), 0x01000201u);
+
+    for (u32 spin = 0u; spin < 200u; spin++) {
+        if ((psx_read32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_OUT)) & (1u << 24)) == 0u &&
+            (psx_read32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_IN)) & (1u << 24)) == 0u) {
+            break;
+        }
+        mdec_dma_advance(10000u);
+    }
+    CHECK_TRUE((psx_read32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_IN)) & (1u << 24)) == 0u,
+               "DMA0 (DecDCTin) completed");
+    CHECK_TRUE((psx_read32(c, PSX_REG_DMA_CHCR(PSX_DMA_CH_MDEC_OUT)) & (1u << 24)) == 0u,
+               "DMA1 (DecDCTout) completed once MDEC produced output");
+    CHECK_TRUE(psx_read32(c, PSX_REG_DMA_MADR(PSX_DMA_CH_MDEC_OUT)) == dst_phys + 256u * 4u,
+               "DMA1 MADR advanced by exactly 256 words");
+
+    bus_dma_read_words(&g_sys, dst_phys, probe, 256u);
+    for (u32 i = 0u; i < 128u; i++) {
+        CHECK_TRUE(probe[i] == 0xC210C210u, "slice word 0..127 = MB0 neutral gray (not zeros)");
+    }
+    u16 px_mb1 = (u16)(probe[128] & 0xFFFFu);
+    CHECK_TRUE((px_mb1 & 0x8000u) != 0u && (px_mb1 & 0x1Fu) > ((px_mb1 >> 5) & 0x1Fu),
+               "slice word 128 = MB1 red-shifted pixel");
+
+    u32 stat = psx_read32(c, PSX_REG_MDEC_STAT);
+    CHECK_TRUE((stat & (1u << 31)) != 0u, "MDEC Data-Out FIFO empty after DMA1 drained it");
+    CHECK_TRUE((stat & (1u << 29)) == 0u,
+               "MDEC Command Busy clear -> DecDCTinSync(0) cannot time out");
+
+    mdec_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     if (test_idct_exactness_and_armv6_parity() != 0) {
         return 1;
     }
     if (test_mdec_macroblock_depths_and_dma() != 0) {
+        return 1;
+    }
+    if (test_mdec_dma1_armed_before_dma0() != 0) {
         return 1;
     }
     printf("test_periph_mdec PASS (arch_armv6k=%d)\n", PSX3DS_ARCH_ARMV6K);

@@ -15,6 +15,43 @@ struct PlatThread {
 static PlatThread  *g_spu_worker = NULL;
 static PlatThread  *g_cd_worker = NULL;
 static volatile int g_workers_running = 0;
+/*
+ * Set while the app is suspended (HOME Menu / applet) or the console sleeps. Workers then
+ * idle without touching NDSP, the DSP data cache or SDMC, leaving Core 1 (SysCore) to the
+ * Home Menu / APT / GSP / DSP transition handlers.
+ */
+static volatile u32 g_workers_paused = 0u;
+static aptHookCookie g_threads_apt_cookie;
+static bool          g_threads_apt_hooked = false;
+
+/* May run on the main thread (suspend/restore) or the APT event thread (sleep/wakeup) */
+static void threads_apt_hook(APT_HookType hook, void *param) {
+    (void)param;
+    switch (hook) {
+        case APTHOOK_ONSUSPEND:
+        case APTHOOK_ONSLEEP:
+            __atomic_store_n(&g_workers_paused, 1u, __ATOMIC_RELEASE);
+            break;
+        case APTHOOK_ONRESTORE:
+        case APTHOOK_ONWAKEUP:
+            __atomic_store_n(&g_workers_paused, 0u, __ATOMIC_RELEASE);
+            break;
+        case APTHOOK_ONEXIT:
+            __atomic_store_n(&g_workers_paused, 1u, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_workers_running, 0, __ATOMIC_RELEASE);
+            break;
+        default:
+            break;
+    }
+}
+
+static bool workers_paused(void) {
+    if (__atomic_load_n(&g_workers_paused, __ATOMIC_ACQUIRE) != 0u) {
+        svcSleepThread(10000000LL); /* 10 ms */
+        return true;
+    }
+    return false;
+}
 
 void ctr_threads_init_hardware(CtrHwInfo *hw) {
     if (!hw) {
@@ -122,6 +159,9 @@ void plat_yield(void) {
 static void spu_core1_worker(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
     while (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) != 0) {
+        if (workers_paused()) {
+            continue;
+        }
         if (sys && !__atomic_load_n(&sys->quit, __ATOMIC_ACQUIRE)) {
             ctr_audio_step_core1(sys);
         }
@@ -136,6 +176,9 @@ static void spu_core1_worker(void *arg) {
 static void cd_core2_worker(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
     while (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) != 0) {
+        if (workers_paused()) {
+            continue;
+        }
         u32 n = 0u;
         if (sys && !__atomic_load_n(&sys->quit, __ATOMIC_ACQUIRE)) {
             n = cdrom_ra_pump(sys, 8u);
@@ -149,13 +192,23 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
     if (!sys || !hw) {
         return;
     }
+    __atomic_store_n(&g_workers_paused, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&g_workers_running, 1, __ATOMIC_RELEASE);
+    if (!g_threads_apt_hooked) {
+        aptHook(&g_threads_apt_cookie, threads_apt_hook, NULL);
+        g_threads_apt_hooked = true;
+    }
 
     s32 main_prio = 0x30;
     (void)svcGetThreadPriority(&main_prio, CUR_THREAD_HANDLE);
 
     if (hw->syscore_pct > 0u) {
-        s32 spu_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
+        /*
+         * Core 1 is SysCore, shared with the Home Menu / APT / GSP / DSP handlers: run the
+         * SPU worker cooperatively BELOW the main thread (higher number = lower priority)
+         * so it can never starve system transitions such as HOME -> Close.
+         */
+        s32 spu_prio = (main_prio < 0x3E) ? (main_prio + 1) : 0x3F;
         g_spu_worker = plat_thread_create(spu_core1_worker, sys, 32768u, spu_prio, 1);
         hw->spu_core1_active = (g_spu_worker != NULL);
     }
@@ -176,11 +229,20 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
 }
 
 void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw) {
+    if (g_threads_apt_hooked) {
+        aptUnhook(&g_threads_apt_cookie);
+        g_threads_apt_hooked = false;
+    }
     if (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE) == 0 &&
         !g_spu_worker && !g_cd_worker) {
         return;
     }
     (void)sys;
+    /*
+     * Drop the run flag only; a worker parked in its 10 ms suspend sleep re-checks it via
+     * `continue` and exits, without touching NDSP/SDMC while closing from the HOME Menu.
+     * The paused flag is reset by the next ctr_threads_start_workers().
+     */
     __atomic_store_n(&g_workers_running, 0, __ATOMIC_RELEASE);
     if (g_spu_worker) {
         plat_thread_join(g_spu_worker);

@@ -111,6 +111,8 @@ typedef struct GpuHwState {
 
     bool              in_frame;
     bool              on_vram_rt;
+    bool              apt_hooked;
+    aptHookCookie     apt_cookie;
     bool              vram_cleared_once;
     u32               skip_counter;
     u64               last_present_us;
@@ -1366,9 +1368,35 @@ static bool should_skip_display(GpuHwState *st) {
 
 static void log_batch_diagnostics(const GpuHwState *st);
 
+/*
+ * True while this application owns the GPU. After the user presses HOME (APT suspend)
+ * citro3d disables its VBlank/render-queue callbacks and GSP rights go to the Home Menu;
+ * if the user then picks "Close", APTHOOK_ONRESTORE never runs. Any C3D_FrameBegin
+ * (SYNCDRAW) / C3D_FrameSync() in that state blocks forever in gspWaitForAnyEvent(),
+ * hanging the console on "Closing software...".
+ */
+static bool hw_gpu_owned(void) {
+    return aptIsActive() && !aptShouldClose();
+}
+
+/* Drop the open frame's CPU-side batch state without touching the PICA200 */
+static void hw_abandon_frame(GpuHwState *st) {
+    st->in_frame = false;
+    st->on_vram_rt = false;
+    st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
+    st->ring_pos = 0u;
+    st->batch_first = 0u;
+    st->batch_count = 0u;
+    st->has_batch_key = false;
+}
+
 static void hw_present(void *self, const GpuDisplay *d) {
     GpuHwState *st = (GpuHwState *)self;
     if (!st) {
+        return;
+    }
+    if (!hw_gpu_owned()) {
+        hw_abandon_frame(st);
         return;
     }
     ++st->n_presents;
@@ -1529,18 +1557,51 @@ static void log_batch_diagnostics(const GpuHwState *st) {
              (int)st->texcache.allow_rgba8);
 }
 
+/*
+ * APT hook (runs on the main thread inside aptMainLoop(); registered after C3D_Init(), so
+ * libctru calls it BEFORE citro3d's own C3Di_AptEventHook). On HOME/suspend, submit any
+ * open frame while we still own the GPU, so citro3d's suspend handler drains it and its
+ * internal inFrame flag is clear. Otherwise a later "Close" from the HOME Menu would hit
+ * C3D_RenderTargetDelete()'s inFrame svcBreak or wait forever on an unowned GPU queue.
+ */
+static void hw_apt_hook(APT_HookType hook, void *param) {
+    GpuHwState *st = (GpuHwState *)param;
+    if (!st || hook != APTHOOK_ONSUSPEND) {
+        return;
+    }
+    if (st->in_frame) {
+        flush_batch(st);
+        C3D_FrameEnd(0);
+        st->in_frame = false;
+        st->on_vram_rt = false;
+    }
+}
+
 static void hw_destroy(void *self) {
     GpuHwState *st = (GpuHwState *)self;
     if (!st) {
         return;
     }
-    log_batch_diagnostics(st);
-    if (st->in_frame) {
-        flush_batch(st);
-        C3D_FrameEnd(0);
-        st->in_frame = false;
+    if (st->apt_hooked) {
+        aptUnhook(&st->apt_cookie);
+        st->apt_hooked = false;
     }
-    C3D_FrameSync();
+    log_batch_diagnostics(st);
+    if (hw_gpu_owned()) {
+        if (st->in_frame) {
+            flush_batch(st);
+            C3D_FrameEnd(0);
+            st->in_frame = false;
+        }
+        C3D_FrameSync();
+    } else {
+        /*
+         * Closing from the HOME Menu: GPU rights/VBlank callbacks are gone, so never wait
+         * on the PICA200 here (C3D_FrameSync would deadlock). C3D_Fini() in main() tears
+         * down the render queue; we only free our own CPU/linear resources below.
+         */
+        hw_abandon_frame(st);
+    }
 
     gpu_texcache_shutdown(&st->texcache);
 
@@ -1709,6 +1770,9 @@ PsxResult gpu_hw_backend_create(PsxSystem *sys, const GpuBackend **be, void **se
     if (sys != NULL && sys->gpu.vram != NULL) {
         mark_cpu_dirty(st, 0u, 0u, GPU_HW_VRAM_W, GPU_HW_VRAM_H);
     }
+
+    aptHook(&st->apt_cookie, hw_apt_hook, st);
+    st->apt_hooked = true;
 
     *be = &k_gpu_hw_backend;
     *self = st;

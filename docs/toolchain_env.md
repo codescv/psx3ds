@@ -273,6 +273,12 @@ static inline void ctr_jit_flush(CtrJitBuffer *jb, void *rw_start, size_t bytes)
 > - `jit_enter` saves the host `SP` in `PsxCpu.jit_saved_sp` (`PSX_OFF_JIT_SP = 0x270`) and `jit_exit`, `jit_exit_step_one`, `jit_exit_with_reason` and `jit_raise_exception_exit` reload it before `pop {r4-r12, pc}`.
 > - SD scanning (`v0.2.3`): ROMs only from `sdmc:/psx3ds/roms`, `sdmc:/roms/psx`, `sdmc:/psx`; external BIOS only from `sdmc:/psx3ds/bios`, `sdmc:/bios` and those ROM folders. The SD root is never walked.
 
+> **HOME Menu suspend / Close & SysCore etiquette (`v0.2.4`, real New 3DS hang on "Closing software..."):**
+> - On HOME, citro3d's `APTHOOK_ONSUSPEND` handler drains the GX queue and disables its VBlank callbacks, and GSP rights go to the Home Menu. If the user picks **Close**, `APTHOOK_ONRESTORE` never runs, so any later `C3D_FrameSync()` / `C3D_FrameBegin(C3D_FRAME_SYNCDRAW)` waits forever in `gspWaitForAnyEvent()`.
+> - libctru `aptHook()` inserts at the list head, so a hook registered after `C3D_Init()` runs *before* citro3d's. `src/gpu_hw/gpu_citro3d.c` uses that to `C3D_FrameEnd(0)` any open frame on `APTHOOK_ONSUSPEND` (citro3d then drains it while the GPU is still owned; `C3D_RenderTargetDelete()` would otherwise `svcBreak` on a dangling `inFrame`).
+> - `hw_present()` / `hw_destroy()` only touch the PICA200 (`C3D_FrameBegin/End/Sync`) when `aptIsActive() && !aptShouldClose()`.
+> - Core 1 is SysCore (shared with Home Menu / APT / GSP / DSP handlers): worker threads there must run at a numerically **higher** (= lower) priority than the main thread (`main_prio + 1`), and `src/platform/3ds/threads_3ds.c` parks both workers (10 ms sleeps, no NDSP / DSP cache / SDMC) between `APTHOOK_ONSUSPEND`/`ONSLEEP` and `ONRESTORE`/`ONWAKEUP`.
+
 ---
 
 ### 6.2 New 3DS Multi-Core, 804 MHz Clock & `ndspInit()` Audio

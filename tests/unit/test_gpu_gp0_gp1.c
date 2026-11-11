@@ -5,6 +5,7 @@
 #include "psx3ds/arena.h"
 #include "psx3ds/gpu.h"
 #include "psx3ds/system.h"
+#include "psx3ds/timers.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -435,6 +436,71 @@ static int test_dual_backend_contract(PsxSystem *sys) {
     return 0;
 }
 
+/*
+ * v0.2.4 regression (Winning Eleven 3 freeze after the 480i Konami logo): with the real
+ * timers_init() -> gpu_init() hook chain driving EV_HBLANK/EV_VBLANK, sys->gpu.frame must
+ * advance exactly once per frame, so in 480i GPUSTAT bits 13 & 31 alternate 0,1,0,1 on
+ * consecutive frames during active video, and Psy-Q VSync(0) (spin until bit 31 differs
+ * from its pre-VBlank value) always terminates.
+ */
+static int test_480i_field_toggles_every_frame(PsxSystem *sys) {
+    sched_init(&sys->sched);
+    timers_init(sys);  /* EV_HBLANK = timers, EV_VBLANK = timers default (system order) */
+    gpu_reset(sys);    /* GPU chains EV_HBLANK/EV_VBLANK on top of the timers */
+    gpu_gp1_write(sys, 0x08000027u); /* 640x480i NTSC interlaced */
+    CHECK_TRUE(sys->gpu.disp.interlace && sys->gpu.disp.vres == 480u, "480i display mode");
+
+    sys->stats.frames = 0u;
+    u32 frame0 = sys->gpu.frame;
+    u32 prev_field = 2u;
+
+    for (u32 f = 0u; f < 8u; f++) {
+        /* Advance to active-video scanline 100 of the next frame */
+        u32 guard = 0u;
+        do {
+            sys->sched.fn[EV_HBLANK](sys, 0u);
+            guard++;
+        } while ((sys->timers.scanline != 100u || sys->timers.in_vblank) && guard < 1000u);
+        CHECK_TRUE(guard <= 263u, "reached scanline 100 within one NTSC frame");
+
+        u32 st = gpu_stat(sys);
+        u32 b13 = (st >> 13) & 1u;
+        u32 b31 = (st >> 31) & 1u;
+        CHECK_EQ_U32(sys->gpu.frame - frame0, f, "gpu.frame advances once per frame");
+        CHECK_TRUE(b13 == b31, "480i active video: bit13 == bit31 (same field)");
+        CHECK_TRUE(b31 == (sys->gpu.frame & 1u), "480i bit31 tracks field parity");
+        if (prev_field != 2u) {
+            CHECK_TRUE(b31 != prev_field, "480i GPUSTAT bit31 toggles on every consecutive frame");
+        }
+        prev_field = b31;
+
+        /* Psy-Q VSync(0): latch bit31, wait for VBlank, then spin until bit31 changes */
+        u32 s0 = b31;
+        u32 frame_before = sys->gpu.frame;
+        guard = 0u;
+        while (!sys->timers.in_vblank && guard < 1000u) {
+            sys->sched.fn[EV_HBLANK](sys, 0u);
+            guard++;
+        }
+        CHECK_TRUE(sys->timers.in_vblank, "reached VBlank");
+        CHECK_EQ_U32(sys->gpu.frame, frame_before + 1u, "exactly one frame++ at VBlank entry");
+        guard = 0u;
+        while (((gpu_stat(sys) >> 31) & 1u) == s0 && guard < 1000u) {
+            sys->sched.fn[EV_HBLANK](sys, 0u);
+            guard++;
+        }
+        CHECK_TRUE(guard <= 263u, "VSync(0) bit31 spin terminates within one frame");
+        CHECK_EQ_U32(sys->gpu.frame, frame_before + 1u, "no second frame++ at scanline 0");
+    }
+    CHECK_EQ_U32(sys->gpu.frame - frame0, 8u, "8 frames -> gpu.frame advanced by exactly 8");
+    CHECK_EQ_U32(sys->stats.frames, 0u, "VBlank callbacks never touch stats.frames");
+
+    gpu_gp1_write(sys, 0x08000000u);
+    sys->timers.in_vblank = false;
+    sys->timers.scanline  = 0u;
+    return 0;
+}
+
 int main(void) {
     memset(&s_sys, 0, sizeof(s_sys));
     psx_config_defaults(&s_sys.cfg, false);
@@ -449,6 +515,7 @@ int main(void) {
     if (test_gp0_e1_texture_disable_quirk(&s_sys) != 0) return 1;
     if (test_fifo_and_polylines(&s_sys) != 0) return 1;
     if (test_dual_backend_contract(&s_sys) != 0) return 1;
+    if (test_480i_field_toggles_every_frame(&s_sys) != 0) return 1;
 
     /* Smoke test gpu_state save & load paths */
     StateIO st = { .writing = true, .error = false, .buf = NULL, .pos = 0u, .cap = 0u };

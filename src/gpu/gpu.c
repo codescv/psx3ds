@@ -161,16 +161,23 @@ static void gpu_refresh_scanline_bits(PsxSystem *sys) {
     g->gpustat = bits;
 }
 
+/*
+ * VBlank entry (scanline == vblank_line). This is the ONLY place sys->gpu.frame advances
+ * when the GPU owns EV_VBLANK (timers_hblank_cb skips its standalone increment), so the
+ * interlace field parity (frame & 1) alternates exactly once per frame. The new field is
+ * latched into GPUSTAT bits 13/31 BEFORE IRQ_VBLANK is raised, so a VBlank ISR (or Psy-Q
+ * VSync(0), which spins on GPUSTAT bit 31 toggling in 480i) observes the new field.
+ */
 static void gpu_on_vblank(PsxSystem *sys, u32 late_cycles) {
+    PsxGpu *g = &sys->gpu;
+    g->frame++;
+    gpu_refresh_scanline_bits(sys);
+
     if (s_prev_vblank) {
         s_prev_vblank(sys, late_cycles);
     } else {
         irq_raise(sys, IRQ_VBLANK);
     }
-
-    PsxGpu *g = &sys->gpu;
-    g->frame++;
-    gpu_refresh_scanline_bits(sys);
 
     if (g->be && g->be->present) {
         g->be->present(g->be_self, &g->disp);

@@ -144,12 +144,31 @@ static void dma_xfer_chunk(PsxSystem *sys, u32 ch, u32 madr, u32 words,
     }
 }
 
-static bool dma_channel_ready(const PsxDma *d, u32 ch) {
+PSX_INLINE bool dma_is_mdec_out_sync1(u32 ch, u32 chcr) {
+    return ch == PSX_DMA_CH_MDEC_OUT && ((chcr >> 9) & 3u) == 1u;
+}
+
+PSX_INLINE u32 dma_bcr_block_size(u32 bcr) {
+    u32 bs = bcr & 0xFFFFu;
+    return (bs == 0u) ? 0x10000u : bs;
+}
+
+static bool dma_channel_ready(const PsxSystem *sys, const PsxDma *d, u32 ch) {
     if (((d->dpcr >> (ch * 4u + 3u)) & 1u) == 0u) {
         return false;
     }
     u32 chcr = d->ch[ch].chcr;
     if ((chcr & DMA_CHCR_BUSY) == 0u) {
+        return false;
+    }
+    /*
+     * DMA1 (MDEC-Out) in SyncMode 1 is paced by the MDEC Data-Out DREQ: it stays armed
+     * (CHCR busy) until decoded words exist. Psy-Q FMV players arm DecDCTout() (DMA1)
+     * BEFORE DecDCTin() (DMA0); transferring immediately drained zeros into slice 0 and
+     * stranded a decoded slice in the MDEC, timing out the next DecDCTinSync().
+     */
+    if (dma_is_mdec_out_sync1(ch, chcr) &&
+        mdec_dma_out_blocks_ready(sys, dma_bcr_block_size(d->ch[ch].bcr)) == 0u) {
         return false;
     }
     if ((d->running_mask & (1u << ch)) != 0u) {
@@ -235,6 +254,18 @@ static u32 dma_step_channel(PsxSystem *sys, u32 ch) {
         if (max_blocks == 0u) {
             max_blocks = 1u;
         }
+        if (ch == PSX_DMA_CH_MDEC_OUT) {
+            /* Only move blocks the MDEC has actually decoded (Data-Out DREQ) */
+            u32 avail_blocks = mdec_dma_out_blocks_ready(sys, bs);
+            if (avail_blocks == 0u) {
+                /* Stay armed; mdec wakes us via dma_request_wakeup() on new output */
+                d->running_mask |= (u8)(1u << ch);
+                return 0u;
+            }
+            if (avail_blocks < max_blocks) {
+                max_blocks = avail_blocks;
+            }
+        }
         u32 blk_chunk = (ba < max_blocks) ? ba : max_blocks;
         u32 words = blk_chunk * bs;
 
@@ -297,11 +328,12 @@ static u32 dma_step_channel(PsxSystem *sys, u32 ch) {
     return 0u;
 }
 
-static int dma_pick_highest_ready(const PsxDma *d) {
+static int dma_pick_highest_ready(const PsxSystem *sys) {
+    const PsxDma *d = &sys->dma;
     int best_ch = -1;
     u32 best_prio = 8u;
     for (u32 ch = 0u; ch < 7u; ch++) {
-        if (!dma_channel_ready(d, ch)) {
+        if (!dma_channel_ready(sys, d, ch)) {
             continue;
         }
         u32 prio = (d->dpcr >> (ch * 4u)) & 7u;
@@ -316,7 +348,7 @@ static int dma_pick_highest_ready(const PsxDma *d) {
 static void dma_schedule_or_run(PsxSystem *sys) {
     PsxDma *d = &sys->dma;
     for (;;) {
-        int ch = dma_pick_highest_ready(d);
+        int ch = dma_pick_highest_ready(sys);
         if (ch < 0) {
             if (d->running_mask == 0u) {
                 sched_cancel(sys, EV_DMA);
@@ -339,9 +371,15 @@ static void dma_schedule_or_run(PsxSystem *sys) {
 static void dma_event_cb(PsxSystem *sys, u32 late_cycles) {
     (void)late_cycles;
     PsxDma *d = &sys->dma;
-    int ch = dma_pick_highest_ready(d);
+    int ch = dma_pick_highest_ready(sys);
     if (ch < 0) {
-        d->running_mask = 0u;
+        /* Keep DREQ-paced channels (armed DMA1 awaiting MDEC output) marked running */
+        u8 keep = 0u;
+        if ((d->ch[PSX_DMA_CH_MDEC_OUT].chcr & DMA_CHCR_BUSY) != 0u &&
+            dma_is_mdec_out_sync1(PSX_DMA_CH_MDEC_OUT, d->ch[PSX_DMA_CH_MDEC_OUT].chcr)) {
+            keep = (u8)(d->running_mask & (1u << PSX_DMA_CH_MDEC_OUT));
+        }
+        d->running_mask = keep;
         return;
     }
     u32 delay = dma_step_channel(sys, (u32)ch);
@@ -423,6 +461,20 @@ static void dma_mmio_write(PsxSystem *sys, u32 addr, u32 v, u32 width) {
         u32 ack_flags = wval & wmask & DICR_FLAGS_MASK;
         u32 new_flags = (old_dicr & DICR_FLAGS_MASK) & ~ack_flags;
         dma_update_dicr_and_irq(sys, old_dicr, new_low | new_flags);
+    }
+}
+
+void dma_request_wakeup(PsxSystem *sys, u32 ch) {
+    if (!sys || ch >= 7u) {
+        return;
+    }
+    const PsxDma *d = &sys->dma;
+    if ((d->ch[ch].chcr & DMA_CHCR_BUSY) == 0u ||
+        ((d->dpcr >> (ch * 4u + 3u)) & 1u) == 0u) {
+        return;
+    }
+    if ((sys->sched.active_mask & (1u << EV_DMA)) == 0u) {
+        sched_schedule(sys, EV_DMA, 1u);
     }
 }
 

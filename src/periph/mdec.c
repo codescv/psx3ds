@@ -144,7 +144,13 @@ static void mdec_refresh_status(PsxSystem *sys) {
     if (ms && in_avail >= ms->in_cap_hw) {
         st |= (1u << 30); /* Data-In FIFO Full */
     }
-    if ((ms && ms->cmd_op != 0u) || m->words_left > 0u || out_avail > 0u) {
+    /*
+     * Command Busy: a command is still receiving parameters / decoding, or an armed DMA1
+     * is still draining its output. Once the command has fully completed and DMA1 is idle,
+     * leftover output (e.g. extra padding macroblocks) must not hold DecDCTinSync() busy.
+     */
+    bool dma1_armed = (sys->dma.ch[PSX_DMA_CH_MDEC_OUT].chcr & (1u << 24)) != 0u;
+    if ((ms && ms->cmd_op != 0u) || m->words_left > 0u || (dma1_armed && out_avail > 0u)) {
         st |= (1u << 29); /* Command Busy */
     }
     if ((m->control & (1u << 30)) != 0u && m->words_left > 0u) {
@@ -161,6 +167,35 @@ static void mdec_refresh_status(PsxSystem *sys) {
     st |= ((m->words_left - 1u) & 0xFFFFu);
 
     m->status = st;
+
+    /* Data-Out DREQ edge: wake an armed DMA1 that is waiting for decoded words */
+    if (out_avail > 0u && dma1_armed) {
+        u32 bs = sys->dma.ch[PSX_DMA_CH_MDEC_OUT].bcr & 0xFFFFu;
+        if (mdec_dma_out_blocks_ready(sys, (bs == 0u) ? 0x10000u : bs) > 0u) {
+            dma_request_wakeup(sys, PSX_DMA_CH_MDEC_OUT);
+        }
+    }
+}
+
+u32 mdec_dma_out_blocks_ready(const PsxSystem *sys, u32 block_words) {
+    if (!sys || block_words == 0u) {
+        return 0u;
+    }
+    const MdecStream *ms = mdec_get_stream(sys);
+    if (!ms) {
+        /* No stream (should not happen after mdec_init): never block DMA1 forever */
+        return 1u;
+    }
+    u32 out_avail = ms->out_head - ms->out_tail;
+    if (out_avail == 0u) {
+        return 0u;
+    }
+    u32 blocks = out_avail / block_words;
+    if (blocks == 0u && ms->cmd_op != 1u) {
+        /* Decode finished with a short tail: let DMA1 flush it (zero-padded) */
+        blocks = 1u;
+    }
+    return blocks;
 }
 
 static void mdec_push_out_word(PsxMdec *m, MdecStream *ms, u32 w) {
