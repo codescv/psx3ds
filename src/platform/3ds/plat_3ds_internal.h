@@ -12,7 +12,8 @@ typedef struct CtrHwInfo {
     u32  cpu_mhz;
     u32  syscore_pct;
     bool ndsp_ok;
-    bool spu_core1_active;
+    bool spu_core1_active; /* async SPU worker runs off Core 0 (Core 1 or Core 2) */
+    int  spu_worker_core;  /* v0.2.8: actual SPU worker core (2 / 1 / -2 Core 0, -1 none) */
     bool cd_core2_active;
     int  cd_worker_core;
 } CtrHwInfo;

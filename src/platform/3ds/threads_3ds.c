@@ -58,6 +58,8 @@ void ctr_threads_init_hardware(CtrHwInfo *hw) {
         return;
     }
     memset(hw, 0, sizeof(*hw));
+    hw->spu_worker_core = -1;
+    hw->cd_worker_core  = -1;
 
     bool is_n3ds = false;
     if (R_SUCCEEDED(APT_CheckNew3DS(&is_n3ds)) && is_n3ds) {
@@ -82,7 +84,12 @@ void ctr_threads_init_hardware(CtrHwInfo *hw) {
              (int)hw->is_n3ds, (unsigned)hw->cpu_mhz, (unsigned)hw->syscore_pct);
 }
 
-PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int prio, int core) {
+/*
+ * allow_fallback = false: try exactly (prio, core) once — used to place a worker on a
+ * specific core without silently landing on Core 0 (where main() never yields).
+ */
+static PlatThread *ctr_thread_create_ex(void (*fn)(void *), void *arg, u32 stack, int prio,
+                                        int core, bool allow_fallback) {
     if (!fn) {
         return NULL;
     }
@@ -111,6 +118,20 @@ PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int pri
 
     int chosen_core = core;
     Thread t = threadCreate(fn, arg, stack, target_prio, chosen_core, false);
+    if (!t && !allow_fallback) {
+        return NULL;
+    }
+    if (!t && chosen_core == 2) {
+        /*
+         * v0.2.8: fall back from N3DS Core 2 (O3DS, or a launcher without Core 2 access) to
+         * the Core 1 SysCore ladder below, starting at the requested priority.
+         */
+        chosen_core = 1;
+        if (target_prio < main_prio - 2) {
+            target_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
+        }
+        t = threadCreate(fn, arg, stack, target_prio, chosen_core, false);
+    }
     if (!t && chosen_core == 1) {
         /*
          * v0.2.6: SysCore (Core 1) priority ladder. The APT SysCore quota thread runs at
@@ -123,11 +144,6 @@ PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int pri
         if (!t && target_prio != above_main) {
             t = threadCreate(fn, arg, stack, above_main, 1, false);
         }
-    }
-    if (!t && chosen_core == 2) {
-        /* Fallback from N3DS Core 2 to Core 1 (O3DS or restricted affinity) */
-        chosen_core = 1;
-        t = threadCreate(fn, arg, stack, above_main, chosen_core, false);
     }
     if (!t && chosen_core != -2) {
         /*
@@ -156,6 +172,10 @@ PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int pri
     return pt;
 }
 
+PlatThread *plat_thread_create(void (*fn)(void *), void *arg, u32 stack, int prio, int core) {
+    return ctr_thread_create_ex(fn, arg, stack, prio, core, true);
+}
+
 void plat_thread_join(PlatThread *th) {
     if (!th) {
         return;
@@ -176,7 +196,8 @@ void plat_yield(void) {
 }
 
 /*
- * Core 1: 500 us cadence (2 kHz) comfortably covers 44.1 kHz in 64-frame render chunks;
+ * Core 2 (N3DS) / Core 1 (O3DS): 500 us cadence (2 kHz) comfortably covers 44.1 kHz in
+ * 64-frame render chunks;
  * ctr_audio_render_core1() only renders time Core 0 has already queued into the SPU
  * out_ring. v0.2.7: Core 1 never touches NDSP / DSP_FlushDataCache (dspHandle IPC raced
  * ndspThreadMain and could not clean Core 0's L1 D-cache) — Core 0 submits wavebufs.
@@ -227,23 +248,46 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
     s32 main_prio = 0x30;
     (void)svcGetThreadPriority(&main_prio, CUR_THREAD_HANDLE);
 
-    if (hw->syscore_pct > 0u) {
-        /*
-         * Core 1 is SysCore, shared with the Home Menu / APT / GSP / DSP handlers.
-         * v0.2.6: run the SPU worker at main_prio - 1 (0x2F). At main_prio + 1 (0x31,
-         * v0.2.4/v0.2.5) it sat below the 0x30 SysCore quota thread and was starved (or
-         * fell back to Core 0, where main() never yields) -> no audio on real hardware.
-         * The worker sleeps 500 us per step and parks 10 ms on APT suspend, so 0x2F never
-         * blocks HOME Menu transitions. Core 0 owns all NDSP wavebuf submission (v0.2.7).
-         */
-        s32 spu_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
-        g_spu_worker = plat_thread_create(spu_core1_worker, sys, 32768u, spu_prio, 1);
-        hw->spu_core1_active = (g_spu_worker != NULL && g_spu_worker->actual_core == 1);
-    }
+    s32 spu_prio   = (main_prio > 0x19) ? (main_prio - 1) : main_prio; /* 0x2F */
+    s32 above_main = (main_prio < 0x3E) ? (main_prio + 1) : 0x3F;      /* 0x31 */
 
-    int target_cd_core = hw->is_n3ds ? 2 : 1;
-    s32 cd_prio = hw->is_n3ds ? main_prio : ((main_prio < 0x3E) ? (main_prio + 1) : 0x3F);
-    g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, cd_prio, target_cd_core);
+    /*
+     * v0.2.8 SPU worker placement. On New 3DS prefer Core 2: a dedicated AppCore with 100%
+     * CPU time and no OS services. Core 1 (SysCore) is throttled by the APT app CPU time
+     * limit (at 30%, Core 1 app threads are frozen ~11 ms of every 16.67 ms) and shared
+     * with dsp / gsp / fs handlers. plat_thread_create falls back from Core 2 to the
+     * Core 1 ladder (0x2F -> 0x30 -> 0x31) and finally Core 0.
+     * Core 1 placement at main_prio - 1 (0x2F): at main_prio + 1 (0x31, v0.2.4/v0.2.5) it
+     * sat below the 0x30 SysCore quota thread and was starved. The worker sleeps 500 us per
+     * step and parks 10 ms on APT suspend, so 0x2F never blocks HOME Menu transitions.
+     * Core 0 owns all NDSP wavebuf submission (v0.2.7).
+     */
+    if (hw->is_n3ds || hw->syscore_pct > 0u) {
+        int target_spu_core = hw->is_n3ds ? 2 : 1;
+        g_spu_worker = plat_thread_create(spu_core1_worker, sys, 32768u, spu_prio, target_spu_core);
+    }
+    hw->spu_worker_core  = g_spu_worker ? g_spu_worker->actual_core : -1;
+    hw->spu_core1_active = (g_spu_worker != NULL && g_spu_worker->actual_core >= 1);
+
+    if (hw->spu_worker_core == 2) {
+        /*
+         * SPU owns Core 2 -> CD readahead goes to Core 1. If Core 1 is unavailable, share
+         * Core 2 at 0x31 so the 0x2F SPU worker always preempts it.
+         */
+        if (hw->syscore_pct > 0u) {
+            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, above_main, 1, false);
+        }
+        if (!g_cd_worker) {
+            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, above_main, 2, false);
+        }
+        if (!g_cd_worker) {
+            g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, above_main, 1);
+        }
+    } else {
+        int target_cd_core = hw->is_n3ds ? 2 : 1;
+        s32 cd_prio = hw->is_n3ds ? main_prio : above_main;
+        g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, cd_prio, target_cd_core);
+    }
     if (g_cd_worker) {
         hw->cd_worker_core = g_cd_worker->actual_core;
         hw->cd_core2_active = (g_cd_worker->actual_core == 2);
@@ -283,6 +327,7 @@ void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw) {
     }
     if (hw) {
         hw->spu_core1_active = false;
+        hw->spu_worker_core  = -1;
         hw->cd_core2_active = false;
         hw->cd_worker_core = -1;
     }

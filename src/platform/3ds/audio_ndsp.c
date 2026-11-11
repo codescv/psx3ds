@@ -52,8 +52,11 @@
 #define CTR_NDSP_RATE_PAL       44312.0f
 #define CTR_NDSP_RATE_PAL_FAST  44440.0f
 #define CTR_NDSP_RATE_PAL_SLOW  44180.0f
-#define CTR_NDSP_QUEUE_HIGH     (CTR_NDSP_BUF_FRAMES * 4u) /* > 66.7 ms queued: speed up */
-#define CTR_NDSP_QUEUE_LOW      (CTR_NDSP_BUF_FRAMES * 2u) /* < 33.3 ms queued: slow down */
+/* Rate-steering hysteresis on total queued frames (NDSP wavebufs + SPU rings) */
+#define CTR_NDSP_FAST_ENTER     (CTR_NDSP_BUF_FRAMES * 5u)        /* > 83.3 ms: speed up  */
+#define CTR_NDSP_FAST_EXIT      (CTR_NDSP_BUF_FRAMES * 4u)        /* <= 66.7 ms: back     */
+#define CTR_NDSP_SLOW_ENTER     ((CTR_NDSP_BUF_FRAMES * 3u) / 2u) /* < 25.0 ms: slow down */
+#define CTR_NDSP_SLOW_EXIT      ((CTR_NDSP_BUF_FRAMES * 5u) / 2u) /* >= 41.7 ms: back     */
 #define CTR_NDSP_RING_FRAMES    8192u
 #define CTR_NDSP_RING_MASK      (CTR_NDSP_RING_FRAMES - 1u)
 
@@ -88,6 +91,7 @@ static alignas(32) u32 g_render_lock = 0u; /* Core 1 render vs Core 0 fallback (
 static alignas(32) u32 g_pump_lock = 0u;   /* re-entrancy guard for the Core 0 pump */
 static s16         g_stretch[(CTR_NDSP_BUF_FRAMES + CTR_SPU_DRIFT_MAX) * 2u];
 static float       g_ndsp_rate = CTR_NDSP_RATE_NTSC; /* last rate sent to ndspChnSetRate */
+static int         g_rate_mode = 0; /* -1 SLOW, 0 BASE, +1 FAST (hysteresis state) */
 
 /* Live diagnostics for the 2:HUD tab (written on Core 0, read on Core 0) */
 static u32  g_wb_submitted = 0u;
@@ -112,6 +116,7 @@ static void configure_ndsp_channel_locked(void) {
     ndspSetMasterVol(1.0f);
     ndspChnSetInterp(CTR_NDSP_CH, NDSP_INTERP_LINEAR);
     g_ndsp_rate = CTR_NDSP_RATE_NTSC;
+    g_rate_mode = 0;
     ndspChnSetRate(CTR_NDSP_CH, g_ndsp_rate);
     ndspChnSetFormat(CTR_NDSP_CH, NDSP_FORMAT_STEREO_PCM16);
     float mix[12];
@@ -351,18 +356,36 @@ static u32 total_queued_frames(PsxSystem *sys, u32 active_wbufs) {
 
 /*
  * v0.2.8 rate matching: steer the TeakLite DSP resampler around the paced PS1 sample rate
- * so ~3 wavebufs stay queued (no pitch steps, no overruns, no underruns). Only issues
+ * so ~3 wavebufs stay queued (no pitch steps, no overruns, no underruns). FAST / SLOW are
+ * entered and left with hysteresis so the rate does not flap between the pacer_wait
+ * slices and psx_run_frame (each frame adds ~737 frames at once). Only issues
  * ndspChnSetRate when the target changes.
  */
 static void update_ndsp_rate(PsxSystem *sys, u32 queued) {
     if (!sys) {
         return;
     }
+    if (g_rate_mode > 0) {
+        if (queued <= CTR_NDSP_FAST_EXIT) {
+            g_rate_mode = 0;
+        }
+    } else if (g_rate_mode < 0) {
+        if (queued >= CTR_NDSP_SLOW_EXIT) {
+            g_rate_mode = 0;
+        }
+    }
+    if (g_rate_mode == 0) {
+        if (queued > CTR_NDSP_FAST_ENTER) {
+            g_rate_mode = 1;
+        } else if (queued < CTR_NDSP_SLOW_ENTER) {
+            g_rate_mode = -1;
+        }
+    }
     bool  pal  = (sys->gpu.disp.pal != 0u); /* the same flag pacer_wait() paces by */
     float rate = pal ? CTR_NDSP_RATE_PAL : CTR_NDSP_RATE_NTSC;
-    if (queued > CTR_NDSP_QUEUE_HIGH) {
+    if (g_rate_mode > 0) {
         rate = pal ? CTR_NDSP_RATE_PAL_FAST : CTR_NDSP_RATE_NTSC_FAST;
-    } else if (queued < CTR_NDSP_QUEUE_LOW) {
+    } else if (g_rate_mode < 0) {
         rate = pal ? CTR_NDSP_RATE_PAL_SLOW : CTR_NDSP_RATE_NTSC_SLOW;
     }
     if (rate != g_ndsp_rate) {
@@ -373,7 +396,7 @@ static void update_ndsp_rate(PsxSystem *sys, u32 queued) {
 
 static void audio_pump_locked(PsxSystem *sys) {
     if (sys && sys->spu.async_mode && !sys->spu.irq_enabled && spu_cmd_backlog(sys) > 0u) {
-        if (queued_frames_for(sys) < CTR_NDSP_BUF_FRAMES * 2u) {
+        if (queued_frames_for(sys) < CTR_NDSP_PRIME_FRAMES) {
             /*
              * v0.2.8: render 100% of the audio Core 0 already emulated (blocking on the
              * SPU lock if Core 1 is mid-chunk) before deciding whether a full wavebuf is
@@ -436,7 +459,9 @@ static void audio_pump_locked(PsxSystem *sys) {
         }
     }
 
-    update_ndsp_rate(sys, total_queued_frames(sys, active_wbufs));
+    if (g_stream_active) {
+        update_ndsp_rate(sys, total_queued_frames(sys, active_wbufs));
+    }
 
     /*
      * Refill wavebufs in strict FIFO order (Core 0 only), FULL buffers only. While at

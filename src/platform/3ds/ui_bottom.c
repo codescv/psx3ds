@@ -660,7 +660,8 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
         ctr_audio_get_diag(&wb_sub, &wb_act, &pcm_pk);
         fb_printf(fb, 12, 120, (hw && hw->ndsp_ok && wb_sub > 0u) ? COL_OK : COL_WARN,
                   "SPU:%-3s NDSP:%-2s WB:%u/%u Pk:%u",
-                  (hw && hw->spu_core1_active) ? "C1" : "SYN",
+                  !(hw && hw->spu_core1_active) ? "SYN"
+                      : (hw->spu_worker_core == 2) ? "C2" : "C1",
                   (hw && hw->ndsp_ok) ? "OK" : "NO",
                   (unsigned)wb_sub, (unsigned)wb_act, (unsigned)pcm_pk);
         fb_printf(fb, 12, 132, (hw && hw->cd_worker_core >= 0) ? COL_OK : COL_DIM,
