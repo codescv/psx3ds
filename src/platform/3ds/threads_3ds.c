@@ -249,7 +249,6 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
     (void)svcGetThreadPriority(&main_prio, CUR_THREAD_HANDLE);
 
     s32 spu_prio   = (main_prio > 0x19) ? (main_prio - 1) : main_prio; /* 0x2F */
-    s32 above_main = (main_prio < 0x3E) ? (main_prio + 1) : 0x3F;      /* 0x31 */
 
     /*
      * v0.2.8 SPU worker placement. On New 3DS prefer Core 2: a dedicated AppCore with 100%
@@ -269,24 +268,32 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
     hw->spu_worker_core  = g_spu_worker ? g_spu_worker->actual_core : -1;
     hw->spu_core1_active = (g_spu_worker != NULL && g_spu_worker->actual_core >= 1);
 
+    /*
+     * CD readahead worker. On Core 1 it must run at 0x2F (or 0x30): the Horizon SysCore
+     * quota thread runs at 0x30 there, and a Core 1 thread at 0x31 is created fine but
+     * starved completely.
+     */
     if (hw->spu_worker_core == 2) {
-        /*
-         * SPU owns Core 2 -> CD readahead goes to Core 1. If Core 1 is unavailable, share
-         * Core 2 at 0x31 so the 0x2F SPU worker always preempts it.
-         */
+        /* SPU owns Core 2 -> CD readahead on Core 1 at 0x2F, then 0x30 */
         if (hw->syscore_pct > 0u) {
-            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, above_main, 1, false);
+            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, spu_prio, 1, false);
+            if (!g_cd_worker && spu_prio != main_prio) {
+                g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, main_prio, 1, false);
+            }
         }
         if (!g_cd_worker) {
-            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, above_main, 2, false);
+            /* Share Core 2 at 0x30: the 0x2F SPU worker always preempts it */
+            g_cd_worker = ctr_thread_create_ex(cd_core2_worker, sys, 32768u, main_prio, 2, false);
         }
         if (!g_cd_worker) {
-            g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, above_main, 1);
+            g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, spu_prio, 1);
         }
+    } else if (hw->is_n3ds) {
+        /* SPU worker not on Core 2 (fallback): CD readahead takes Core 2 */
+        g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, main_prio, 2);
     } else {
-        int target_cd_core = hw->is_n3ds ? 2 : 1;
-        s32 cd_prio = hw->is_n3ds ? main_prio : above_main;
-        g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, cd_prio, target_cd_core);
+        /* O3DS: Core 1 ladder 0x2F -> 0x30 (-> 0x31 -> Core 0 only as a last resort) */
+        g_cd_worker = plat_thread_create(cd_core2_worker, sys, 32768u, spu_prio, 1);
     }
     if (g_cd_worker) {
         hw->cd_worker_core = g_cd_worker->actual_core;
