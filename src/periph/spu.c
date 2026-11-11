@@ -430,14 +430,15 @@ static void spu_key_on_mask(PsxSpu *spu, u32 mask24) {
         v->adsr_phase  = ADSR_ATTACK;
         v->block_flags = 0u;
         v->keyed       = 1u; /* 1 = awaiting first ADPCM block fetch at start_addr */
-        spu->endx     &= ~(1u << i);
+        (void)__atomic_and_fetch(&spu->endx, ~(1u << i), __ATOMIC_RELAXED);
         if (ext) {
             ext->adsr_ticks[i] = 0u;
         }
         spu->regs[((i << 4) + 0x0Cu) >> 1] = 0u;
     }
-    spu->regs[(PSX_REG_SPU_ENDX_LO - PSX_REG_SPU_BASE) >> 1] = (u16)(spu->endx & 0xFFFFu);
-    spu->regs[(PSX_REG_SPU_ENDX_HI - PSX_REG_SPU_BASE) >> 1] = (u16)((spu->endx >> 16) & 0x00FFu);
+    u32 endx = __atomic_load_n(&spu->endx, __ATOMIC_RELAXED);
+    spu->regs[(PSX_REG_SPU_ENDX_LO - PSX_REG_SPU_BASE) >> 1] = (u16)(endx & 0xFFFFu);
+    spu->regs[(PSX_REG_SPU_ENDX_HI - PSX_REG_SPU_BASE) >> 1] = (u16)((endx >> 16) & 0x00FFu);
 }
 
 static void spu_key_off_mask(PsxSpu *spu, u32 mask24) {
@@ -476,8 +477,13 @@ static void spu_apply_voice_flags(PsxSpu *spu) {
     }
 }
 
-/* Apply a 16-bit register write at byte offset [0x000..0x3FE] to live synthesis state */
-static void spu_apply_reg16(PsxSystem *sys, u32 off, u16 val) {
+/*
+ * Apply a 16-bit register write at byte offset [0x000..0x3FE] to live synthesis state.
+ * store_reg = false for writes replayed from the async cmd_ring: Core 0 already mirrored
+ * spu->regs at MMIO-write time, and re-storing the (possibly older) queued value from
+ * Core 1 would race with newer Core 0 writes to the same register (v0.2.7).
+ */
+static void spu_apply_reg16_ex(PsxSystem *sys, u32 off, u16 val, bool store_reg) {
     PsxSpu *spu = &sys->spu;
     SpuExt *ext = spu_ext(spu);
     u32 idx = (off >> 1) & 0x1FFu;
@@ -488,7 +494,9 @@ static void spu_apply_reg16(PsxSystem *sys, u32 off, u16 val) {
         return;
     }
 
-    spu->regs[idx] = val;
+    if (store_reg) {
+        spu->regs[idx] = val;
+    }
 
     if (off < 0x180u) {
         u32 v_idx = off >> 4;
@@ -614,6 +622,15 @@ static void spu_apply_reg16(PsxSystem *sys, u32 off, u16 val) {
     }
 }
 
+static void spu_apply_reg16(PsxSystem *sys, u32 off, u16 val) {
+    spu_apply_reg16_ex(sys, off, val, true);
+}
+
+/* Replay of a cmd_ring entry (spu->regs was already mirrored by Core 0) */
+static void spu_apply_queued_reg16(PsxSystem *sys, u32 off, u16 val) {
+    spu_apply_reg16_ex(sys, off, val, false);
+}
+
 static bool spu_cmd_push(PsxSystem *sys, u16 reg, u16 val) {
     PsxSpu *spu = &sys->spu;
     if (!spu->cmd_ring) {
@@ -642,7 +659,7 @@ static void spu_drain_all_cmds(PsxSystem *sys) {
         SpuCmd cmd = spu->cmd_ring[slot];
         spsc_commit_pop(&spu->cmd_tail);
         if (cmd.reg < 0x400u) {
-            spu_apply_reg16(sys, cmd.reg, cmd.val);
+            spu_apply_queued_reg16(sys, cmd.reg, cmd.val);
         }
     }
     spu_unlock(spu);
@@ -680,6 +697,39 @@ static void spu_write_reg16_mmio(PsxSystem *sys, u32 off, u16 val) {
         off != 0x1B8u && off != 0x1BAu && !(off >= 0x200u && off < 0x260u)) {
         spu->regs[off >> 1] = val;
     }
+    /*
+     * v0.2.7: update the Core-0-readable shadow state that spu_read_reg16_mmio() serves
+     * from SpuVoice / ENDX (not spu->regs) right away, so a read-back issued before Core 1
+     * drains cmd_ring sees the value just written (repeat_addr, ADSR volume, ENDX cleared
+     * and ADSR volume zeroed on KON) exactly as the synchronous path would.
+     */
+    if (off < 0x180u) {
+        u32 v_idx = off >> 4;
+        u32 sub   = off & 0x0Eu;
+        if (sub == 0x06u) {
+            spu->v[v_idx].start_addr = ((u32)val << 3) & 0x7FFF8u;
+        } else if (sub == 0x0Cu) {
+            spu->v[v_idx].adsr_vol = val;
+        } else if (sub == 0x0Eu) {
+            spu->v[v_idx].repeat_addr = ((u32)val << 3) & 0x7FFF8u;
+        }
+    } else if (off == 0x188u) { /* KON low */
+        u32 m = (u32)val;
+        (void)__atomic_and_fetch(&spu->endx, ~m, __ATOMIC_RELAXED);
+        for (u32 i = 0u; i < 16u; i++) {
+            if ((m & (1u << i)) != 0u) {
+                spu->v[i].adsr_vol = 0u;
+            }
+        }
+    } else if (off == 0x18Au) { /* KON high */
+        u32 m = ((u32)val & 0xFFu) << 16;
+        (void)__atomic_and_fetch(&spu->endx, ~m, __ATOMIC_RELAXED);
+        for (u32 i = 0u; i < 8u; i++) {
+            if (((u32)val & (1u << i)) != 0u) {
+                spu->v[16u + i].adsr_vol = 0u;
+            }
+        }
+    }
     if (!spu_cmd_push(sys, (u16)off, val)) {
         /* Ring full (e.g. single-threaded test without Core 1 consumer): render & apply */
         spu_render_batch(sys, PSX_SPU_BATCH_FRAMES);
@@ -694,10 +744,10 @@ static u16 spu_read_reg16_mmio(PsxSystem *sys, u32 off) {
     off &= 0x3FEu;
 
     if (off == 0x19Cu) {
-        return (u16)(spu->endx & 0xFFFFu);
+        return (u16)(__atomic_load_n(&spu->endx, __ATOMIC_RELAXED) & 0xFFFFu);
     }
     if (off == 0x19Eu) {
-        return (u16)((spu->endx >> 16) & 0x00FFu);
+        return (u16)((__atomic_load_n(&spu->endx, __ATOMIC_RELAXED) >> 16) & 0x00FFu);
     }
     if (off == 0x1AEu) {
         spu_update_stat(spu);
@@ -841,9 +891,9 @@ static void spu_fetch_voice_block(PsxSystem *sys, u32 v_idx) {
     } else {
         /* Handle previous block's Loop End flag after its 28 samples finished */
         if ((v->block_flags & 0x01u) != 0u) {
-            spu->endx |= (1u << v_idx);
-            spu->regs[(PSX_REG_SPU_ENDX_LO - PSX_REG_SPU_BASE) >> 1] = (u16)(spu->endx & 0xFFFFu);
-            spu->regs[(PSX_REG_SPU_ENDX_HI - PSX_REG_SPU_BASE) >> 1] = (u16)((spu->endx >> 16) & 0x00FFu);
+            u32 endx = __atomic_or_fetch(&spu->endx, (1u << v_idx), __ATOMIC_RELAXED);
+            spu->regs[(PSX_REG_SPU_ENDX_LO - PSX_REG_SPU_BASE) >> 1] = (u16)(endx & 0xFFFFu);
+            spu->regs[(PSX_REG_SPU_ENDX_HI - PSX_REG_SPU_BASE) >> 1] = (u16)((endx >> 16) & 0x00FFu);
             v->cur_addr = v->repeat_addr & 0x7FFF8u;
             if ((v->block_flags & 0x02u) == 0u) {
                 v->env_level  = 0;
@@ -1088,7 +1138,7 @@ static void spu_render_batch_locked(PsxSystem *sys, u32 frames) {
             } else {
                 spsc_commit_pop(&spu->cmd_tail);
                 if (cmd.reg < 0x400u) {
-                    spu_apply_reg16(sys, cmd.reg, cmd.val);
+                    spu_apply_queued_reg16(sys, cmd.reg, cmd.val);
                 }
             }
         }
@@ -1147,7 +1197,7 @@ PSX_HOT u32 spu_render_queued_async(PsxSystem *sys, u32 max_frames) {
         } else {
             spsc_commit_pop(&spu->cmd_tail);
             if (cmd.reg < 0x400u) {
-                spu_apply_reg16(sys, cmd.reg, cmd.val);
+                spu_apply_queued_reg16(sys, cmd.reg, cmd.val);
             }
         }
     }

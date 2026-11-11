@@ -655,10 +655,14 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                   sys ? (unsigned)sys->stats.gpu_prims : 0u,
                   tc_pct);
         fb_printf(fb, 12, 108, COL_DIM,   "Time: CPU %4.1fms  GPU %4.1fms", ms_cpu, ms_gpu);
-        fb_printf(fb, 12, 120, (hw && hw->spu_core1_active) ? COL_OK : COL_WARN,
-                  "Core1 SPU: %-4s  NDSP: %-4s",
-                  (hw && hw->spu_core1_active) ? "ASYNC" : "SYNC",
-                  (hw && hw->ndsp_ok) ? "OK" : "MUTE");
+        /* v0.2.7: live NDSP diagnostics — wavebufs submitted / in flight, PCM peak */
+        u32 wb_sub = 0u, wb_act = 0u, pcm_pk = 0u;
+        ctr_audio_get_diag(&wb_sub, &wb_act, &pcm_pk);
+        fb_printf(fb, 12, 120, (hw && hw->ndsp_ok && wb_sub > 0u) ? COL_OK : COL_WARN,
+                  "SPU:%-3s NDSP:%-2s WB:%u/%u Pk:%u",
+                  (hw && hw->spu_core1_active) ? "C1" : "SYN",
+                  (hw && hw->ndsp_ok) ? "OK" : "NO",
+                  (unsigned)wb_sub, (unsigned)wb_act, (unsigned)pcm_pk);
         fb_printf(fb, 12, 132, (hw && hw->cd_worker_core >= 0) ? COL_OK : COL_DIM,
                   cdrom_is_chd(sys) ? "CD [CHD]: Core %d (Miss %u)"
                                     : "CD Readahead: Core %d (Miss %u)",
@@ -760,7 +764,7 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                        strstr(line, "ERR") || strstr(line, "rc=-")) {
                 col = COL_WARN;
             } else if (strncmp(line, "[boot]", 6) == 0 || strncmp(line, "[cdboot]", 8) == 0 ||
-                       strncmp(line, "[bios]", 6) == 0) {
+                       strncmp(line, "[bios]", 6) == 0 || strncmp(line, "[audio_ndsp]", 12) == 0) {
                 col = COL_OK;
             }
             fb_draw_text(fb, 4, LOG_ROW_Y0 + (int)i * LOG_ROW_DY, line, col, LOG_COLS);

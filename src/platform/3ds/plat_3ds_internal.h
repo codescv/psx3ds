@@ -81,7 +81,10 @@ void ctr_threads_stop_workers(PsxSystem *sys, CtrHwInfo *hw);
 /* audio_ndsp.c */
 bool ctr_audio_init(PsxSystem *sys);
 void ctr_audio_bind_system(PsxSystem *sys);
-void ctr_audio_step_core1(PsxSystem *sys);
+void ctr_audio_render_core1(PsxSystem *sys); /* Core 1: SPU render only, never NDSP */
+void ctr_audio_step_core1(PsxSystem *sys);   /* Core 0: NDSP wavebuf pump (+ render fallback) */
+void ctr_audio_pump_core0(PsxSystem *sys);   /* alias of ctr_audio_step_core1 */
+void ctr_audio_get_diag(u32 *out_wb_submitted, u32 *out_wb_active, u32 *out_pcm_peak);
 void ctr_audio_shutdown(void);
 u32  ctr_audio_queued_frames(void);
 

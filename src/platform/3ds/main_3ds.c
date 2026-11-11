@@ -368,9 +368,13 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         plat_input_poll(sys->pads, &hkeys);
 
         psx_run_frame(sys);
-        ctr_audio_step_core1(sys); /* Core 0 NDSP backstop (no-op if Core 1 kept up) */
+        ctr_audio_step_core1(sys); /* Core 0 owns NDSP wavebuf submission (v0.2.7) */
         psx_stats_accumulate(&accum, &sys->stats);
         frames_ran++;
+        if (ui) {
+            ctr_ui_record_frame_time(ui, sys->stats.us_frame, sys->stats.us_cpu,
+                                     sys->stats.us_gpu);
+        }
 
         if (ui && ((frames_ran & 3u) == 1u || frames_ran == ar->frames)) {
             ctr_ui_render(ui, sys, hw);
@@ -466,8 +470,15 @@ static void pacer_reset(CtrFramePacer *p) {
     p->step = 0u;
 }
 
-/* Sleeps until this frame's deadline; returns the paced wall time of the frame (us) */
-static u32 pacer_wait(CtrFramePacer *p, bool pal) {
+/* Longest single sleep inside pacer_wait: NDSP is pumped between slices (v0.2.7) */
+#define CTR_PACE_AUDIO_SLICE_US 4000ULL
+
+/*
+ * Sleeps until this frame's deadline, in <= 4 ms slices with a Core 0 NDSP pump between
+ * them, so the 66.7 ms wavebuf ring is topped up even during a 16.67 ms frame sleep.
+ * Returns the paced wall time of the frame (us).
+ */
+static u32 pacer_wait(CtrFramePacer *p, PsxSystem *sys, bool pal) {
     u64 step_us;
     if (pal) {
         step_us = 20000ULL;
@@ -486,8 +497,19 @@ static u32 pacer_wait(CtrFramePacer *p, bool pal) {
         if (sleep_us > CTR_PACE_CATCHUP_US) {
             sleep_us = CTR_PACE_CATCHUP_US; /* clock anomaly guard */
         }
-        plat_sleep_us((u32)sleep_us);
-        now_us = plat_time_us();
+        u64 wake_us = now_us + sleep_us;
+        while (now_us < wake_us) {
+            u64 slice = wake_us - now_us;
+            if (slice > CTR_PACE_AUDIO_SLICE_US) {
+                slice = CTR_PACE_AUDIO_SLICE_US;
+            }
+            plat_sleep_us((u32)slice);
+            now_us = plat_time_us();
+            if (now_us < wake_us) {
+                ctr_audio_step_core1(sys);
+                now_us = plat_time_us();
+            }
+        }
     } else if (now_us > p->deadline_us + CTR_PACE_CATCHUP_US) {
         p->deadline_us = now_us;
     }
@@ -730,7 +752,7 @@ int main(int argc, char **argv) {
                 pacer_reset(&pacer);
             }
             psx_run_frame(sys);
-            /* Core 0 NDSP backstop: < 1 us when Core 1 kept up, else feeds NDSP itself */
+            /* Core 0 NDSP pump (Core 1 only renders SPU audio into the out_ring) */
             ctr_audio_step_core1(sys);
             /*
              * The bottom-screen UI is software-rendered on the ARM11 (~1-2 ms per redraw on
@@ -747,7 +769,7 @@ int main(int argc, char **argv) {
             if (ui_input) {
                 ctr_ui_render(ui, sys, &hw);
             }
-            u32 paced_us = pacer_wait(&pacer, sys->gpu.disp.pal != 0u);
+            u32 paced_us = pacer_wait(&pacer, sys, sys->gpu.disp.pal != 0u);
             ctr_ui_record_frame_time(ui, paced_us, sys->stats.us_cpu, sys->stats.us_gpu);
         } else {
             pacer_reset(&pacer);

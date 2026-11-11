@@ -539,7 +539,17 @@ static void cd_exec_command(PsxSystem *sys, u8 cmd) {
             break;
         }
         case 0x05u: {
-            u8 r[3] = { cd_make_stat(cd), 0x01u, 0x01u };
+            /*
+             * Read SCEx counters (total_reads, success_count):
+             *  - In the Lead-In area (cur_lba < 150) while not playing CD-DA / reading data,
+             *    return 0x01, 0x01 for BIOS / early Lead-In checks.
+             *  - While playing CD-DA, reading data sectors, or positioned in the data/audio
+             *    area (cur_lba >= 150), genuine hardware reads 0 SCEx strings (0x00, 0x00);
+             *    returning non-zero here trips 1999+ anti-modchip checks (e.g. Winning
+             *    Eleven 4 "強制終了しました。本体が改造されているおそれがあります。").
+             */
+            u8 scex = (cd->playing || cd->reading || cd->cur_lba >= 150u) ? 0x00u : 0x01u;
+            u8 r[3] = { cd_make_stat(cd), scex, scex };
             cd_queue_int(sys, CD_INT3_ACK, r, 3u, PSX_CD_ACK_CYCLES);
             break;
         }

@@ -488,6 +488,75 @@ static int test_spu_async_savestate_and_ring(void) {
     return 0;
 }
 
+/*
+ * v0.2.7: in async_mode (3DS) Core 0 reads ENDX / ADSR volume / repeat address from SpuVoice
+ * state that Core 1 owns. Writes queued in cmd_ring must be visible to spu_mmio_read right
+ * away, before spu_render_queued_async drains the ring.
+ */
+static int test_spu_async_readback_coherency(void) {
+    const u32 v0 = PSX_REG_SPU_BASE;
+    const u32 v1 = PSX_REG_SPU_BASE + 0x10u;
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async  = true;
+    g_sys.cfg.spu_reverb = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init SPU coherency");
+    spu_init(&g_sys);
+    CHECK_TRUE(g_sys.spu.async_mode && !g_sys.spu.irq_enabled, "async SPSC SPU path");
+
+    /* Voice 0: one-shot block (Loop End, no Repeat) -> ENDX bit 0 once it is fetched */
+    write_adpcm_block(g_sys.spu.ram, 0x2000u, 0x01u, 0x01u, 0x66u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_L, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_MAIN_VOL_R, 0x3FFFu, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPUCNT, 0xC000u, 2u);
+    spu_mmio_write(&g_sys, v0 + 0x04u, 0x1000u, 2u);
+    spu_mmio_write(&g_sys, v0 + 0x06u, 0x0400u, 2u); /* start 0x2000 */
+    spu_mmio_write(&g_sys, v0 + 0x08u, 0x000Fu, 2u);
+    spu_mmio_write(&g_sys, v0 + 0x0Au, 0x0000u, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_KON_LO, 0x0001u, 2u);
+    (void)run_async_batches(4u);
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "setup commands drained");
+    CHECK_TRUE((spu_mmio_read(&g_sys, PSX_REG_SPU_ENDX_LO, 2u) & 1u) != 0u,
+               "voice 0 reached Loop End -> ENDX bit 0 set");
+
+    /* Queue writes WITHOUT rendering: reads on Core 0 must already reflect them */
+    spu_mmio_write(&g_sys, v1 + 0x0Eu, 0x0123u, 2u); /* repeat_addr = 0x0918 */
+    spu_mmio_write(&g_sys, v1 + 0x0Cu, 0x2345u, 2u); /* current ADSR volume */
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) > 0u, "writes queued in cmd_ring (not yet applied)");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v1 + 0x0Eu, 2u) == 0x0123u,
+               "repeat_addr readback before cmd_ring drain");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v1 + 0x0Cu, 2u) == 0x2345u,
+               "adsr_vol readback before cmd_ring drain");
+
+    spu_mmio_write(&g_sys, v0 + 0x0Cu, 0x1111u, 2u);
+    spu_mmio_write(&g_sys, PSX_REG_SPU_KON_LO, 0x0001u, 2u);
+    CHECK_TRUE((spu_mmio_read(&g_sys, PSX_REG_SPU_ENDX_LO, 2u) & 1u) == 0u,
+               "KON clears ENDX bit 0 before cmd_ring drain");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v0 + 0x0Cu, 2u) == 0x0000u,
+               "KON zeroes voice 0 ADSR volume before cmd_ring drain");
+
+    /* KON high (voices 16..23) */
+    spu_mmio_write(&g_sys, PSX_REG_SPU_BASE + 0x170u + 0x0Cu, 0x3333u, 2u); /* voice 23 */
+    CHECK_TRUE(spu_mmio_read(&g_sys, PSX_REG_SPU_BASE + 0x170u + 0x0Cu, 2u) == 0x3333u,
+               "voice 23 adsr_vol readback");
+    spu_mmio_write(&g_sys, PSX_REG_SPU_KON_HI, 0x0080u, 2u);
+    CHECK_TRUE(spu_mmio_read(&g_sys, PSX_REG_SPU_BASE + 0x170u + 0x0Cu, 2u) == 0x0000u,
+               "KON_HI zeroes voice 23 ADSR volume before cmd_ring drain");
+
+    /* Draining the ring keeps the queued values (no stale regs[] overwrite from Core 1) */
+    u32 n;
+    while ((n = spu_render_queued_async(&g_sys, 64u)) != 0u) {
+    }
+    CHECK_TRUE(spu_cmd_backlog(&g_sys) == 0u, "coherency writes drained");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v1 + 0x0Eu, 2u) == 0x0123u, "repeat_addr after drain");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v1 + 0x06u, 2u) == 0x0000u, "voice 1 start reg untouched");
+    CHECK_TRUE(spu_mmio_read(&g_sys, v0 + 0x06u, 2u) == 0x0400u, "voice 0 start reg mirror");
+
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     if (test_adpcm_decoder() != 0) {
         return 1;
@@ -499,6 +568,9 @@ int main(void) {
         return 1;
     }
     if (test_spu_async_savestate_and_ring() != 0) {
+        return 1;
+    }
+    if (test_spu_async_readback_coherency() != 0) {
         return 1;
     }
     printf("test_periph_spu PASS (arch_armv6k=%d)\n", PSX3DS_ARCH_ARMV6K);

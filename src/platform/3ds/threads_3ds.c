@@ -177,7 +177,9 @@ void plat_yield(void) {
 
 /*
  * Core 1: 500 us cadence (2 kHz) comfortably covers 44.1 kHz in 64-frame render chunks;
- * ctr_audio_step_core1() itself only renders time Core 0 has already queued.
+ * ctr_audio_render_core1() only renders time Core 0 has already queued into the SPU
+ * out_ring. v0.2.7: Core 1 never touches NDSP / DSP_FlushDataCache (dspHandle IPC raced
+ * ndspThreadMain and could not clean Core 0's L1 D-cache) — Core 0 submits wavebufs.
  */
 static void spu_core1_worker(void *arg) {
     PsxSystem *sys = (PsxSystem *)arg;
@@ -186,7 +188,7 @@ static void spu_core1_worker(void *arg) {
             continue;
         }
         if (sys && !__atomic_load_n(&sys->quit, __ATOMIC_ACQUIRE)) {
-            ctr_audio_step_core1(sys);
+            ctr_audio_render_core1(sys);
         }
         plat_sleep_us(500u);
     }
@@ -232,7 +234,7 @@ void ctr_threads_start_workers(PsxSystem *sys, CtrHwInfo *hw) {
          * v0.2.4/v0.2.5) it sat below the 0x30 SysCore quota thread and was starved (or
          * fell back to Core 0, where main() never yields) -> no audio on real hardware.
          * The worker sleeps 500 us per step and parks 10 ms on APT suspend, so 0x2F never
-         * blocks HOME Menu transitions. Core 0 also pumps NDSP every frame as a backstop.
+         * blocks HOME Menu transitions. Core 0 owns all NDSP wavebuf submission (v0.2.7).
          */
         s32 spu_prio = (main_prio > 0x19) ? (main_prio - 1) : main_prio;
         g_spu_worker = plat_thread_create(spu_core1_worker, sys, 32768u, spu_prio, 1);

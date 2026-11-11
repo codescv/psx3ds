@@ -437,6 +437,95 @@ static int test_cdrom_commands_and_readahead(void) {
     return 0;
 }
 
+/* Test(0x05) GetSCExCounters -> returns the 2 counter bytes (after stat) */
+static int scex_counters(u8 *out_total, u8 *out_ok) {
+    u8 resp[16];
+    cd_push_param(0x05u);
+    cd_send_cmd(0x19u);
+    cdrom_event_cb(&g_sys, 0u);
+    CHECK_TRUE(cd_irq_flag() == 3u, "Test(0x05) -> INT3");
+    CHECK_TRUE(cd_drain_resp(resp, 16u) == 3u, "Test(0x05) returns stat + 2 counters");
+    cd_ack_irq(0x07u);
+    *out_total = resp[1];
+    *out_ok    = resp[2];
+    return 0;
+}
+
+static int cd_seekl_lba(u8 mm, u8 ss, u8 ff) {
+    u8 resp[16];
+    cd_push_param(mm);
+    cd_push_param(ss);
+    cd_push_param(ff);
+    cd_send_cmd(0x02u); /* Setloc */
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    cd_send_cmd(0x15u); /* SeekL */
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    cdrom_event_cb(&g_sys, 0u);
+    CHECK_TRUE(cd_irq_flag() == 2u, "SeekL complete -> INT2");
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    return 0;
+}
+
+/*
+ * Winning Eleven 4 (SLPM_862.91) anti-modchip regression: the game seeks to 11:47:00,
+ * plays CD-DA, issues Test(0x04) ResetSCExCounters and later Test(0x05). Real hardware
+ * reads no SCEx wobble outside the Lead-In, so a non-zero count means "modchip".
+ */
+static int test_cdrom_scex_counters(void) {
+    memset(&g_sys, 0, sizeof(g_sys));
+    psx_config_defaults(&g_sys.cfg, true);
+    g_sys.cfg.spu_async = false;
+    CHECK_TRUE(arena_init(&g_sys.arena, 2u * 1024u * 1024u) == PSX_OK, "arena_init SCEx");
+    spu_init(&g_sys);
+    cdrom_init(&g_sys);
+    cd_write_idx(1u);
+    cdrom_mmio_write(&g_sys, PSX_REG_CDROM_REG2, 0x1Fu, 1u);
+    CHECK_TRUE(cdrom_load(&g_sys, TEST_CUE_PATH) == PSX_OK, "cdrom_load (SCEx test)");
+
+    u8 total = 0xEEu, ok = 0xEEu;
+    CHECK_TRUE(scex_counters(&total, &ok) == 0, "GetSCExCounters idle");
+    CHECK_TRUE(g_sys.cdrom.cur_lba < 150u, "idle head in Lead-In area");
+    CHECK_TRUE(total == 0x01u && ok == 0x01u, "idle Lead-In GetSCExCounters -> 01 01");
+
+    /* Seek past the Lead-In: 00:04:50 = LBA 200 */
+    CHECK_TRUE(cd_seekl_lba(0x00u, 0x04u, 0x50u) == 0, "SeekL to LBA 200");
+    CHECK_TRUE(g_sys.cdrom.cur_lba >= 150u, "head positioned at LBA >= 150");
+    CHECK_TRUE(scex_counters(&total, &ok) == 0, "GetSCExCounters at LBA 200");
+    CHECK_TRUE(total == 0x00u && ok == 0x00u, "GetSCExCounters at LBA >= 150 -> 00 00");
+
+    /* Back into the Lead-In area, then Play (0x03) CD-DA: no SCEx while playing */
+    CHECK_TRUE(cd_seekl_lba(0x00u, 0x02u, 0x06u) == 0, "SeekL to LBA 6");
+    CHECK_TRUE(scex_counters(&total, &ok) == 0, "GetSCExCounters at LBA 6");
+    CHECK_TRUE(total == 0x01u && ok == 0x01u, "idle LBA 6 GetSCExCounters -> 01 01");
+
+    u8 resp[16];
+    cd_push_param(0x04u); /* ResetSCExCounters */
+    cd_send_cmd(0x19u);
+    cdrom_event_cb(&g_sys, 0u);
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+
+    cd_send_cmd(0x03u); /* Play */
+    cdrom_event_cb(&g_sys, 0u);
+    CHECK_TRUE(cd_irq_flag() == 3u, "Play -> INT3");
+    (void)cd_drain_resp(resp, 16u);
+    cd_ack_irq(0x07u);
+    CHECK_TRUE(g_sys.cdrom.playing, "CD-DA Play active");
+    CHECK_TRUE(scex_counters(&total, &ok) == 0, "GetSCExCounters while playing");
+    CHECK_TRUE(total == 0x00u && ok == 0x00u,
+               "GetSCExCounters while playing CD-DA -> 00 00 (Winning Eleven 4 anti-modchip)");
+
+    cdrom_shutdown(&g_sys);
+    spu_shutdown(&g_sys);
+    arena_destroy(&g_sys.arena);
+    return 0;
+}
+
 int main(void) {
     cleanup_temp_files();
     if (build_test_disc_images() != 0) {
@@ -448,6 +537,10 @@ int main(void) {
         return 1;
     }
     if (test_cdrom_commands_and_readahead() != 0) {
+        cleanup_temp_files();
+        return 1;
+    }
+    if (test_cdrom_scex_counters() != 0) {
         cleanup_temp_files();
         return 1;
     }
