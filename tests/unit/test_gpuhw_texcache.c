@@ -415,6 +415,100 @@ static int test_small_mem_mru_inflight(u16 *vram) {
     return 0;
 }
 
+/*
+ * v0.2.4 regression (Winning Eleven 3 title screen right-column stripes on the PICA200
+ * backend): an 8bpp TexPage at tp_x = 960 must not wrap onto the framebuffer at X = 0..63
+ * for coherence/invalidation, GPU->shadow readback must only touch GPU-dirty cells (never
+ * write back CPU-uploaded texels with a forced STP bit), and CPU uploads are exact 8x8 tiles.
+ */
+static int test_texpage_wrap_and_cell_coherence(u16 *vram) {
+    /* 1. TexPage coherence width clamps at the right VRAM edge */
+    CHECK(gpu_texpage_coherence_width(960u, 1u) == 64u, "8bpp tp_x=960 clamps to 64 words");
+    CHECK(gpu_texpage_coherence_width(896u, 1u) == 128u, "8bpp tp_x=896 keeps 128 words");
+    CHECK(gpu_texpage_coherence_width(960u, 0u) == 64u, "4bpp tp_x=960 keeps 64 words");
+    CHECK(gpu_texpage_coherence_width(768u, 2u) == 256u, "15bpp tp_x=768 keeps 256 words");
+    CHECK(gpu_texpage_coherence_width(832u, 2u) == 192u, "15bpp tp_x=832 clamps to 192 words");
+
+    /* 2. Texcache: framebuffer writes at X = 0..63 never invalidate the tp_x = 960 page */
+    GpuTexCache tc;
+    PsxStats stats;
+    memset(&stats, 0, sizeof(stats));
+    memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+    CHECK(gpu_texcache_init(&tc, false, 0u), "gpu_texcache_init (5551)");
+    u16 clut = (u16)(480u << 6);
+    for (u32 i = 0u; i < 256u; ++i) {
+        vram[(480u << 10) + i] = (u16)(0x0400u | i);
+    }
+    vram[960u] = 0x8100u; /* texels 0x00, 0x81 */
+    const u16 tp960 = 0x000Fu; /* tp_x = 15 * 64 = 960, tp_y = 0 */
+    bool hit = true;
+    const GpuTexSlot *s = gpu_texcache_lookup(&tc, vram, tp960, 1u, clut, NULL, &stats, &hit);
+    CHECK(s != NULL && !hit && stats.gpu_tex_uploads == 1u, "tp_x=960 8bpp initial decode");
+    gpu_texcache_invalidate_vram(&tc, 0u, 0u, 64u, 256u); /* framebuffer at X = 0..63 */
+    s = gpu_texcache_lookup(&tc, vram, tp960, 1u, clut, NULL, &stats, &hit);
+    CHECK(s != NULL && hit && stats.gpu_tex_uploads == 1u,
+          "tp_x=960 8bpp page NOT invalidated by dirty rect at X=0..63 (no wrap)");
+    gpu_texcache_invalidate_vram(&tc, 1008u, 0u, 16u, 16u);
+    s = gpu_texcache_lookup(&tc, vram, tp960, 1u, clut, NULL, &stats, &hit);
+    CHECK(s != NULL && !hit && stats.gpu_tex_uploads == 2u, "tp_x=960 page invalidated at X=1008");
+    gpu_texcache_shutdown(&tc);
+
+    /* 3. Fully-covered cell masks (with X wrap) */
+    u64 cols = 0ULL;
+    u32 rows = 0u;
+    gpu_vram_rect_full_cell_masks(960u, 0u, 64u, 256u, &cols, &rows);
+    CHECK(cols == 0xF000000000000000ULL && rows == 0x0000FFFFu, "full cells of (960,0,64,256)");
+    gpu_vram_rect_full_cell_masks(8u, 8u, 16u, 16u, &cols, &rows);
+    CHECK(cols == 0ULL && rows == 0u, "unaligned 16x16 rect covers no full cell");
+    gpu_vram_rect_full_cell_masks(1008u, 0u, 32u, 16u, &cols, &rows);
+    CHECK(cols == 0x8000000000000001ULL && rows == 1u, "wrapping rect covers cells 63 and 0");
+
+    /* 4. Readback touches only GPU-dirty cells (+ exclusion rect) */
+    u16 *tiled = (u16 *)malloc(GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+    CHECK(tiled != NULL, "alloc tiled VRAM image");
+    for (u32 y = 0u; y < GPU_HW_VRAM_H; ++y) {
+        for (u32 x = 0u; x < GPU_HW_VRAM_W; ++x) {
+            tiled[gpu_vram_tiled_index(x, y)] = gpu_psx_to_rgba5551_opaque(0x1234u);
+            vram[(y << 10) + x] = 0x00AAu; /* 8bpp texel pair, STP bit clear */
+        }
+    }
+    u64 dirty[GPU_HW_CELL_ROWS];
+    memset(dirty, 0, sizeof(dirty));
+    dirty[0] = 1ULL << 0;  /* framebuffer cell (0..15, 0..15) */
+    dirty[1] = 1ULL << 1;  /* cell (16..31, 16..31) */
+    gpu_vram_rect_cell_masks(960u, 0u, 128u, 256u, &cols, &rows); /* wraps: cells 60..63, 0..3 */
+    u32 n = gpu_morton_readback_cells(vram, tiled, dirty, cols, rows, 20u, 20u, 4u, 4u);
+    CHECK(n == 2u, "readback copied exactly the 2 dirty cells");
+    CHECK(vram[(5u << 10) + 7u] == 0x1234u, "dirty framebuffer cell synced from vram_tex");
+    CHECK(vram[(17u << 10) + 17u] == 0x1234u, "dirty cell (1,1) synced outside exclusion");
+    CHECK(vram[(21u << 10) + 21u] == 0x00AAu, "exclusion rect pixels left untouched");
+    for (u32 y = 0u; y < 256u; ++y) {
+        for (u32 x = 960u; x < 1024u; ++x) {
+            CHECK(vram[(y << 10) + x] == 0x00AAu,
+                  "non-dirty tp_x=960 texels never written back (no forced STP bit)");
+        }
+    }
+    CHECK(vram[(5u << 10) + 40u] == 0x00AAu, "non-dirty cell (0,2) untouched");
+
+    /* 5. Exact 8x8-tile upload mask (with X wrap) */
+    u64 tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS];
+    memset(tiles, 0, sizeof(tiles));
+    gpu_vram_rect_tile_mark(tiles, 1020u, 4u, 8u, 2u);
+    CHECK(tiles[0][1] == (1ULL << 63) && tiles[0][0] == 1ULL, "tile mark wraps 1020..1027");
+    CHECK(tiles[1][0] == 0ULL && tiles[1][1] == 0ULL, "tile row 1 untouched");
+    memset(tiled, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+    vram[(3u << 10) + 1023u] = 0x001Fu;
+    vram[(3u << 10) + 2u]    = 0x7C00u;
+    CHECK(gpu_morton_upload_tiles(tiled, vram, tiles) == 2u, "uploaded exactly 2 tiles");
+    CHECK(tiled[gpu_vram_tiled_index(1023u, 3u)] == gpu_psx_to_rgba5551_opaque(0x001Fu),
+          "tile 127 uploaded");
+    CHECK(tiled[gpu_vram_tiled_index(2u, 3u)] == gpu_psx_to_rgba5551_opaque(0x7C00u),
+          "tile 0 uploaded");
+    CHECK(tiled[gpu_vram_tiled_index(8u, 3u)] == 0u, "tile 1 (not dirty) not uploaded");
+    free(tiled);
+    return 0;
+}
+
 int main(void) {
     u16 *vram = (u16 *)calloc(GPU_HW_VRAM_W * GPU_HW_VRAM_H, sizeof(u16));
     CHECK(vram != NULL, "calloc 1 MiB shadow VRAM");
@@ -424,7 +518,8 @@ int main(void) {
         test_decoders_and_texwindow(vram) != 0 ||
         test_texcache_lru_clut_and_invalidation(vram) != 0 ||
         test_tile_masks_classify(vram) != 0 ||
-        test_small_mem_mru_inflight(vram) != 0) {
+        test_small_mem_mru_inflight(vram) != 0 ||
+        test_texpage_wrap_and_cell_coherence(vram) != 0) {
         free(vram);
         return 1;
     }

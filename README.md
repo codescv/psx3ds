@@ -292,6 +292,11 @@ The emulator creates the `psx3ds/` directories on first launch.
 >   `APTHOOK_ONSUSPEND` and never calls `C3D_FrameSync()` / `C3D_FrameBegin()` unless
 >   `aptIsActive() && !aptShouldClose()`. The Core 1 (SysCore) SPU worker now runs below the main
 >   thread priority, and both worker threads idle (no NDSP/DSP/SDMC access) while suspended/asleep.
+> - **PICA200 title-screen stripes (368 px modes):** an 8bpp TexPage at `tp_x = 960` was treated as
+>   wrapping onto the framebuffer at `X = 0..63`, forcing a GPU readback that also copied *non-dirty*
+>   cells back into shadow VRAM with the STP bit forced to 1 (odd 8bpp texels gained `+128`). TexPage
+>   coherence is now clamped at `X = 1023`, readback only touches GPU-dirty 16x16 cells (whole cells),
+>   and CPU uploads re-upload exact 8x8 tiles instead of one bounding box.
 
 ### Controls
 

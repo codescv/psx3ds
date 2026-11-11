@@ -20,6 +20,10 @@
 #define GPU_HW_CELL_SIZE         (1u << GPU_HW_CELL_SHIFT)
 #define GPU_HW_CELL_COLS         (GPU_HW_VRAM_W >> GPU_HW_CELL_SHIFT) /* 64 */
 #define GPU_HW_CELL_ROWS         (GPU_HW_VRAM_H >> GPU_HW_CELL_SHIFT) /* 32 */
+/* 8x8 Morton-tile grid (128 x 64 tiles) used for exact CPU -> vram_tex uploads */
+#define GPU_HW_TILE_COLS         (GPU_HW_VRAM_W >> 3) /* 128 */
+#define GPU_HW_TILE_ROWS         (GPU_HW_VRAM_H >> 3) /* 64 */
+#define GPU_HW_TILE_WORDS        (GPU_HW_TILE_COLS / 64u) /* 2 x u64 per tile row */
 
 typedef enum GpuTexAlphaClass {
     GPU_TEX_ALPHA_ALL_OPAQUE = 0, /* No non-zero texel has STP=1 (RGBA5551, 1 pass) */
@@ -162,6 +166,37 @@ GpuTexAlphaClass gpu_tex_tiles_classify(const GpuTexTileMasks *tm,
 void gpu_morton_swizzle_vram_rect_5551(u16 *dst_morton, u32 dst_w, u32 dst_h,
                                        const u16 *vram, u16 src_x, u16 src_y, u16 w, u16 h);
 
+/*
+ * Full-VRAM 1024x512 Morton-tiled RGBA5551 image (vram_tex / upload_tex / readback layout):
+ * 8x8 tile (tx, ty) = (x >> 3, y >> 3) starts at ((ty * 128) + tx) * 64.
+ */
+static inline u32 gpu_vram_tiled_index(u32 x, u32 y) {
+    return ((((y >> 3) * GPU_HW_TILE_COLS) + (x >> 3)) << 6) + gpu_morton8x8_lut[y & 7u][x & 7u];
+}
+
+/* Mark every 8x8 tile touched by the (wrapping) VRAM rect in a [64][2] tile bitmask */
+void gpu_vram_rect_tile_mark(u64 tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS],
+                             u16 x, u16 y, u16 w, u16 h);
+
+/*
+ * Swizzle every marked 8x8 tile of linear PSX shadow VRAM into the full-VRAM Morton image
+ * (opaque A=1). Returns the number of tiles converted.
+ */
+u32 gpu_morton_upload_tiles(u16 *tiled, const u16 *vram,
+                            const u64 tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS]);
+
+/*
+ * GPU -> shadow readback restricted to dirty 16x16 cells: for every cell (r, c) with
+ * (rows >> r) & 1 and (dirty[r] & cols) bit c set, un-swizzle the WHOLE cell from the
+ * full-VRAM Morton image into shadow VRAM, skipping pixels inside the optional exclusion
+ * rect (ex_w/ex_h == 0 disables it). Cells that are not GPU-dirty are never touched, so
+ * CPU-uploaded data (whose STP bit the opaque upload forced to 1) is never written back.
+ * Returns the number of cells copied.
+ */
+u32 gpu_morton_readback_cells(u16 *vram, const u16 *tiled,
+                              const u64 dirty[GPU_HW_CELL_ROWS], u64 cols, u32 rows,
+                              u16 ex_x, u16 ex_y, u16 ex_w, u16 ex_h);
+
 /* Swizzle a 24-bit RGB display region from PSX shadow VRAM into a WxH RGBA8 Morton texture */
 void gpu_morton_swizzle_vram_24bpp_8888(u32 *dst_morton, u32 dst_w, u32 dst_h,
                                         const u16 *vram, u16 src_x, u16 src_y, u16 w_px, u16 h_px);
@@ -171,6 +206,23 @@ void gpu_morton_swizzle_vram_24bpp_8888(u32 *dst_morton, u32 dst_w, u32 dst_h,
  * -------------------------------------------------------------------------- */
 u32  gpu_clut_hash_fnv1a(const u16 *vram, u16 clut_attr, u8 tex_depth);
 void gpu_vram_rect_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *out_rows);
+/* Like gpu_vram_rect_cell_masks, but only 16x16 cells FULLY covered by the (wrapping) rect */
+void gpu_vram_rect_full_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *out_rows);
+
+/*
+ * VRAM columns a TexPage covers for render-to-texture coherence and texcache invalidation,
+ * clamped at the right VRAM edge: an 8bpp page at tp_x = 960 (or 15bpp at >= 768) would
+ * otherwise wrap into X = 0.. (usually the live framebuffer) and force a GPU readback +
+ * re-decode on every draw. Texels past X = 1023 are not sampled by real games.
+ */
+static inline u16 gpu_texpage_coherence_width(u16 tp_x, u8 eff_depth) {
+    u32 w = (eff_depth == 0u) ? 64u : ((eff_depth == 1u) ? 128u : 256u);
+    u32 x = (u32)tp_x & (GPU_HW_VRAM_W - 1u);
+    if (x + w > GPU_HW_VRAM_W) {
+        w = GPU_HW_VRAM_W - x;
+    }
+    return (u16)w;
+}
 
 /* Old 3DS (small_mem) slot cap: 20 x 128 KiB RGBA5551 pages = 2.5 MiB LINEAR RAM */
 #define GPU_HW_TEXCACHE_SLOTS_SMALL 20u

@@ -369,3 +369,100 @@ void gpu_morton_swizzle_vram_24bpp_8888(u32 *dst_morton, u32 dst_w, u32 dst_h,
         }
     }
 }
+
+void gpu_vram_rect_tile_mark(u64 tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS],
+                             u16 x, u16 y, u16 w, u16 h) {
+    if (!tiles || w == 0u || h == 0u) {
+        return;
+    }
+    u32 x0 = (u32)x & (GPU_HW_VRAM_W - 1u);
+    u32 y0 = (u32)y & (GPU_HW_VRAM_H - 1u);
+    u32 cw = ((u32)w > GPU_HW_VRAM_W) ? GPU_HW_VRAM_W : (u32)w;
+    u32 ch = ((u32)h > GPU_HW_VRAM_H) ? GPU_HW_VRAM_H : (u32)h;
+
+    u64 colmask[GPU_HW_TILE_WORDS] = { 0ULL, 0ULL };
+    u32 tx_first = x0 >> 3;
+    u32 tx_count = (((x0 & 7u) + cw + 7u) >> 3);
+    if (tx_count > GPU_HW_TILE_COLS) {
+        tx_count = GPU_HW_TILE_COLS;
+    }
+    for (u32 i = 0u; i < tx_count; ++i) {
+        u32 tx = (tx_first + i) & (GPU_HW_TILE_COLS - 1u);
+        colmask[tx >> 6] |= 1ULL << (tx & 63u);
+    }
+    u32 ty_first = y0 >> 3;
+    u32 ty_count = (((y0 & 7u) + ch + 7u) >> 3);
+    if (ty_count > GPU_HW_TILE_ROWS) {
+        ty_count = GPU_HW_TILE_ROWS;
+    }
+    for (u32 i = 0u; i < ty_count; ++i) {
+        u32 ty = (ty_first + i) & (GPU_HW_TILE_ROWS - 1u);
+        for (u32 k = 0u; k < GPU_HW_TILE_WORDS; ++k) {
+            tiles[ty][k] |= colmask[k];
+        }
+    }
+}
+
+u32 gpu_morton_upload_tiles(u16 *tiled, const u16 *vram,
+                            const u64 tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS]) {
+    if (!tiled || !vram || !tiles) {
+        return 0u;
+    }
+    u32 n = 0u;
+    for (u32 ty = 0u; ty < GPU_HW_TILE_ROWS; ++ty) {
+        for (u32 k = 0u; k < GPU_HW_TILE_WORDS; ++k) {
+            u64 m = tiles[ty][k];
+            while (m != 0ULL) {
+                u32 tx = (k << 6) + (u32)__builtin_ctzll(m);
+                m &= m - 1ULL;
+                u16 *tile = tiled + (((ty * GPU_HW_TILE_COLS) + tx) << 6);
+                for (u32 py = 0u; py < 8u; ++py) {
+                    const u16 *vrow = vram + ((((ty << 3) + py)) << 10) + (tx << 3);
+                    for (u32 px = 0u; px < 8u; ++px) {
+                        tile[gpu_morton8x8_lut[py][px]] = gpu_psx_to_rgba5551_opaque(vrow[px]);
+                    }
+                }
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+u32 gpu_morton_readback_cells(u16 *vram, const u16 *tiled,
+                              const u64 dirty[GPU_HW_CELL_ROWS], u64 cols, u32 rows,
+                              u16 ex_x, u16 ex_y, u16 ex_w, u16 ex_h) {
+    if (!vram || !tiled || !dirty) {
+        return 0u;
+    }
+    bool has_ex = (ex_w != 0u && ex_h != 0u);
+    u32 exx = (u32)ex_x & (GPU_HW_VRAM_W - 1u);
+    u32 exy = (u32)ex_y & (GPU_HW_VRAM_H - 1u);
+    u32 n = 0u;
+    for (u32 r = 0u; r < GPU_HW_CELL_ROWS; ++r) {
+        if (((rows >> r) & 1u) == 0u) {
+            continue;
+        }
+        u64 m = dirty[r] & cols;
+        while (m != 0ULL) {
+            u32 c = (u32)__builtin_ctzll(m);
+            m &= m - 1ULL;
+            u32 x0 = c << GPU_HW_CELL_SHIFT;
+            u32 y0 = r << GPU_HW_CELL_SHIFT;
+            for (u32 py = 0u; py < GPU_HW_CELL_SIZE; ++py) {
+                u32 vy = y0 + py;
+                bool row_in_ex = has_ex && (((vy - exy) & (GPU_HW_VRAM_H - 1u)) < (u32)ex_h);
+                u16 *dst_row = vram + (vy << 10);
+                for (u32 px = 0u; px < GPU_HW_CELL_SIZE; ++px) {
+                    u32 vx = x0 + px;
+                    if (row_in_ex && (((vx - exx) & (GPU_HW_VRAM_W - 1u)) < (u32)ex_w)) {
+                        continue;
+                    }
+                    dst_row[vx] = gpu_rgba5551_to_psx(tiled[gpu_vram_tiled_index(vx, vy)]);
+                }
+            }
+            n++;
+        }
+    }
+    return n;
+}

@@ -124,7 +124,8 @@ typedef struct GpuHwState {
     u64               gpu_dirty_rows[GPU_HW_CELL_ROWS];
     u64               cpu_dirty_rows[GPU_HW_CELL_ROWS];
     bool              any_cpu_dirty;
-    u16               cpu_dx0, cpu_dy0, cpu_dx1, cpu_dy1;
+    /* Exact 8x8-tile CPU upload mask (128 x 64 tiles): only these tiles are re-uploaded */
+    u64               cpu_dirty_tiles[GPU_HW_TILE_ROWS][GPU_HW_TILE_WORDS];
 } GpuHwState;
 
 /* --------------------------------------------------------------------------
@@ -156,46 +157,24 @@ static void grid_mark_rect(u64 grid[GPU_HW_CELL_ROWS], u16 x, u16 y, u16 w, u16 
     }
 }
 
-static void grid_clear_rect(u64 grid[GPU_HW_CELL_ROWS], u16 x, u16 y, u16 w, u16 h) {
-    u64 cols = 0ULL;
-    u32 rows = 0u;
-    gpu_vram_rect_cell_masks(x, y, w, h, &cols, &rows);
-    for (u32 r = 0; r < GPU_HW_CELL_ROWS; ++r) {
-        if ((rows & (1u << r)) != 0u) {
-            grid[r] &= ~cols;
-        }
-    }
-}
-
 static void mark_cpu_dirty(GpuHwState *st, u16 x, u16 y, u16 w, u16 h) {
     if (w == 0u || h == 0u) {
         return;
     }
     grid_mark_rect(st->cpu_dirty_rows, x, y, w, h);
+    gpu_vram_rect_tile_mark(st->cpu_dirty_tiles, x, y, w, h);
+    st->any_cpu_dirty = true;
+}
 
-    u32 x0 = (u32)x & 0x3FFu;
-    u32 y0 = (u32)y & 0x1FFu;
-    u32 x1 = x0 + (u32)w;
-    u32 y1 = y0 + (u32)h;
-    if (x1 > GPU_HW_VRAM_W) {
-        x0 = 0u;
-        x1 = GPU_HW_VRAM_W;
-    }
-    if (y1 > GPU_HW_VRAM_H) {
-        y0 = 0u;
-        y1 = GPU_HW_VRAM_H;
-    }
-    if (!st->any_cpu_dirty) {
-        st->any_cpu_dirty = true;
-        st->cpu_dx0 = (u16)x0;
-        st->cpu_dy0 = (u16)y0;
-        st->cpu_dx1 = (u16)x1;
-        st->cpu_dy1 = (u16)y1;
-    } else {
-        if (x0 < st->cpu_dx0) st->cpu_dx0 = (u16)x0;
-        if (y0 < st->cpu_dy0) st->cpu_dy0 = (u16)y0;
-        if (x1 > st->cpu_dx1) st->cpu_dx1 = (u16)x1;
-        if (y1 > st->cpu_dy1) st->cpu_dy1 = (u16)y1;
+/* Clear GPU-dirty only for 16x16 cells the rect FULLY covers (shadow is authoritative there) */
+static void grid_clear_full_cells(u64 grid[GPU_HW_CELL_ROWS], u16 x, u16 y, u16 w, u16 h) {
+    u64 cols = 0ULL;
+    u32 rows = 0u;
+    gpu_vram_rect_full_cell_masks(x, y, w, h, &cols, &rows);
+    for (u32 r = 0; r < GPU_HW_CELL_ROWS; ++r) {
+        if ((rows & (1u << r)) != 0u) {
+            grid[r] &= ~cols;
+        }
     }
 }
 
@@ -616,33 +595,14 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
     flush_batch(st);
     restart_frame_and_wait(st);
 
-    u16 ux0 = (u16)(st->cpu_dx0 & ~7u);
-    u16 uy0 = (u16)(st->cpu_dy0 & ~7u);
-    u16 ux1 = (u16)((st->cpu_dx1 + 7u) & ~7u);
-    u16 uy1 = (u16)((st->cpu_dy1 + 7u) & ~7u);
-    if (ux1 > GPU_HW_VRAM_W) ux1 = GPU_HW_VRAM_W;
-    if (uy1 > GPU_HW_VRAM_H) uy1 = GPU_HW_VRAM_H;
-    u16 uw = (u16)(ux1 - ux0);
-    u16 uh = (u16)(uy1 - uy0);
-
-    if (uw > 0u && uh > 0u) {
-        const u16 *vram = st->sys->gpu.vram;
-        u16 *dst = (u16 *)st->upload_tex.data;
-        u32 tx0 = ux0 >> 3, tx1 = ux1 >> 3;
-        u32 ty0 = uy0 >> 3, ty1 = uy1 >> 3;
-        for (u32 ty = ty0; ty < ty1; ++ty) {
-            for (u32 tx = tx0; tx < tx1; ++tx) {
-                u16 *tile = dst + (((ty * (GPU_HW_VRAM_W >> 3)) + tx) << 6);
-                for (u32 py = 0; py < 8u; ++py) {
-                    u32 vy = (ty << 3) + py;
-                    const u16 *vrow = vram + (vy << 10);
-                    for (u32 px = 0; px < 8u; ++px) {
-                        u32 vx = (tx << 3) + px;
-                        tile[gpu_morton8x8_lut[py][px]] = gpu_psx_to_rgba5551_opaque(vrow[vx]);
-                    }
-                }
-            }
-        }
+    /*
+     * Upload ONLY the 8x8 tiles the CPU actually wrote (not their bounding box): a box
+     * spanning two disjoint uploads would overwrite GPU-rendered cells in between that
+     * shadow VRAM has not synced yet.
+     */
+    const u16 *vram = st->sys->gpu.vram;
+    u16 *dst = (u16 *)st->upload_tex.data;
+    if (gpu_morton_upload_tiles(dst, vram, st->cpu_dirty_tiles) > 0u) {
         GSPGPU_FlushDataCache(st->upload_tex.data, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
 
         GpuHwBatchKey ukey;
@@ -657,22 +617,115 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
         ukey.sc_x1        = GPU_HW_VRAM_W;
         ukey.sc_y1        = GPU_HW_VRAM_H;
 
-        GpuHwVertex *v = alloc_batch_verts(st, &ukey, 6u);
-        if (v != NULL) {
-            s16 x0 = (s16)ux0, y0 = (s16)uy0;
-            s16 x1 = (s16)ux1, y1 = (s16)uy1;
-            write_hw_vtx(&v[0], x0, y0, x0, y0, 255, 255, 255, 255);
-            write_hw_vtx(&v[1], x1, y0, x1, y0, 255, 255, 255, 255);
-            write_hw_vtx(&v[2], x0, y1, x0, y1, 255, 255, 255, 255);
-            write_hw_vtx(&v[3], x1, y0, x1, y0, 255, 255, 255, 255);
-            write_hw_vtx(&v[4], x1, y1, x1, y1, 255, 255, 255, 255);
-            write_hw_vtx(&v[5], x0, y1, x0, y1, 255, 255, 255, 255);
-            flush_batch(st);
+        /* One quad per horizontal run of dirty tiles in each 8-line tile row */
+        for (u32 ty = 0u; ty < GPU_HW_TILE_ROWS; ++ty) {
+            u32 tx = 0u;
+            while (tx < GPU_HW_TILE_COLS) {
+                if (((st->cpu_dirty_tiles[ty][tx >> 6] >> (tx & 63u)) & 1ULL) == 0ULL) {
+                    tx++;
+                    continue;
+                }
+                u32 run0 = tx;
+                while (tx < GPU_HW_TILE_COLS &&
+                       ((st->cpu_dirty_tiles[ty][tx >> 6] >> (tx & 63u)) & 1ULL) != 0ULL) {
+                    tx++;
+                }
+                GpuHwVertex *v = alloc_batch_verts(st, &ukey, 6u);
+                if (v == NULL) {
+                    continue;
+                }
+                s16 x0 = (s16)(run0 << 3), y0 = (s16)(ty << 3);
+                s16 x1 = (s16)(tx << 3),   y1 = (s16)((ty + 1u) << 3);
+                write_hw_vtx(&v[0], x0, y0, x0, y0, 255, 255, 255, 255);
+                write_hw_vtx(&v[1], x1, y0, x1, y0, 255, 255, 255, 255);
+                write_hw_vtx(&v[2], x0, y1, x0, y1, 255, 255, 255, 255);
+                write_hw_vtx(&v[3], x1, y0, x1, y0, 255, 255, 255, 255);
+                write_hw_vtx(&v[4], x1, y1, x1, y1, 255, 255, 255, 255);
+                write_hw_vtx(&v[5], x0, y1, x0, y1, 255, 255, 255, 255);
+            }
         }
+        flush_batch(st);
     }
 
+    memset(st->cpu_dirty_tiles, 0, sizeof(st->cpu_dirty_tiles));
     memset(st->cpu_dirty_rows, 0, sizeof(st->cpu_dirty_rows));
     st->any_cpu_dirty = false;
+}
+
+/* --------------------------------------------------------------------------
+ * GPU -> Shadow VRAM Coherence (sync_to_shadow)
+ * -------------------------------------------------------------------------- */
+/*
+ * Copy vram_tex rows of 16x16 cells `cell_rows` (bitmask) into st->readback_buf. Submits
+ * pending draws and leaves the frame CLOSED: C3D_SyncTextureCopy() outside a frame first
+ * waits for (and clears) the GX queue, i.e. for the PICA200 to finish rendering into
+ * vram_tex, and then performs the copy synchronously.
+ */
+static bool readback_cell_rows(GpuHwState *st, u32 cell_rows) {
+    if (cell_rows == 0u) {
+        return false;
+    }
+    st->n_readback++;
+    flush_batch(st);
+    if (st->in_frame) {
+        C3D_FrameEnd(0);
+        st->in_frame = false;
+        st->on_vram_rt = false;
+    }
+    if (st->readback_buf == NULL) {
+        st->readback_buf = (u16 *)linearMemAlign(GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16), 0x80);
+        if (st->readback_buf == NULL) {
+            return false;
+        }
+    }
+    /* One 16-line cell row = two 8-line Morton tile rows of 8192 u16s (16 KB) each */
+    u32 r_first = (u32)__builtin_ctz(cell_rows);
+    u32 r_last  = 31u - (u32)__builtin_clz(cell_rows);
+    u32 tile_row_u16 = GPU_HW_VRAM_W * 8u;
+    u32 off_u16      = (r_first * 2u) * tile_row_u16;
+    u32 copy_bytes   = ((r_last - r_first + 1u) * 2u) * tile_row_u16 * sizeof(u16);
+
+    GSPGPU_InvalidateDataCache(st->readback_buf + off_u16, copy_bytes);
+    C3D_SyncTextureCopy((u32 *)((u16 *)st->vram_tex.data + off_u16), 0u,
+                        (u32 *)(st->readback_buf + off_u16), 0u,
+                        copy_bytes, GX_TRANSFER_RAW_COPY(1));
+    GSPGPU_InvalidateDataCache(st->readback_buf + off_u16, copy_bytes);
+    return true;
+}
+
+/* Rows (bitmask) of `rows` that hold at least one GPU-dirty cell in `cols` */
+static u32 gpu_dirty_rows_in(const GpuHwState *st, u64 cols, u32 rows) {
+    u32 out = 0u;
+    for (u32 r = 0; r < GPU_HW_CELL_ROWS; ++r) {
+        if ((rows & (1u << r)) != 0u && (st->gpu_dirty_rows[r] & cols) != 0ULL) {
+            out |= 1u << r;
+        }
+    }
+    return out;
+}
+
+/* Clear synced GPU-dirty cells and invalidate texcache slots over each run of them */
+static void retire_synced_cells(GpuHwState *st, u64 cols, u32 rows) {
+    for (u32 r = 0; r < GPU_HW_CELL_ROWS; ++r) {
+        if ((rows & (1u << r)) == 0u) {
+            continue;
+        }
+        u64 d = st->gpu_dirty_rows[r] & cols;
+        st->gpu_dirty_rows[r] &= ~cols;
+        while (d != 0ULL) {
+            u32 c0 = (u32)__builtin_ctzll(d);
+            u32 c1 = c0;
+            while (c1 + 1u < GPU_HW_CELL_COLS && ((d >> (c1 + 1u)) & 1ULL) != 0ULL) {
+                c1++;
+            }
+            u64 run = (c1 - c0 + 1u >= 64u) ? ~0ULL : (((1ULL << (c1 - c0 + 1u)) - 1ULL) << c0);
+            d &= ~run;
+            gpu_texcache_invalidate_vram(&st->texcache, (u16)(c0 << GPU_HW_CELL_SHIFT),
+                                         (u16)(r << GPU_HW_CELL_SHIFT),
+                                         (u16)((c1 - c0 + 1u) << GPU_HW_CELL_SHIFT),
+                                         (u16)GPU_HW_CELL_SIZE);
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -683,68 +736,64 @@ static void hw_sync_to_shadow(void *self, u16 x, u16 y, u16 w, u16 h) {
     if (!st || !st->sys || !st->sys->gpu.vram || w == 0u || h == 0u) {
         return;
     }
-    if (!grid_overlaps_rect(st->gpu_dirty_rows, x, y, w, h)) {
+    u64 cols = 0ULL;
+    u32 rows = 0u;
+    gpu_vram_rect_cell_masks(x, y, w, h, &cols, &rows);
+    u32 dirty_rows = gpu_dirty_rows_in(st, cols, rows);
+    if (dirty_rows == 0u || !readback_cell_rows(st, dirty_rows)) {
         return;
     }
 
     /*
-     * Submit pending draws and leave the frame CLOSED: C3D_SyncTextureCopy() outside a
-     * frame first waits for (and clears) the GX queue, i.e. for the PICA200 to finish
-     * rendering into vram_tex, and then performs the copy synchronously.
+     * Sync WHOLE GPU-dirty cells touched by the rect, and nothing else: copying non-dirty
+     * cells would write back vram_tex copies of CPU uploads whose STP bit the opaque
+     * RGBA5551 conversion forced to 1 (e.g. 8bpp texels at odd columns gaining +128), and
+     * syncing only part of a cell before clearing its dirty bit would lose the rest.
      */
-    st->n_readback++;
-    flush_batch(st);
-    if (st->in_frame) {
-        C3D_FrameEnd(0);
-        st->in_frame = false;
-        st->on_vram_rt = false;
-    }
+    (void)gpu_morton_readback_cells(st->sys->gpu.vram, st->readback_buf, st->gpu_dirty_rows,
+                                    cols, dirty_rows, 0u, 0u, 0u, 0u);
+    retire_synced_cells(st, cols, dirty_rows);
+}
 
-    if (st->readback_buf == NULL) {
-        st->readback_buf = (u16 *)linearMemAlign(GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16), 0x80);
-        if (st->readback_buf == NULL) {
+/*
+ * Before shadow-side data (CPU copy) replaces the rect [x, y, w, h): pull the GPU-rendered
+ * pixels of PARTIALLY covered dirty cells that lie OUTSIDE the rect into shadow VRAM, then
+ * retire all GPU-dirty cells the rect touches. Afterwards shadow VRAM is authoritative for
+ * every touched cell, so the 8x8-tile CPU upload cannot clobber GPU pixels around the rect.
+ */
+static void sync_cells_around_rect(GpuHwState *st, u16 x, u16 y, u16 w, u16 h) {
+    if (!st->sys || !st->sys->gpu.vram || w == 0u || h == 0u) {
+        return;
+    }
+    u64 cols = 0ULL, full_cols = 0ULL;
+    u32 rows = 0u, full_rows = 0u;
+    gpu_vram_rect_cell_masks(x, y, w, h, &cols, &rows);
+    gpu_vram_rect_full_cell_masks(x, y, w, h, &full_cols, &full_rows);
+
+    u32 dirty_rows = gpu_dirty_rows_in(st, cols, rows);
+    if (dirty_rows == 0u) {
+        return;
+    }
+    /* A cell is partial if its column or its row is not fully covered */
+    bool any_partial = false;
+    for (u32 r = 0; r < GPU_HW_CELL_ROWS && !any_partial; ++r) {
+        if ((dirty_rows & (1u << r)) == 0u) {
+            continue;
+        }
+        u64 d = st->gpu_dirty_rows[r] & cols;
+        u64 partial = ((full_rows & (1u << r)) != 0u) ? (d & ~full_cols) : d;
+        any_partial = (partial != 0ULL);
+    }
+    if (any_partial) {
+        if (!readback_cell_rows(st, dirty_rows)) {
+            /* No readback buffer: keep partial cells dirty, retire only fully covered ones */
+            grid_clear_full_cells(st->gpu_dirty_rows, x, y, w, h);
             return;
         }
+        (void)gpu_morton_readback_cells(st->sys->gpu.vram, st->readback_buf, st->gpu_dirty_rows,
+                                        cols, dirty_rows, x, y, w, h);
     }
-
-    u32 ty_first = 0u;
-    u32 ty_last  = (GPU_HW_VRAM_H >> 3) - 1u;
-    u32 y0_clamped = (u32)y & 0x1FFu;
-    if ((u32)h < GPU_HW_VRAM_H && (y0_clamped + (u32)h) <= GPU_HW_VRAM_H) {
-        ty_first = y0_clamped >> 3;
-        ty_last  = (y0_clamped + (u32)h - 1u) >> 3;
-    }
-    u32 tile_row_u16 = GPU_HW_VRAM_W * 8u; /* 8192 u16s (16 KB) per 8-scanline Morton tile row */
-    u32 off_u16      = ty_first * tile_row_u16;
-    u32 copy_bytes   = (ty_last - ty_first + 1u) * tile_row_u16 * sizeof(u16);
-
-    GSPGPU_InvalidateDataCache(st->readback_buf + off_u16, copy_bytes);
-    C3D_SyncTextureCopy((u32 *)((u16 *)st->vram_tex.data + off_u16), 0u,
-                        (u32 *)(st->readback_buf + off_u16), 0u,
-                        copy_bytes, GX_TRANSFER_RAW_COPY(1));
-    GSPGPU_InvalidateDataCache(st->readback_buf + off_u16, copy_bytes);
-
-    /*
-     * Un-Morton from vram_tex tile layout: Mtx_Ortho(0, 1024, 512, 0) places
-     * PSX y = 0 (NDC y = +1, t = 1.0) at tile row 0 (offset 0) of vram_tex.data.
-     */
-    u16 *vram = st->sys->gpu.vram;
-    for (u32 dy = 0; dy < (u32)h; ++dy) {
-        u32 vy = ((u32)y + dy) & 0x1FFu;
-        u32 ty = vy >> 3;
-        u32 py = vy & 7u;
-        u16 *dst_row = vram + (vy << 10);
-        for (u32 dx = 0; dx < (u32)w; ++dx) {
-            u32 vx = ((u32)x + dx) & 0x3FFu;
-            u32 tx = vx >> 3;
-            u32 px = vx & 7u;
-            u16 raw = st->readback_buf[(((ty << 7) + tx) << 6) + gpu_morton8x8_lut[py][px]];
-            dst_row[vx] = gpu_rgba5551_to_psx(raw);
-        }
-    }
-
-    grid_clear_rect(st->gpu_dirty_rows, x, y, w, h);
-    gpu_texcache_invalidate_vram(&st->texcache, x, y, w, h);
+    retire_synced_cells(st, cols, dirty_rows);
 }
 
 /* --------------------------------------------------------------------------
@@ -828,6 +877,7 @@ static void hw_reset(void *self) {
     st->any_cpu_dirty = false;
     memset(st->gpu_dirty_rows, 0, sizeof(st->gpu_dirty_rows));
     memset(st->cpu_dirty_rows, 0, sizeof(st->cpu_dirty_rows));
+    memset(st->cpu_dirty_tiles, 0, sizeof(st->cpu_dirty_tiles));
     memset(&st->cur_env, 0, sizeof(st->cur_env));
     st->cur_env.clip_x1 = (s16)(GPU_HW_VRAM_W - 1u);
     st->cur_env.clip_y1 = (s16)(GPU_HW_VRAM_H - 1u);
@@ -944,7 +994,8 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
         u8  eff_depth = (p->tex_depth >= 2u) ? 2u : p->tex_depth;
         u16 tp_x = (u16)((p->texpage & 0x0Fu) << 6);
         u16 tp_y = (u16)(((p->texpage >> 4) & 0x01u) << 8);
-        u16 tp_w = (eff_depth == 0u) ? 64u : ((eff_depth == 1u) ? 128u : 256u);
+        /* Clamped at X = 1023: tp_x = 960 8bpp must not wrap onto the framebuffer at X = 0 */
+        u16 tp_w = gpu_texpage_coherence_width(tp_x, eff_depth);
         if (grid_overlaps_rect(st->gpu_dirty_rows, tp_x, tp_y, tp_w, GPU_HW_TEXPAGE_DIM)) {
             hw_sync_to_shadow(st, tp_x, tp_y, tp_w, GPU_HW_TEXPAGE_DIM);
         }
@@ -1262,8 +1313,12 @@ static void hw_fill_rect(void *self, u16 x, u16 y, u16 w, u16 h, u32 bgr24) {
     emit_fill_subrect(st, x,  0u, w0, h1, r8, g8, b8);
     emit_fill_subrect(st, 0u, 0u, w1, h1, r8, g8, b8);
 
-    /* Shadow VRAM was already updated by gpu.c before fill_rect, so shadow matches GPU */
-    grid_clear_rect(st->gpu_dirty_rows, x, y, w, h);
+    /*
+     * Shadow VRAM was already updated by gpu.c before fill_rect, so shadow matches the GPU
+     * for fully covered cells. Partially covered dirty cells stay dirty: vram_tex holds the
+     * fill AND the GPU pixels around it, so a later whole-cell sync remains exact.
+     */
+    grid_clear_full_cells(st->gpu_dirty_rows, x, y, w, h);
 }
 
 static void hw_vram_written(void *self, u16 x, u16 y, u16 w, u16 h) {
@@ -1271,6 +1326,9 @@ static void hw_vram_written(void *self, u16 x, u16 y, u16 w, u16 h) {
     if (!st || w == 0u || h == 0u) {
         return;
     }
+    /* gpu.c synced this rect to shadow before the CPU write; make every touched cell
+     * shadow-authoritative before the tile upload (no-op unless something stayed dirty) */
+    sync_cells_around_rect(st, x, y, w, h);
     gpu_texcache_invalidate_vram(&st->texcache, x, y, w, h);
     mark_cpu_dirty(st, x, y, w, h);
 }
@@ -1290,6 +1348,7 @@ static void hw_vram_copy(void *self, u16 sx, u16 sy, u16 dx, u16 dy, u16 w, u16 
     if ((src_gpu || dst_gpu) && st->sys && st->sys->gpu.vram) {
         if (src_gpu) hw_sync_to_shadow(st, sx, sy, w, h);
         if (dst_gpu) hw_sync_to_shadow(st, dx, dy, w, h);
+        /* (masked replay below re-applies the copy on top of the synced cells) */
 
         u16 *vram = st->sys->gpu.vram;
         u16 set_bit = st->cur_env.set_mask ? 0x8000u : 0x0000u;
@@ -1312,6 +1371,11 @@ static void hw_vram_copy(void *self, u16 sx, u16 sy, u16 dx, u16 dy, u16 w, u16 
         }
     }
 
+    /*
+     * Shadow now holds the copied rect; GPU-rendered pixels of partially covered dirty
+     * destination cells (outside the rect) are pulled in so the tile upload keeps them.
+     */
+    sync_cells_around_rect(st, dx, dy, w, h);
     gpu_texcache_invalidate_vram(&st->texcache, dx, dy, w, h);
     mark_cpu_dirty(st, dx, dy, w, h);
 }

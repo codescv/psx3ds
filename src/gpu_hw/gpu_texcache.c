@@ -64,6 +64,32 @@ void gpu_vram_rect_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *ou
     *out_rows = rows;
 }
 
+void gpu_vram_rect_full_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *out_rows) {
+    *out_cols = 0ULL;
+    *out_rows = 0u;
+    if (w == 0u || h == 0u) {
+        return;
+    }
+    u32 x0 = (u32)x & (GPU_HW_VRAM_W - 1u);
+    u32 y0 = (u32)y & (GPU_HW_VRAM_H - 1u);
+    u64 cols = 0ULL;
+    u32 rows = 0u;
+    for (u32 c = 0u; c < GPU_HW_CELL_COLS; ++c) {
+        u32 start = ((c << GPU_HW_CELL_SHIFT) - x0) & (GPU_HW_VRAM_W - 1u);
+        if ((u32)w >= GPU_HW_VRAM_W || start + GPU_HW_CELL_SIZE <= (u32)w) {
+            cols |= 1ULL << c;
+        }
+    }
+    for (u32 r = 0u; r < GPU_HW_CELL_ROWS; ++r) {
+        u32 start = ((r << GPU_HW_CELL_SHIFT) - y0) & (GPU_HW_VRAM_H - 1u);
+        if ((u32)h >= GPU_HW_VRAM_H || start + GPU_HW_CELL_SIZE <= (u32)h) {
+            rows |= 1u << r;
+        }
+    }
+    *out_cols = cols;
+    *out_rows = rows;
+}
+
 u32 gpu_clut_hash_fnv1a(const u16 *vram, u16 clut_attr, u8 tex_depth) {
     if (tex_depth >= 2u) {
         return 0u;
@@ -479,7 +505,7 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
     GSPGPU_FlushDataCache(victim->pixels, victim->pixel_bytes);
 #endif
 
-    u16 tp_w_words = (eff_depth == 0u) ? 64u : ((eff_depth == 1u) ? 128u : 256u);
+    u16 tp_w_words = gpu_texpage_coherence_width(tp_x, eff_depth);
     gpu_vram_rect_cell_masks(tp_x, tp_y, tp_w_words, GPU_HW_TEXPAGE_DIM,
                              &victim->tp_col_mask, &victim->tp_row_mask);
     update_slot_clut_footprint(victim, clut_norm, eff_depth);
