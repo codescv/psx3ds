@@ -47,6 +47,7 @@ static ndspWaveBuf g_wbufs[CTR_NDSP_BUF_COUNT];
 static s16         g_last_l = 0;
 static s16         g_last_r = 0;
 static u32         g_wbuf_next = 0u; /* FIFO: next wavebuf to refill / resubmit */
+static bool        g_stream_active = false; /* game audio is (re)started in NDSP */
 static alignas(32) u32 g_step_lock = 0u; /* Core 0 / Core 1 mutual exclusion (trylock) */
 static s16         g_stretch[(CTR_NDSP_BUF_FRAMES + CTR_SPU_DRIFT_MAX) * 2u];
 
@@ -62,6 +63,7 @@ bool ctr_audio_init(PsxSystem *sys) {
     g_last_l = 0;
     g_last_r = 0;
     g_wbuf_next = 0u;
+    g_stream_active = false;
 
     if (g_ndsp_ready) {
         return true;
@@ -112,7 +114,9 @@ bool ctr_audio_init(PsxSystem *sys) {
     return true;
 }
 
+/* Called with the Core 1 worker stopped (boot / reset / autorun start) */
 void ctr_audio_bind_system(PsxSystem *sys) {
+    g_stream_active = false;
     __atomic_store_n(&g_bound_sys, sys, __ATOMIC_RELEASE);
 }
 
@@ -224,6 +228,32 @@ static void audio_step_locked(PsxSystem *sys) {
         }
     }
 
+    bool any_active = false;
+    for (u32 k = 0u; k < CTR_NDSP_BUF_COUNT; k++) {
+        if (g_wbufs[k].status == NDSP_WBUF_PLAYING || g_wbufs[k].status == NDSP_WBUF_QUEUED) {
+            any_active = true;
+            break;
+        }
+    }
+    if (!any_active) {
+        /*
+         * NDSP fully drained. Count ONE underrun per active->drained transition (not one
+         * per 2 kHz poll), then re-prime with 2 full buffers (33.3 ms = one 30 Hz
+         * VSync(2) even+odd pair) before restarting, so a ~22 ms heavy frame right after
+         * a restart cannot drain NDSP again.
+         */
+        if (g_stream_active) {
+            g_stream_active = false;
+            if (sys) {
+                __atomic_fetch_add(&sys->stats.spu_underruns, 1u, __ATOMIC_RELAXED);
+            }
+        }
+        if (queued_frames_for(sys) < CTR_NDSP_BUF_FRAMES * 2u) {
+            return;
+        }
+        g_stream_active = true;
+    }
+
     /*
      * Refill wavebufs in strict FIFO order, and only with a FULL buffer of real samples:
      * a partially-filled buffer would be padded with flat DC and lock NDSP for 16.67 ms
@@ -233,18 +263,6 @@ static void audio_step_locked(PsxSystem *sys) {
            g_wbufs[g_wbuf_next].status == NDSP_WBUF_FREE) {
         u32 avail = queued_frames_for(sys);
         if (avail < CTR_NDSP_BUF_FRAMES) {
-            /* Count an underrun only if ALL wavebufs have drained while game audio is active */
-            bool any_active = false;
-            for (u32 k = 0u; k < CTR_NDSP_BUF_COUNT; k++) {
-                if (g_wbufs[k].status == NDSP_WBUF_PLAYING ||
-                    g_wbufs[k].status == NDSP_WBUF_QUEUED) {
-                    any_active = true;
-                    break;
-                }
-            }
-            if (!any_active && sys && avail > 0u) {
-                sys->stats.spu_underruns++;
-            }
             break;
         }
         ndspWaveBuf *wb  = &g_wbufs[g_wbuf_next];
@@ -307,6 +325,7 @@ void plat_audio_push(const s16 *stereo, u32 frames) {
 void ctr_audio_shutdown(void) {
     __atomic_store_n(&g_bound_sys, NULL, __ATOMIC_RELEASE);
     g_wbuf_next = 0u;
+    g_stream_active = false;
     if (!g_ndsp_ready) {
         return;
     }

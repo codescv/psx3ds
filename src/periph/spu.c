@@ -1098,7 +1098,7 @@ static void spu_render_batch_locked(PsxSystem *sys, u32 frames) {
         spu_render_frames_core(sys, remaining);
     }
 
-    sys->stats.spu_batches++;
+    __atomic_fetch_add(&sys->stats.spu_batches, 1u, __ATOMIC_RELAXED); /* Core 0 or Core 1 */
 }
 
 PSX_HOT void spu_render_batch(PsxSystem *sys, u32 frames) {
@@ -1152,7 +1152,7 @@ PSX_HOT u32 spu_render_queued_async(PsxSystem *sys, u32 max_frames) {
         }
     }
     if (done > 0u) {
-        sys->stats.spu_batches++;
+        __atomic_fetch_add(&sys->stats.spu_batches, 1u, __ATOMIC_RELAXED); /* Core 0 or Core 1 */
     }
 
     spu->defer_irq = 0u;

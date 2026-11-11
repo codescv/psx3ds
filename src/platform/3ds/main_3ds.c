@@ -378,9 +378,12 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
     }
 
     u64 wall_us = plat_time_us() - t0;
-    ctr_threads_stop_workers(sys, hw);
 
-    /* 1. Capture un-rotated 400x240 top screen PPM */
+    /*
+     * 1. Capture un-rotated 400x240 top screen PPM, and the bottom screen, BEFORE the
+     * workers stop: ctr_threads_stop_workers() clears hw->spu_core1_active and
+     * hw->cd_worker_core, which the HUD would otherwise show as "SYNC" / "Core -1".
+     */
     if (ar->ppm[0] != '\0') {
         PsxResult prc = ctr_capture_top_screen_ppm(ar->ppm);
         plat_log("[main_3ds] autorun ppm '%s' rc=%d\n", ar->ppm, (int)prc);
@@ -392,6 +395,7 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         PsxResult brc = ctr_capture_bottom_screen_ppm(ar->bottom_ppm);
         plat_log("[main_3ds] autorun bottom_ppm '%s' rc=%d\n", ar->bottom_ppm, (int)brc);
     }
+    ctr_threads_stop_workers(sys, hw);
 
     /* 2. Write TTY stdout capture */
     if (ar->tty[0] != '\0') {
