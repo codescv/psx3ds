@@ -16,11 +16,29 @@
 
 typedef struct GpuHwVertex {
     s16 pos[2]; /* v0: GPU_SHORT x 2 (VRAM or screen X, Y) */
-    s16 uv[2];  /* v1: GPU_SHORT x 2 (texel U, V) */
+    s16 uv[2];  /* v1: GPU_SHORT x 2 (texel U, V in 1/16-texel units, see HW_UV_SHIFT) */
     u8  col[4]; /* v2: GPU_UNSIGNED_BYTE x 4 (R, G, B, A: 255 = textured, 0 = untextured) */
 } GpuHwVertex;
 
 _Static_assert(sizeof(GpuHwVertex) == 12, "GpuHwVertex must be 12 bytes");
+
+/*
+ * v0.2.5 sub-texel UV + PS1 sample-point model (fixes off-by-one / wrapped texel rows and
+ * minified textures such as player shadows):
+ *  - Vertex UVs are fixed point with HW_UV_SHIFT fractional bits (1/16 texel).
+ *  - The PS1 samples pixel (x, y) at its INTEGER position; the PICA200 samples at the pixel
+ *    centre and snaps vertices to 1/16 pixel. The VRAM-pass projection therefore shifts all
+ *    geometry by +7/16 pixel (HW_VRAM_POS_SHIFT): every covered centre then lies 1/16 pixel
+ *    past a PS1 integer sample point inside the primitive (left/top edges inclusive,
+ *    right/bottom exclusive, with no exact ties), and attributes interpolate at that point.
+ *  - The PS1 (and gpu_soft) looks up texel floor(u + 0.5): every VRAM-pass UV carries +1/2
+ *    texel (HW_UV_HALF). Polygons also subtract the 1/16-pixel step (du/dx + du/dy) / 16 so
+ *    minified textures sample exactly where gpu_soft does.
+ */
+#define HW_UV_SHIFT       4
+#define HW_UV_ONE         (1 << HW_UV_SHIFT)
+#define HW_UV_HALF        (HW_UV_ONE >> 1)
+#define HW_VRAM_POS_SHIFT (7.0f / 16.0f)
 
 /*
  * Fused TEV modes (primitives & fills of the VRAM pass):
@@ -104,6 +122,8 @@ typedef struct GpuHwState {
     GpuHwVertex      *vbo_ring[GPU_HW_VTX_RING_COUNT];
     u32               cur_ring;
     u32               ring_pos;
+    u32               vtx_flush_from;  /* first vertex of cur_ring not yet D-cache flushed */
+    bool              upload_tex_used_in_frame; /* open GPU frame samples upload_tex */
     u32               batch_first;
     u32               batch_count;
     bool              has_batch_key;
@@ -205,6 +225,7 @@ static void begin_frame(GpuHwState *st, u8 flags) {
     C3D_FrameBegin(flags);
     st->in_frame = true;
     st->on_vram_rt = false;
+    st->upload_tex_used_in_frame = false;
     st->gpu_frame_id++;
     if (st->gpu_frame_id == 0u) {
         st->gpu_frame_id = 1u;
@@ -212,13 +233,41 @@ static void begin_frame(GpuHwState *st, u8 flags) {
     gpu_texcache_set_frame(&st->texcache, st->gpu_frame_id);
 }
 
-/* Submit the open frame (if any) and wait until the GPU has consumed it */
-static void restart_frame_and_wait(GpuHwState *st) {
+/*
+ * Vertex data is only read by the PICA200 once C3D_FrameEnd() submits the frame's command
+ * list, so the ring's D-cache is flushed ONCE per submission (one GSPGPU IPC) instead of once
+ * per batch (v0.2.5: WE3 matches issued ~360 per-batch flushes per frame on real hardware).
+ */
+static void flush_vtx_dcache(GpuHwState *st) {
+    if (st->ring_pos > st->vtx_flush_from) {
+        GSPGPU_FlushDataCache(&st->vbo_ring[st->cur_ring][st->vtx_flush_from],
+                              (st->ring_pos - st->vtx_flush_from) * sizeof(GpuHwVertex));
+    }
+    st->vtx_flush_from = st->ring_pos;
+}
+
+/* Submit the open frame (if any) to the PICA200 */
+static void submit_frame(GpuHwState *st) {
     if (st->in_frame) {
+        flush_vtx_dcache(st);
         C3D_FrameEnd(0);
         st->in_frame = false;
         st->on_vram_rt = false;
     }
+}
+
+/* Switch to the other vertex ring (its previous contents must no longer be in flight) */
+static void next_vtx_ring(GpuHwState *st) {
+    st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
+    st->ring_pos = 0u;
+    st->vtx_flush_from = 0u;
+    st->batch_first = 0u;
+    st->batch_count = 0u;
+}
+
+/* Submit the open frame (if any) and wait until the GPU has consumed it */
+static void restart_frame_and_wait(GpuHwState *st) {
+    submit_frame(st);
     begin_frame(st, 0);
 }
 
@@ -300,16 +349,20 @@ static void apply_stencil_state(GpuHwState *st, u8 stencil_mode) {
 /*
  * PICA200 C3D_Tex memory places tile row 0 (offset 0, PSX y = 0 / NDC y = +1)
  * at texture coordinate t = 1.0 and tile row H/8 - 1 (PSX y = H - 1 / NDC y = -1)
- * at t = 0.0, so PSX texel (u, v) maps to s = u / W, t = 1.0 - v / H (flip_v = true).
+ * at t = 0.0, so PSX texel (u, v) maps to s = u / W, t = 1.0 - v / H.
+ *
+ * GPU_NEAREST picks column floor(s * W) but, because of the flip, PSX row
+ * ceil(v) - 1: an exactly integral v = k would fetch row k - 1 (and v = 0 would wrap to row
+ * 255 under GPU_REPEAT). A 1/64-texel nudge on both axes makes both behave as floor().
+ * UVs are in 1/16-texel fixed point (HW_UV_SHIFT).
  */
-static void set_uv_transform(GpuHwState *st, float inv_w, float inv_h, bool flip_v) {
-    if (flip_v) {
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_scale, inv_w, -inv_h, 0.0f, 0.0f);
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_bias,  0.0f,  1.0f,  0.0f, 0.0f);
-    } else {
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_scale, inv_w, inv_h, 0.0f, 0.0f);
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_bias,  0.0f,  0.0f,  0.0f, 0.0f);
-    }
+static void set_uv_transform(GpuHwState *st, u32 tex_w, u32 tex_h) {
+    float inv_w = 1.0f / (float)(tex_w << HW_UV_SHIFT);
+    float inv_h = 1.0f / (float)(tex_h << HW_UV_SHIFT);
+    float nudge_s = (1.0f / 64.0f) / (float)tex_w;
+    float nudge_t = (1.0f / 64.0f) / (float)tex_h;
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_scale, inv_w, -inv_h, 0.0f, 0.0f);
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, st->u_uv_bias, nudge_s, 1.0f - nudge_t, 0.0f, 0.0f);
 }
 
 static void configure_tev_mode(GpuHwState *st, GpuHwTexMode mode) {
@@ -395,23 +448,21 @@ static void flush_batch(GpuHwState *st) {
         C3D_Tex *tex = (C3D_Tex *)st->texcache.slots[k->tex_slot].hw_tex;
         C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST);
         C3D_TexBind(0, tex);
-        set_uv_transform(st, 1.0f / 256.0f, 1.0f / 256.0f, true);
+        set_uv_transform(st, GPU_HW_TEXPAGE_DIM, GPU_HW_TEXPAGE_DIM);
     } else if (k->tex_slot == HW_SLOT_UPLOAD) {
         C3D_TexSetFilter(&st->upload_tex, GPU_NEAREST, GPU_NEAREST);
         C3D_TexBind(0, &st->upload_tex);
-        set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
+        set_uv_transform(st, GPU_HW_VRAM_W, GPU_HW_VRAM_H);
     } else {
         /* untextured-only batch: vertex alpha 0 ignores the (white) texture sample */
         C3D_TexBind(0, &st->white_tex);
-        set_uv_transform(st, 1.0f / 8.0f, 1.0f / 8.0f, true);
+        set_uv_transform(st, 8u, 8u);
     }
 
     configure_tev_mode(st, k->tex_mode == HW_TEX_ANY ? HW_TEX_FUSED : (GpuHwTexMode)k->tex_mode);
     apply_stencil_state(st, k->stencil_mode);
 
-    GSPGPU_FlushDataCache(&st->vbo_ring[st->cur_ring][st->batch_first],
-                          st->batch_count * sizeof(GpuHwVertex));
-
+    /* (vertex D-cache is flushed once per frame submission, see flush_vtx_dcache) */
     int first = (int)st->batch_first;
     int count = (int)st->batch_count;
 
@@ -526,15 +577,8 @@ static GpuHwVertex *alloc_batch_verts(GpuHwState *st, const GpuHwBatchKey *key, 
          * draws), switch rings, and wait for the GPU so the other ring is free to rewrite.
          */
         flush_batch(st);
-        if (st->in_frame) {
-            C3D_FrameEnd(0);
-            st->in_frame = false;
-            st->on_vram_rt = false;
-        }
-        st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
-        st->ring_pos = 0u;
-        st->batch_first = 0u;
-        st->batch_count = 0u;
+        submit_frame(st);
+        next_vtx_ring(st);
         st->n_ring_wrap++;
         begin_frame(st, 0);
     }
@@ -590,10 +634,20 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
         return;
     }
 
-    /* Submit pending draws and wait until any prior upload_tex sampling has completed */
     st->n_cpu_upload++;
     flush_batch(st);
-    restart_frame_and_wait(st);
+    /*
+     * upload_tex may only be rewritten once no submitted or pending draw samples it.
+     * begin_frame() waits for every previously submitted frame, so a stall is needed only
+     * when the OPEN frame already drew from upload_tex (v0.2.5: avoids a full PICA200 stall
+     * for the first upload of each frame, the common case).
+     */
+    if (!st->in_frame) {
+        begin_frame(st, 0);
+    } else if (st->upload_tex_used_in_frame) {
+        st->n_stall++;
+        restart_frame_and_wait(st);
+    }
 
     /*
      * Upload ONLY the 8x8 tiles the CPU actually wrote (not their bounding box): a box
@@ -603,7 +657,21 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
     const u16 *vram = st->sys->gpu.vram;
     u16 *dst = (u16 *)st->upload_tex.data;
     if (gpu_morton_upload_tiles(dst, vram, st->cpu_dirty_tiles) > 0u) {
-        GSPGPU_FlushDataCache(st->upload_tex.data, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+        /* D-cache flush only the dirty 8-line tile rows (16 KiB each), not all 1 MiB */
+        u32 ty_min = GPU_HW_TILE_ROWS, ty_max = 0u;
+        for (u32 ty = 0u; ty < GPU_HW_TILE_ROWS; ++ty) {
+            bool any = false;
+            for (u32 w = 0u; w < GPU_HW_TILE_WORDS; ++w) {
+                any = any || (st->cpu_dirty_tiles[ty][w] != 0ULL);
+            }
+            if (any) {
+                if (ty < ty_min) ty_min = ty;
+                ty_max = ty;
+            }
+        }
+        const u32 tile_row_u16 = GPU_HW_VRAM_W * 8u;
+        GSPGPU_FlushDataCache(dst + ty_min * tile_row_u16,
+                              (ty_max - ty_min + 1u) * tile_row_u16 * sizeof(u16));
 
         GpuHwBatchKey ukey;
         memset(&ukey, 0, sizeof(ukey));
@@ -618,7 +686,7 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
         ukey.sc_y1        = GPU_HW_VRAM_H;
 
         /* One quad per horizontal run of dirty tiles in each 8-line tile row */
-        for (u32 ty = 0u; ty < GPU_HW_TILE_ROWS; ++ty) {
+        for (u32 ty = ty_min; ty <= ty_max; ++ty) {
             u32 tx = 0u;
             while (tx < GPU_HW_TILE_COLS) {
                 if (((st->cpu_dirty_tiles[ty][tx >> 6] >> (tx & 63u)) & 1ULL) == 0ULL) {
@@ -636,15 +704,21 @@ static void flush_cpu_dirty_if_needed(GpuHwState *st, u16 rx, u16 ry, u16 rw, u1
                 }
                 s16 x0 = (s16)(run0 << 3), y0 = (s16)(ty << 3);
                 s16 x1 = (s16)(tx << 3),   y1 = (s16)((ty + 1u) << 3);
-                write_hw_vtx(&v[0], x0, y0, x0, y0, 255, 255, 255, 255);
-                write_hw_vtx(&v[1], x1, y0, x1, y0, 255, 255, 255, 255);
-                write_hw_vtx(&v[2], x0, y1, x0, y1, 255, 255, 255, 255);
-                write_hw_vtx(&v[3], x1, y0, x1, y0, 255, 255, 255, 255);
-                write_hw_vtx(&v[4], x1, y1, x1, y1, 255, 255, 255, 255);
-                write_hw_vtx(&v[5], x0, y1, x0, y1, 255, 255, 255, 255);
+                s16 u0 = (s16)((x0 << HW_UV_SHIFT) + HW_UV_HALF);
+                s16 u1 = (s16)((x1 << HW_UV_SHIFT) + HW_UV_HALF);
+                s16 v0 = (s16)((y0 << HW_UV_SHIFT) + HW_UV_HALF);
+                s16 v1 = (s16)((y1 << HW_UV_SHIFT) + HW_UV_HALF);
+                write_hw_vtx(&v[0], x0, y0, u0, v0, 255, 255, 255, 255);
+                write_hw_vtx(&v[1], x1, y0, u1, v0, 255, 255, 255, 255);
+                write_hw_vtx(&v[2], x0, y1, u0, v1, 255, 255, 255, 255);
+                write_hw_vtx(&v[3], x1, y0, u1, v0, 255, 255, 255, 255);
+                write_hw_vtx(&v[4], x1, y1, u1, v1, 255, 255, 255, 255);
+                write_hw_vtx(&v[5], x0, y1, u0, v1, 255, 255, 255, 255);
             }
         }
         flush_batch(st);
+        /* (a ring wrap inside alloc_batch_verts starts a new frame: re-mark it as well) */
+        st->upload_tex_used_in_frame = true;
     }
 
     memset(st->cpu_dirty_tiles, 0, sizeof(st->cpu_dirty_tiles));
@@ -667,11 +741,7 @@ static bool readback_cell_rows(GpuHwState *st, u32 cell_rows) {
     }
     st->n_readback++;
     flush_batch(st);
-    if (st->in_frame) {
-        C3D_FrameEnd(0);
-        st->in_frame = false;
-        st->on_vram_rt = false;
-    }
+    submit_frame(st);
     if (st->readback_buf == NULL) {
         st->readback_buf = (u16 *)linearMemAlign(GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16), 0x80);
         if (st->readback_buf == NULL) {
@@ -863,13 +933,10 @@ static void hw_reset(void *self) {
         return;
     }
     flush_batch(st);
-    if (st->in_frame) {
-        C3D_FrameEnd(0);
-        st->in_frame = false;
-        st->on_vram_rt = false;
-    }
+    submit_frame(st);
     st->cur_ring = 0u;
     st->ring_pos = 0u;
+    st->vtx_flush_from = 0u;
     st->batch_first = 0u;
     st->batch_count = 0u;
     st->has_batch_key = false;
@@ -921,6 +988,47 @@ static void mark_gpu_bbox_clipped(GpuHwState *st, s32 bx0, s32 by0, s32 bx1, s32
     }
 }
 
+static inline s16 clamp_s16(s32 v) {
+    return (s16)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+}
+
+/* Round-to-nearest num / den (den != 0) */
+static inline s32 div_round_s32(s32 num, s32 den) {
+    if (den < 0) {
+        num = -num;
+        den = -den;
+    }
+    return (num >= 0) ? ((num + den / 2) / den) : -((-num + den / 2) / den);
+}
+
+/*
+ * PS1 polygon UVs -> PICA200 1/16-texel vertex UVs for ONE triangle (a, b, c): +1/2 texel
+ * (floor(u + 0.5) lookup) minus the 1/16-pixel sample offset (du/dx + du/dy) / 16, i.e.
+ * 16 * u + 8 - (du/dx + du/dy) in fixed point. Returns false for zero-area triangles, which
+ * the PS1 does not rasterize.
+ */
+static bool tri_uv_to_hw(const GpuVertex *const vtx[3], const s16 u_in[3], const s16 v_in[3],
+                         s16 u_out[3], s16 v_out[3]) {
+    s32 dbx = (s32)vtx[1]->x - (s32)vtx[0]->x, dby = (s32)vtx[1]->y - (s32)vtx[0]->y;
+    s32 dcx = (s32)vtx[2]->x - (s32)vtx[0]->x, dcy = (s32)vtx[2]->y - (s32)vtx[0]->y;
+    s32 det = dbx * dcy - dcx * dby;
+    if (det == 0) {
+        return false;
+    }
+    s32 dub = (s32)u_in[1] - (s32)u_in[0], duc = (s32)u_in[2] - (s32)u_in[0];
+    s32 dvb = (s32)v_in[1] - (s32)v_in[0], dvc = (s32)v_in[2] - (s32)v_in[0];
+    /* (du/dx + du/dy) * det  and  (dv/dx + dv/dy) * det */
+    s32 nu = (dub * dcy - duc * dby) + (dbx * duc - dcx * dub);
+    s32 nv = (dvb * dcy - dvc * dby) + (dbx * dvc - dcx * dvb);
+    s32 cu = HW_UV_HALF - div_round_s32(nu, det);
+    s32 cv = HW_UV_HALF - div_round_s32(nv, det);
+    for (u32 i = 0; i < 3u; ++i) {
+        u_out[i] = clamp_s16(((s32)u_in[i] << HW_UV_SHIFT) + cu);
+        v_out[i] = clamp_s16(((s32)v_in[i] << HW_UV_SHIFT) + cv);
+    }
+    return true;
+}
+
 static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
     GpuHwState *st = (GpuHwState *)self;
     if (!st || !p) {
@@ -939,8 +1047,62 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
         return;
     }
 
-    /* Flush any CPU->VRAM uploaded background inside the active draw area before overdrawing */
-    flush_cpu_dirty_if_needed(st, (u16)cx0, (u16)cy0, (u16)(cx1 - cx0), (u16)(cy1 - cy0));
+    /*
+     * v0.2.5 early scissor culling: primitive bbox [bx0, bx1) x [by0, by1) in PS1 coverage
+     * terms (right/bottom polygon edges exclusive, lines include their end pixel). WE3
+     * matches submit ~39% of their draws completely outside the drawing area; culling them
+     * here skips their texture-page decodes, CLUT syncs and batch breaks.
+     */
+    s32 bx0, by0, bx1, by1;
+    switch ((GpuPrimKind)p->kind) {
+        case PRIM_RECT:
+            if (p->w == 0u || p->h == 0u || p->w > 1023u || p->h > 511u) {
+                return;
+            }
+            bx0 = p->v[0].x;
+            by0 = p->v[0].y;
+            bx1 = bx0 + (s32)p->w;
+            by1 = by0 + (s32)p->h;
+            break;
+        case PRIM_TRI:
+        case PRIM_QUAD: {
+            u32 n = (p->kind == PRIM_QUAD) ? 4u : 3u;
+            bx0 = bx1 = p->v[0].x;
+            by0 = by1 = p->v[0].y;
+            for (u32 i = 1u; i < n; ++i) {
+                if (p->v[i].x < bx0) bx0 = p->v[i].x;
+                if (p->v[i].x > bx1) bx1 = p->v[i].x;
+                if (p->v[i].y < by0) by0 = p->v[i].y;
+                if (p->v[i].y > by1) by1 = p->v[i].y;
+            }
+            if (bx1 == bx0 || by1 == by0) {
+                return; /* zero-area: the PS1 rasterizes no pixel */
+            }
+            break;
+        }
+        case PRIM_LINE:
+        case PRIM_POLYLINE_SEG:
+        default: {
+            bx0 = p->v[0].x < p->v[1].x ? p->v[0].x : p->v[1].x;
+            bx1 = (p->v[0].x > p->v[1].x ? p->v[0].x : p->v[1].x) + 1;
+            by0 = p->v[0].y < p->v[1].y ? p->v[0].y : p->v[1].y;
+            by1 = (p->v[0].y > p->v[1].y ? p->v[0].y : p->v[1].y) + 1;
+            if (bx1 - bx0 > 1024 || by1 - by0 > 512) {
+                return;
+            }
+            break;
+        }
+    }
+    s32 cbx0 = bx0 > cx0 ? bx0 : cx0;
+    s32 cby0 = by0 > cy0 ? by0 : cy0;
+    s32 cbx1 = bx1 < cx1 ? bx1 : cx1;
+    s32 cby1 = by1 < cy1 ? by1 : cy1;
+    if (cbx0 >= cbx1 || cby0 >= cby1) {
+        return;
+    }
+
+    /* Flush CPU->VRAM uploads under the (scissor-clipped) primitive before overdrawing */
+    flush_cpu_dirty_if_needed(st, (u16)cbx0, (u16)cby0, (u16)(cbx1 - cbx0), (u16)(cby1 - cby0));
 
     bool textured  = (p->flags & PF_TEXTURED) != 0u;
     bool raw_tex   = (p->flags & PF_RAW_TEX) != 0u;
@@ -952,22 +1114,23 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
         raw_tex  = false;
     }
 
-    /* Prepare primitive vertex UV coordinates before texture-window resolution */
+    /* Prepare primitive vertex UV coordinates (texels) before texture-window resolution */
     s16 u_coords[4] = { 0, 0, 0, 0 };
     s16 v_coords[4] = { 0, 0, 0, 0 };
     u32 uv_count = 0u;
+    bool flip_x = false, flip_y = false;
 
     if (textured) {
         if (p->kind == PRIM_RECT) {
-            if (p->w == 0u || p->h == 0u || p->w > 1023u || p->h > 511u) {
-                return;
-            }
+            /* Sampled texel box [u0, u0 + w) (or (u0 - w, u0] when flipped) */
+            flip_x = (p->flags & PF_RECT_FLIP_X) != 0u;
+            flip_y = (p->flags & PF_RECT_FLIP_Y) != 0u;
             s16 u0 = (s16)p->v[0].u;
             s16 v0 = (s16)p->v[0].v;
-            s16 uL = (p->flags & PF_RECT_FLIP_X) ? (s16)(u0 + 1) : u0;
-            s16 uR = (p->flags & PF_RECT_FLIP_X) ? (s16)(u0 + 1 - (s16)p->w) : (s16)(u0 + (s16)p->w);
-            s16 vT = (p->flags & PF_RECT_FLIP_Y) ? (s16)(v0 + 1) : v0;
-            s16 vB = (p->flags & PF_RECT_FLIP_Y) ? (s16)(v0 + 1 - (s16)p->h) : (s16)(v0 + (s16)p->h);
+            s16 uL = flip_x ? (s16)(u0 + 1) : u0;
+            s16 uR = flip_x ? (s16)(u0 + 1 - (s16)p->w) : (s16)(u0 + (s16)p->w);
+            s16 vT = flip_y ? (s16)(v0 + 1) : v0;
+            s16 vB = flip_y ? (s16)(v0 + 1 - (s16)p->h) : (s16)(v0 + (s16)p->h);
             u_coords[0] = uL; v_coords[0] = vT;
             u_coords[1] = uR; v_coords[1] = vT;
             u_coords[2] = uL; v_coords[2] = vB;
@@ -1086,59 +1249,50 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
     }
 
     switch ((GpuPrimKind)p->kind) {
-        case PRIM_TRI: {
-            if (tri_oversized(p->v[0].x, p->v[0].y, p->v[1].x, p->v[1].y, p->v[2].x, p->v[2].y)) {
-                return;
-            }
-            GpuHwVertex *v = alloc_batch_verts(st, &key, 3u);
-            if (!v) return;
-            for (u32 i = 0; i < 3u; ++i) {
-                u8 vr = per_vtx_col ? p->v[i].r : r0;
-                u8 vg = per_vtx_col ? p->v[i].g : g0;
-                u8 vb = per_vtx_col ? p->v[i].b : b0;
-                write_hw_vtx(&v[i], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i], vr, vg, vb, va);
-            }
-            s32 bx0 = p->v[0].x, bx1 = p->v[0].x, by0 = p->v[0].y, by1 = p->v[0].y;
-            for (u32 i = 1u; i < 3u; ++i) {
-                if (p->v[i].x < bx0) bx0 = p->v[i].x;
-                if (p->v[i].x > bx1) bx1 = p->v[i].x;
-                if (p->v[i].y < by0) by0 = p->v[i].y;
-                if (p->v[i].y > by1) by1 = p->v[i].y;
-            }
-            mark_gpu_bbox_clipped(st, bx0, by0, bx1 + 1, by1 + 1,
-                                  key.sc_x0, key.sc_y0, key.sc_x1, key.sc_y1);
-            break;
-        }
-
+        case PRIM_TRI:
         case PRIM_QUAD: {
-            bool ok0 = !tri_oversized(p->v[0].x, p->v[0].y, p->v[1].x, p->v[1].y, p->v[2].x, p->v[2].y);
-            bool ok1 = !tri_oversized(p->v[1].x, p->v[1].y, p->v[2].x, p->v[2].y, p->v[3].x, p->v[3].y);
-            u32 n_emit = (ok0 ? 3u : 0u) + (ok1 ? 3u : 0u);
+            /* The PS1 rasterizes a quad as triangles (0,1,2) + (1,2,3), each on its own */
+            static const u8 k_tri_idx[2][3] = { { 0u, 1u, 2u }, { 1u, 2u, 3u } };
+            u32 n_tris = (p->kind == PRIM_QUAD) ? 2u : 1u;
+            s16 hu[2][3], hv[2][3];
+            bool ok[2] = { false, false };
+            u32 n_emit = 0u;
+            for (u32 t = 0u; t < n_tris; ++t) {
+                const u8 *ix = k_tri_idx[t];
+                const GpuVertex *tv[3] = { &p->v[ix[0]], &p->v[ix[1]], &p->v[ix[2]] };
+                if (tri_oversized(tv[0]->x, tv[0]->y, tv[1]->x, tv[1]->y, tv[2]->x, tv[2]->y)) {
+                    continue;
+                }
+                if (textured) {
+                    s16 ut[3] = { u_coords[ix[0]], u_coords[ix[1]], u_coords[ix[2]] };
+                    s16 vt[3] = { v_coords[ix[0]], v_coords[ix[1]], v_coords[ix[2]] };
+                    ok[t] = tri_uv_to_hw(tv, ut, vt, hu[t], hv[t]);
+                } else {
+                    s32 det = ((s32)tv[1]->x - tv[0]->x) * ((s32)tv[2]->y - tv[0]->y) -
+                              ((s32)tv[2]->x - tv[0]->x) * ((s32)tv[1]->y - tv[0]->y);
+                    ok[t] = (det != 0);
+                    memset(hu[t], 0, sizeof(hu[t]));
+                    memset(hv[t], 0, sizeof(hv[t]));
+                }
+                n_emit += ok[t] ? 3u : 0u;
+            }
             if (n_emit == 0u) return;
             GpuHwVertex *v = alloc_batch_verts(st, &key, n_emit);
             if (!v) return;
 
             u32 out_i = 0u;
-            static const u8 k_quad_idx[2][3] = { { 0u, 1u, 2u }, { 1u, 2u, 3u } };
-            for (u32 t = 0u; t < 2u; ++t) {
-                if ((t == 0u && !ok0) || (t == 1u && !ok1)) {
+            for (u32 t = 0u; t < n_tris; ++t) {
+                if (!ok[t]) {
                     continue;
                 }
                 for (u32 k = 0; k < 3u; ++k) {
-                    u32 i = k_quad_idx[t][k];
+                    u32 i = k_tri_idx[t][k];
                     u8 vr = per_vtx_col ? p->v[i].r : r0;
                     u8 vg = per_vtx_col ? p->v[i].g : g0;
                     u8 vb = per_vtx_col ? p->v[i].b : b0;
-                    write_hw_vtx(&v[out_i++], p->v[i].x, p->v[i].y, u_coords[i], v_coords[i],
+                    write_hw_vtx(&v[out_i++], p->v[i].x, p->v[i].y, hu[t][k], hv[t][k],
                                  vr, vg, vb, va);
                 }
-            }
-            s32 bx0 = p->v[0].x, bx1 = p->v[0].x, by0 = p->v[0].y, by1 = p->v[0].y;
-            for (u32 i = 1u; i < 4u; ++i) {
-                if (p->v[i].x < bx0) bx0 = p->v[i].x;
-                if (p->v[i].x > bx1) bx1 = p->v[i].x;
-                if (p->v[i].y < by0) by0 = p->v[i].y;
-                if (p->v[i].y > by1) by1 = p->v[i].y;
             }
             mark_gpu_bbox_clipped(st, bx0, by0, bx1 + 1, by1 + 1,
                                   key.sc_x0, key.sc_y0, key.sc_x1, key.sc_y1);
@@ -1146,23 +1300,37 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
         }
 
         case PRIM_RECT: {
-            if (p->w == 0u || p->h == 0u || p->w > 1023u || p->h > 511u) {
-                return;
-            }
             s16 x0 = p->v[0].x;
             s16 y0 = p->v[0].y;
             s16 x1 = (s16)(x0 + (s16)p->w);
             s16 y1 = (s16)(y0 + (s16)p->h);
 
+            /*
+             * Pixel x0 + i samples texel u0 + i (u0 - i when flipped): +1/2 texel at the
+             * leading edge, which the 7/16-pixel geometry shift keeps inside the texel.
+             */
+            s16 hu[4], hv[4];
+            for (u32 i = 0; i < 4u; ++i) {
+                /* flipped corners are (u0 + 1, u0 + 1 - w): the pixel-x0 texel is u0 */
+                s32 uu = (s32)u_coords[i] - (flip_x ? 1 : 0);
+                s32 vv = (s32)v_coords[i] - (flip_y ? 1 : 0);
+                hu[i] = clamp_s16((uu << HW_UV_SHIFT) + HW_UV_HALF);
+                hv[i] = clamp_s16((vv << HW_UV_SHIFT) + HW_UV_HALF);
+            }
+            if (!textured) {
+                memset(hu, 0, sizeof(hu));
+                memset(hv, 0, sizeof(hv));
+            }
+
             GpuHwVertex *v = alloc_batch_verts(st, &key, 6u);
             if (!v) return;
 
-            write_hw_vtx(&v[0], x0, y0, u_coords[0], v_coords[0], r0, g0, b0, va);
-            write_hw_vtx(&v[1], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, va);
-            write_hw_vtx(&v[2], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, va);
-            write_hw_vtx(&v[3], x1, y0, u_coords[1], v_coords[1], r0, g0, b0, va);
-            write_hw_vtx(&v[4], x1, y1, u_coords[3], v_coords[3], r0, g0, b0, va);
-            write_hw_vtx(&v[5], x0, y1, u_coords[2], v_coords[2], r0, g0, b0, va);
+            write_hw_vtx(&v[0], x0, y0, hu[0], hv[0], r0, g0, b0, va);
+            write_hw_vtx(&v[1], x1, y0, hu[1], hv[1], r0, g0, b0, va);
+            write_hw_vtx(&v[2], x0, y1, hu[2], hv[2], r0, g0, b0, va);
+            write_hw_vtx(&v[3], x1, y0, hu[1], hv[1], r0, g0, b0, va);
+            write_hw_vtx(&v[4], x1, y1, hu[3], hv[3], r0, g0, b0, va);
+            write_hw_vtx(&v[5], x0, y1, hu[2], hv[2], r0, g0, b0, va);
 
             mark_gpu_bbox_clipped(st, x0, y0, x1, y1,
                                   key.sc_x0, key.sc_y0, key.sc_x1, key.sc_y1);
@@ -1220,11 +1388,7 @@ static void hw_draw(void *self, const GpuPrim *p, const GpuDrawEnv *env_in) {
                 write_hw_vtx(&v[5], xB,            yB, 0, 0, e1.r, e1.g, e1.b, 0u);
             }
 
-            s32 bx0 = p->v[0].x < p->v[1].x ? p->v[0].x : p->v[1].x;
-            s32 bx1 = p->v[0].x > p->v[1].x ? p->v[0].x : p->v[1].x;
-            s32 by0 = p->v[0].y < p->v[1].y ? p->v[0].y : p->v[1].y;
-            s32 by1 = p->v[0].y > p->v[1].y ? p->v[0].y : p->v[1].y;
-            mark_gpu_bbox_clipped(st, bx0, by0, bx1 + 1, by1 + 1,
+            mark_gpu_bbox_clipped(st, bx0, by0, bx1, by1,
                                   key.sc_x0, key.sc_y0, key.sc_x1, key.sc_y1);
             break;
         }
@@ -1338,6 +1502,10 @@ static void hw_vram_copy(void *self, u16 sx, u16 sy, u16 dx, u16 dy, u16 w, u16 
     if (!st || w == 0u || h == 0u) {
         return;
     }
+    /* Unmasked self-copy: VRAM unchanged, no readback / re-upload (gpu.c skips it too) */
+    if (gpu_vram_copy_is_noop(sx, sy, dx, dy, st->cur_env.check_mask, st->cur_env.set_mask)) {
+        return;
+    }
 
     /*
      * If PICA200 rendered into source or destination cells that shadow VRAM lacked,
@@ -1447,10 +1615,7 @@ static bool hw_gpu_owned(void) {
 static void hw_abandon_frame(GpuHwState *st) {
     st->in_frame = false;
     st->on_vram_rt = false;
-    st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
-    st->ring_pos = 0u;
-    st->batch_first = 0u;
-    st->batch_count = 0u;
+    next_vtx_ring(st);
     st->has_batch_key = false;
 }
 
@@ -1487,15 +1652,8 @@ static void hw_present(void *self, const GpuDisplay *d) {
 
     bool skip_disp = should_skip_display(st);
     if (skip_disp) {
-        if (st->in_frame) {
-            C3D_FrameEnd(0);
-            st->in_frame = false;
-            st->on_vram_rt = false;
-        }
-        st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
-        st->ring_pos = 0u;
-        st->batch_first = 0u;
-        st->batch_count = 0u;
+        submit_frame(st);
+        next_vtx_ring(st);
         st->has_batch_key = false;
         return;
     }
@@ -1542,9 +1700,10 @@ static void hw_present(void *self, const GpuDisplay *d) {
                                       GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u32));
                 C3D_TexSetFilter(&st->disp24_tex, filt, filt);
                 C3D_TexBind(0, &st->disp24_tex);
-                set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
+                set_uv_transform(st, GPU_HW_VRAM_W, GPU_HW_VRAM_H);
 
-                s16 u0 = 0, v0 = 0, u1 = (s16)hres, v1 = (s16)vres;
+                s16 u0 = 0, v0 = 0;
+                s16 u1 = (s16)(hres << HW_UV_SHIFT), v1 = (s16)(vres << HW_UV_SHIFT);
                 write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255);
                 write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255);
                 write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255);
@@ -1552,7 +1711,6 @@ static void hw_present(void *self, const GpuDisplay *d) {
                 write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255);
                 write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255);
 
-                GSPGPU_FlushDataCache(dv, 6u * sizeof(GpuHwVertex));
                 C3D_DrawArrays(GPU_TRIANGLES, (int)st->ring_pos, 6);
                 st->ring_pos += 6u;
                 st->n_draw_calls++;
@@ -1566,10 +1724,10 @@ static void hw_present(void *self, const GpuDisplay *d) {
              */
             C3D_TexSetFilter(&st->vram_tex, filt, filt);
             C3D_TexBind(0, &st->vram_tex);
-            set_uv_transform(st, 1.0f / 1024.0f, 1.0f / 512.0f, true);
+            set_uv_transform(st, GPU_HW_VRAM_W, GPU_HW_VRAM_H);
 
-            s16 u0 = (s16)vx, v0 = (s16)vy;
-            s16 u1 = (s16)(vx + hres), v1 = (s16)(vy + vres);
+            s16 u0 = (s16)(vx << HW_UV_SHIFT), v0 = (s16)(vy << HW_UV_SHIFT);
+            s16 u1 = (s16)((vx + hres) << HW_UV_SHIFT), v1 = (s16)((vy + vres) << HW_UV_SHIFT);
             write_hw_vtx(&dv[0], dx0, dy0, u0, v0, 255, 255, 255, 255);
             write_hw_vtx(&dv[1], dx1, dy0, u1, v0, 255, 255, 255, 255);
             write_hw_vtx(&dv[2], dx0, dy1, u0, v1, 255, 255, 255, 255);
@@ -1577,7 +1735,6 @@ static void hw_present(void *self, const GpuDisplay *d) {
             write_hw_vtx(&dv[4], dx1, dy1, u1, v1, 255, 255, 255, 255);
             write_hw_vtx(&dv[5], dx0, dy1, u0, v1, 255, 255, 255, 255);
 
-            GSPGPU_FlushDataCache(dv, 6u * sizeof(GpuHwVertex));
             C3D_DrawArrays(GPU_TRIANGLES, (int)st->ring_pos, 6);
             st->ring_pos += 6u;
             st->n_draw_calls++;
@@ -1585,14 +1742,8 @@ static void hw_present(void *self, const GpuDisplay *d) {
         }
     }
 
-    C3D_FrameEnd(0);
-    st->in_frame = false;
-    st->on_vram_rt = false;
-
-    st->cur_ring = (st->cur_ring + 1u) % GPU_HW_VTX_RING_COUNT;
-    st->ring_pos = 0u;
-    st->batch_first = 0u;
-    st->batch_count = 0u;
+    submit_frame(st);
+    next_vtx_ring(st);
     st->has_batch_key = false;
 }
 
@@ -1635,9 +1786,7 @@ static void hw_apt_hook(APT_HookType hook, void *param) {
     }
     if (st->in_frame) {
         flush_batch(st);
-        C3D_FrameEnd(0);
-        st->in_frame = false;
-        st->on_vram_rt = false;
+        submit_frame(st);
     }
 }
 
@@ -1654,8 +1803,7 @@ static void hw_destroy(void *self) {
     if (hw_gpu_owned()) {
         if (st->in_frame) {
             flush_batch(st);
-            C3D_FrameEnd(0);
-            st->in_frame = false;
+            submit_frame(st);
         }
         C3D_FrameSync();
     } else {
@@ -1816,17 +1964,25 @@ PsxResult gpu_hw_backend_create(PsxSystem *sys, const GpuBackend **be, void **se
     }
     C3D_RenderTargetSetOutput(st->top_rt, GFX_TOP, GFX_LEFT, TOP_DISPLAY_TRANSFER_FLAGS);
 
-    /* Unrotated 1024x512 PSX VRAM projection: z=0 maps to o_pos.z = -0.5 in [-1.0, 0.0] */
-    Mtx_Ortho(&st->proj_vram, 0.0f, 1024.0f, 512.0f, 0.0f, -1.0f, 1.0f, true);
+    /*
+     * Unrotated 1024x512 PSX VRAM projection: z=0 maps to o_pos.z = -0.5 in [-1.0, 0.0].
+     * PSX (x, y) lands at framebuffer position (x + 7/16, y + 7/16) (HW_VRAM_POS_SHIFT).
+     */
+    Mtx_Ortho(&st->proj_vram, -HW_VRAM_POS_SHIFT, 1024.0f - HW_VRAM_POS_SHIFT,
+              512.0f - HW_VRAM_POS_SHIFT, -HW_VRAM_POS_SHIFT, -1.0f, 1.0f, true);
 
     /*
-     * Old 3DS (small_mem): RGBA5551-only pages (no RGBA8 MIXED split) and a 20-slot cap keep
-     * the texture cache at <= 2.5 MiB of LINEAR RAM; readback_buf / disp24_tex stay lazy.
+     * Old 3DS (small_mem): RGBA5551-only pages (no RGBA8 MIXED split) and a 32-slot cap keep
+     * the texture cache at <= 4 MiB of LINEAR RAM; readback_buf / disp24_tex stay lazy.
      */
     if (!gpu_texcache_init(&st->texcache, !small_mem,
                            small_mem ? GPU_HW_TEXCACHE_SLOTS_SMALL : GPU_HW_TEXCACHE_SLOTS)) {
         hw_destroy(st);
         return PSX_ERR_NOMEM;
+    }
+    if (!small_mem) {
+        /* New 3DS: 128 lazily allocated slots, capped at 24 MiB of LINEAR RAM */
+        gpu_texcache_set_byte_budget(&st->texcache, GPU_HW_TEXCACHE_BYTE_BUDGET);
     }
 
     st->cur_env.clip_x1 = (s16)(GPU_HW_VRAM_W - 1u);

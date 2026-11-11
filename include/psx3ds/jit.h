@@ -71,6 +71,19 @@ typedef struct JitState {
     u64           page_code_mask[512];
 } JitState;
 
+/*
+ * Split JIT code publication (v0.2.5; implemented next to jit_mem_commit in
+ * jit_mem_host.c / platform/3ds/jit_mem_3ds.c):
+ *  - jit_mem_commit_dcache(): per-block D-cache clean of the RW view (+ RX alias)
+ *    only. On hosts it also does the ranged __builtin___clear_cache.
+ *  - jit_mem_flush_icache(): ONE full ARM11 L1 I-cache + BTB invalidate
+ *    (Luma SVC 0x94 / eviction sled) + DSB/ISB; host: no-op.
+ * Code made visible by jit_mem_commit_dcache() MUST NOT execute until
+ * jit_mem_flush_icache() has run. jit_mem_commit() == both, back to back.
+ */
+void  jit_mem_commit_dcache(JitMem *m, const void *rw_begin, u32 bytes);
+void  jit_mem_flush_icache(JitMem *m);
+
 /* Lifecycle & execution engines (built on ALL targets) */
 void  jit_init(PsxSystem *sys);
 void  jit_reset(PsxSystem *sys);

@@ -843,6 +843,23 @@ static JitScanResult g_scan_scratch;
 static Emitter       g_emit_scratch;
 static ColdStub      g_stubs_scratch[JIT_MAX_COLD_STUBS];
 
+/*
+ * v0.2.5: set when a block was published with jit_mem_commit_dcache() (D-cache
+ * clean only) and the full L1 I-cache invalidate is still owed. jit_compile_at_pc
+ * pays it ONCE after the whole eager compile tree (up to JIT_EAGER_BUDGET + 1
+ * blocks) instead of once per block, and before returning any entry to the
+ * dispatcher. Blocks are linked only through table slots / IBTC (no post-commit
+ * code patching), so no other path publishes executable bytes.
+ */
+static bool          g_icache_flush_pending;
+
+static void jit_publish_icache(JitState *j) {
+    if (g_icache_flush_pending) {
+        g_icache_flush_pending = false;
+        jit_mem_flush_icache(&j->mem);
+    }
+}
+
 static JIT_NOINLINE bool jit_prescan_eager_targets(const PsxSystem *sys, u32 start_pc,
                                                    u16 out_pages[2], u32 out_targets[2],
                                                    u32 *out_n_targets) {
@@ -1914,7 +1931,9 @@ emit_tails:
     }
 
     u8 *entry_rx = JIT_RW2RX(&j->mem, rw_begin);
-    jit_mem_commit(&j->mem, rw_begin, aligned_bytes);
+    /* D-cache clean only; I-cache invalidated once by jit_compile_at_pc (v0.2.5). */
+    jit_mem_commit_dcache(&j->mem, rw_begin, aligned_bytes);
+    g_icache_flush_pending = true;
 
     u16 b_idx = (u16)j->n_blocks++;
     JitBlock *b = &j->blocks[b_idx];
@@ -2052,6 +2071,12 @@ PSX_USED void *jit_compile_at_pc(PsxCpu *cpu) {
 
     u32 budget = JIT_EAGER_BUDGET;
     JitBlock *b = jit_compile_internal(sys, pc, 0u, &budget);
+    /*
+     * Single I-cache invalidate for every block committed above -- even when the
+     * root failed (b == NULL): eagerly compiled children are already reachable
+     * through tab_ram/tab_bios and may be dispatched later.
+     */
+    jit_publish_icache(j);
     if (!b) {
         return (void *)jit_exit_step_one;
     }

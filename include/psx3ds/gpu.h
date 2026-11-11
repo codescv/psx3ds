@@ -112,4 +112,14 @@ void gpu_gp1_write(PsxSystem *sys, u32 word);
 u32  gpu_read(PsxSystem *sys);
 u32  gpu_stat(PsxSystem *sys);
 
+/*
+ * GP0(80h) VRAM->VRAM copy that cannot change VRAM: source == destination (modulo the
+ * 1024x512 wrap) with mask-bit test and set both disabled. Backends and gpu.c skip it.
+ */
+static inline bool gpu_vram_copy_is_noop(u16 sx, u16 sy, u16 dx, u16 dy, u8 check_mask,
+                                         u8 set_mask) {
+    return ((sx & 0x3FFu) == (dx & 0x3FFu)) && ((sy & 0x1FFu) == (dy & 0x1FFu)) &&
+           check_mask == 0u && set_mask == 0u;
+}
+
 #endif /* PSX3DS_GPU_H */

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "psx3ds/jit.h"
 #include "psx3ds/jit_mem.h"
 #include "psx3ds/config.h"
 
@@ -64,11 +65,16 @@ void jit_mem_free(JitMem *m) {
     m->luma_icache_svc = false;
 }
 
-void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
+void jit_mem_commit_dcache(JitMem *m, const void *rw_begin, u32 bytes) {
 #if PSX3DS_HAVE_JIT
     if (!m || !m->rx || !m->rw || !rw_begin || bytes == 0u) {
         return;
     }
+    /*
+     * Hosts have no cheap "invalidate entire I-cache" from user space, so the
+     * ranged __builtin___clear_cache (D-clean + I-invalidate of exactly these
+     * bytes; a no-op on x86) is done here and jit_mem_flush_icache() is a no-op.
+     */
     char *rx_begin = (char *)JIT_RW2RX(m, rw_begin);
     __builtin___clear_cache(rx_begin, rx_begin + bytes);
 #else
@@ -76,6 +82,16 @@ void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
     (void)rw_begin;
     (void)bytes;
 #endif
+}
+
+void jit_mem_flush_icache(JitMem *m) {
+    /* Ranged I-cache maintenance already done per block in jit_mem_commit_dcache. */
+    (void)m;
+}
+
+void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
+    jit_mem_commit_dcache(m, rw_begin, bytes);
+    jit_mem_flush_icache(m);
 }
 
 void jit_mem_icache_flush_all(JitMem *m) {

@@ -11,9 +11,9 @@
 #define GPU_HW_VRAM_H            512u
 #define GPU_HW_TEXPAGE_DIM       256u
 #define GPU_HW_TEXPAGE_PIXELS    (GPU_HW_TEXPAGE_DIM * GPU_HW_TEXPAGE_DIM)
-#define GPU_HW_TEXCACHE_SLOTS    64u
+#define GPU_HW_TEXCACHE_SLOTS    128u
 #define GPU_HW_VTX_RING_COUNT    2u
-#define GPU_HW_VTX_RING_VERTS    4096u
+#define GPU_HW_VTX_RING_VERTS    8192u
 
 /* 64x32 grid of 16x16 VRAM cells (col bitmask fits in u64, row bitmask in u32) */
 #define GPU_HW_CELL_SHIFT        4u
@@ -77,11 +77,13 @@ typedef struct GpuTexCache {
     u32        lru_clock;
     u32        hits;
     u32        uploads;
-    u32        max_slots;   /* active slot count (64, or fewer on Old 3DS small_mem) */
+    u32        max_slots;   /* active slot count (128 on New 3DS, 20 on Old 3DS small_mem) */
     u32        mru;         /* index of the most recently returned slot */
     u32        cur_frame;   /* in-flight GPU frame id (0 = no frame tracking) */
     bool       stalled;     /* last lookup failed: every slot is referenced by cur_frame */
     bool       allow_rgba8; /* true by default; false if small_mem forces RGBA5551 */
+    u32        bytes_alloc; /* pixel storage currently allocated across all slots */
+    u32        byte_budget; /* never allocate NEW slot storage beyond this (LINEAR RAM cap) */
 } GpuTexCache;
 
 /* --------------------------------------------------------------------------
@@ -202,7 +204,7 @@ void gpu_morton_swizzle_vram_24bpp_8888(u32 *dst_morton, u32 dst_w, u32 dst_h,
                                         const u16 *vram, u16 src_x, u16 src_y, u16 w_px, u16 h_px);
 
 /* --------------------------------------------------------------------------
- * 64-Slot LRU CLUT + TexPage Cache (gpu_texcache.c)
+ * 128-Slot LRU CLUT + TexPage Cache (gpu_texcache.c)
  * -------------------------------------------------------------------------- */
 u32  gpu_clut_hash_fnv1a(const u16 *vram, u16 clut_attr, u8 tex_depth);
 void gpu_vram_rect_cell_masks(u16 x, u16 y, u16 w, u16 h, u64 *out_cols, u32 *out_rows);
@@ -224,11 +226,24 @@ static inline u16 gpu_texpage_coherence_width(u16 tp_x, u8 eff_depth) {
     return (u16)w;
 }
 
-/* Old 3DS (small_mem) slot cap: 20 x 128 KiB RGBA5551 pages = 2.5 MiB LINEAR RAM */
-#define GPU_HW_TEXCACHE_SLOTS_SMALL 20u
+/* Old 3DS (small_mem) slot cap: 32 x 128 KiB RGBA5551 pages = 4 MiB LINEAR RAM (v0.2.5: WE3 needs ~23 live pages) */
+#define GPU_HW_TEXCACHE_SLOTS_SMALL 32u
 
-/* max_slots is clamped to [1, GPU_HW_TEXCACHE_SLOTS] (0 selects the full 64) */
+/*
+ * New 3DS LINEAR RAM cap for texcache pixel storage (v0.2.5): 128 slots x 256 KiB RGBA8 would
+ * be 32 MiB of the ~42.5 MiB linear heap. Slots are allocated lazily; once this budget is
+ * reached, lookups recycle existing storage (stale slots first, then clean LRU) instead.
+ */
+#define GPU_HW_TEXCACHE_BYTE_BUDGET (24u * 1024u * 1024u)
+
+/*
+ * max_slots is clamped to [1, GPU_HW_TEXCACHE_SLOTS] (0 selects the full 128). The byte budget
+ * defaults to max_slots worst-case pages (i.e. unlimited); see gpu_texcache_set_byte_budget().
+ */
 bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8, u32 max_slots);
+static inline void gpu_texcache_set_byte_budget(GpuTexCache *tc, u32 bytes) {
+    tc->byte_budget = bytes;
+}
 
 /*
  * In-flight tracking: slots referenced while tc->cur_frame == F are never re-decoded,

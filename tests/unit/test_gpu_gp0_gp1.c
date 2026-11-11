@@ -437,6 +437,82 @@ static int test_dual_backend_contract(PsxSystem *sys) {
 }
 
 /*
+ * v0.2.5 (Winning Eleven 3 ~20 FPS on real New 3DS): the game ends every frame with
+ * GP0(80h) (0,0)->(0,0) 2x512. An unmasked self-copy cannot change VRAM, so it must not
+ * reach the backend (no sync_to_shadow readback, no vram_copy re-upload); real copies and
+ * masked self-copies still do. Masked GP0(A0h) loads sync the destination first.
+ */
+static int test_vram_copy_noop_and_masked_load(PsxSystem *sys) {
+    gpu_reset(sys);
+    const GpuBackend *orig_be   = sys->gpu.be;
+    void             *orig_self = sys->gpu.be_self;
+
+    MockBackendState mock;
+    memset(&mock, 0, sizeof(mock));
+    sys->gpu.be      = &s_mock_be;
+    sys->gpu.be_self = &mock;
+
+    CHECK_TRUE(gpu_vram_copy_is_noop(0u, 0u, 0u, 0u, 0u, 0u), "self-copy is a no-op");
+    CHECK_TRUE(gpu_vram_copy_is_noop(1024u + 5u, 512u + 7u, 5u, 7u, 0u, 0u),
+               "self-copy modulo the VRAM wrap is a no-op");
+    CHECK_TRUE(!gpu_vram_copy_is_noop(0u, 0u, 0u, 0u, 1u, 0u), "check_mask self-copy is real");
+    CHECK_TRUE(!gpu_vram_copy_is_noop(0u, 0u, 0u, 0u, 0u, 1u), "set_mask self-copy is real");
+    CHECK_TRUE(!gpu_vram_copy_is_noop(0u, 0u, 2u, 0u, 0u, 0u), "moved copy is real");
+
+    /* WE3 end-of-frame GP0(80h) (0,0)->(0,0) 2x512 with mask bits off */
+    sys->gpu.vram[0] = 0x1234u;
+    gpu_gp0_write(sys, 0x80000000u);
+    gpu_gp0_write(sys, 0x00000000u);
+    gpu_gp0_write(sys, 0x00000000u);
+    gpu_gp0_write(sys, 2u | (512u << 16));
+    CHECK_EQ_U32(mock.sync_calls, 0u, "no-op GP0(80h) skips sync_to_shadow");
+    CHECK_EQ_U32(mock.copy_calls, 0u, "no-op GP0(80h) skips be->vram_copy");
+    CHECK_EQ_U32(sys->gpu.vram[0], 0x1234u, "no-op GP0(80h) leaves VRAM unchanged");
+    CHECK_EQ_U32((gpu_stat(sys) >> 26) & 1u, 1u, "GP0 idle after no-op copy");
+
+    /* A real copy still syncs the source and reaches the backend */
+    gpu_gp0_write(sys, 0x80000000u);
+    gpu_gp0_write(sys, 0x00000000u);
+    gpu_gp0_write(sys, 16u | (0u << 16));
+    gpu_gp0_write(sys, 2u | (2u << 16));
+    CHECK_EQ_U32(mock.sync_calls, 1u, "real GP0(80h) syncs source");
+    CHECK_EQ_U32(mock.copy_calls, 1u, "real GP0(80h) calls be->vram_copy");
+
+    /* With set_mask (E6h bit 0) the self-copy sets bit 15: must NOT be skipped */
+    gpu_gp0_write(sys, 0xE6000001u);
+    gpu_gp0_write(sys, 0x80000000u);
+    gpu_gp0_write(sys, 0x00000000u);
+    gpu_gp0_write(sys, 0x00000000u);
+    gpu_gp0_write(sys, 2u | (2u << 16));
+    CHECK_EQ_U32(mock.copy_calls, 2u, "masked self-copy still executes");
+
+    /* Masked CPU->VRAM load (check_mask): destination synced BEFORE the first pixel */
+    gpu_gp0_write(sys, 0xE6000002u);
+    u32 sync_before = mock.sync_calls;
+    gpu_gp0_write(sys, 0xA0000000u);
+    gpu_gp0_write(sys, 40u | (8u << 16));
+    gpu_gp0_write(sys, 2u | (1u << 16));
+    CHECK_EQ_U32(mock.sync_calls, sync_before + 1u, "masked GP0(A0h) syncs destination");
+    CHECK_TRUE(mock.sync_x == 40u && mock.sync_y == 8u && mock.sync_w == 2u && mock.sync_h == 1u,
+               "masked GP0(A0h) syncs exactly the load rect");
+    gpu_gp0_write(sys, 0x7FFF7FFFu);
+    CHECK_EQ_U32(mock.written_calls, 1u, "GP0(A0h) completion notifies vram_written");
+
+    /* Unmasked load: no sync needed (vram_written handles coherence) */
+    gpu_gp0_write(sys, 0xE6000000u);
+    sync_before = mock.sync_calls;
+    gpu_gp0_write(sys, 0xA0000000u);
+    gpu_gp0_write(sys, 40u | (8u << 16));
+    gpu_gp0_write(sys, 2u | (1u << 16));
+    gpu_gp0_write(sys, 0x11112222u);
+    CHECK_EQ_U32(mock.sync_calls, sync_before, "unmasked GP0(A0h) does not sync");
+
+    sys->gpu.be      = orig_be;
+    sys->gpu.be_self = orig_self;
+    return 0;
+}
+
+/*
  * v0.2.4 regression (Winning Eleven 3 freeze after the 480i Konami logo): with the real
  * timers_init() -> gpu_init() hook chain driving EV_HBLANK/EV_VBLANK, sys->gpu.frame must
  * advance exactly once per frame, so in 480i GPUSTAT bits 13 & 31 alternate 0,1,0,1 on
@@ -516,6 +592,7 @@ int main(void) {
     if (test_fifo_and_polylines(&s_sys) != 0) return 1;
     if (test_dual_backend_contract(&s_sys) != 0) return 1;
     if (test_480i_field_toggles_every_frame(&s_sys) != 0) return 1;
+    if (test_vram_copy_noop_and_masked_load(&s_sys) != 0) return 1;
 
     /* Smoke test gpu_state save & load paths */
     StateIO st = { .writing = true, .error = false, .buf = NULL, .pos = 0u, .cap = 0u };

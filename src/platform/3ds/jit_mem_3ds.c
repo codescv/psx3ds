@@ -2,6 +2,7 @@
 #include <malloc.h>
 #include <string.h>
 
+#include "psx3ds/jit.h"
 #include "psx3ds/jit_mem.h"
 #include "psx3ds/platform.h"
 
@@ -271,7 +272,7 @@ void jit_mem_free(JitMem *m) {
     memset(m, 0, sizeof(*m));
 }
 
-void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
+void jit_mem_commit_dcache(JitMem *m, const void *rw_begin, u32 bytes) {
     if (!m || !rw_begin || bytes == 0u || m->mode == JIT_MEM_NONE) {
         return;
     }
@@ -280,28 +281,44 @@ void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
     uintptr_t end = ((uintptr_t)rw_begin + (uintptr_t)bytes + 31u) & ~(uintptr_t)31u;
     u32 len = (u32)(end - start);
 
-    /* 1. Clean D-cache of the RW view (and the RX alias) out to FCRAM. */
+    /* Clean D-cache of the RW view (and the RX alias) out to FCRAM. */
     (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)start, len);
     if (m->rx && m->rx != m->rw) {
         uintptr_t rx_start = (uintptr_t)m->rx + (start - (uintptr_t)m->rw);
         (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)rx_start, len);
     }
+    /* DSB: the clean is complete before any later I-cache invalidate / fetch. */
+    ctr_el0_dsb_isb();
+}
 
+void jit_mem_flush_icache(JitMem *m) {
+    if (!m || m->mode == JIT_MEM_NONE) {
+        return;
+    }
     /*
-     * 2. v0.2.3: invalidate the ARM11 L1 I-cache + BTB. Without this a freshly
-     *    emitted block could execute stale I-cache lines (e.g. zero words decoded
-     *    as `andeq r0, r0, r0`), skipping `blx`/`pop` and corrupting SP before
-     *    jit_exit (real New 3DS prefetch abort at PC = 0x08067E70).
-     *    Luma3DS svcInvalidateEntireInstructionCache (SVC 0x94) clobbers r0-r3, r12.
+     * v0.2.3: invalidate the ARM11 L1 I-cache + BTB. Without this a freshly
+     * emitted block could execute stale I-cache lines (e.g. zero words decoded
+     * as `andeq r0, r0, r0`), skipping `blx`/`pop` and corrupting SP before
+     * jit_exit (real New 3DS prefetch abort at PC = 0x08067E70).
+     * Luma3DS svcInvalidateEntireInstructionCache (SVC 0x94) clobbers r0-r3, r12.
+     * v0.2.5: called ONCE per jit_compile_at_pc (after all eagerly compiled blocks
+     * were D-cache cleaned by jit_mem_commit_dcache), not once per block.
      */
     if (m->luma_icache_svc) {
         __asm__ volatile("svc 0x94\n\t" ::: "r0", "r1", "r2", "r3", "r12", "memory");
     } else if (!m->is_hle_emu) {
         psx3ds_icache_evict_sled();
     }
-
-    /* 3. DSB + ISB (EL0-safe) */
+    /* DSB + ISB (EL0-safe) */
     ctr_el0_dsb_isb();
+}
+
+void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
+    if (!m || !rw_begin || bytes == 0u || m->mode == JIT_MEM_NONE) {
+        return;
+    }
+    jit_mem_commit_dcache(m, rw_begin, bytes);
+    jit_mem_flush_icache(m);
 }
 
 void jit_mem_icache_flush_all(JitMem *m) {

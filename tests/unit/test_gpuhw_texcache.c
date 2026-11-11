@@ -7,7 +7,7 @@
  *   5. 64-slot strict LRU eviction, FNV-1a CLUT hash hits & palette-swap zero-redecode
  *   6. Dirty-rect partial & wrapped VRAM invalidation
  *   7. Per-8x8-tile STP masks & per-primitive UV-box classification
- *   8. Old 3DS small_mem 20-slot cap, MRU fast path & in-flight (current GPU frame) safety
+ *   8. Old 3DS small_mem 32-slot cap, MRU fast path & in-flight (current GPU frame) safety
  */
 
 #include "psx3ds/gpu_hw.h"
@@ -174,7 +174,8 @@ static int test_texcache_lru_clut_and_invalidation(u16 *vram) {
     memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
 
     CHECK(gpu_texcache_init(&tc, true, 0u), "gpu_texcache_init");
-    CHECK(tc.max_slots == GPU_HW_TEXCACHE_SLOTS, "default 64 slots");
+    CHECK(tc.max_slots == GPU_HW_TEXCACHE_SLOTS && GPU_HW_TEXCACHE_SLOTS == 128u,
+          "default 128 slots (v0.2.5 New 3DS)");
 
     /* Setup Page 0 (4bpp at 0,0) with Palette A at (0, 480) */
     u16 clut_a = (u16)(480u << 6);
@@ -248,8 +249,9 @@ static int test_texcache_lru_clut_and_invalidation(u16 *vram) {
     CHECK(!hit && stats.gpu_tex_uploads == 3u, "Page 0 invalidated by wrapped rect at X=1016..15");
     CHECK(((const u16 *)s0_re->pixels)[0] == 0xF801u, "Page 0 re-decoded updated texel");
 
-    /* --- 64-Slot Strict LRU Eviction Test --- */
-    gpu_texcache_reset(&tc);
+    /* --- 64-Slot Strict LRU Eviction Test (explicit 64-slot cap) --- */
+    gpu_texcache_shutdown(&tc);
+    CHECK(gpu_texcache_init(&tc, true, 64u) && tc.max_slots == 64u, "init 64-slot cache");
     memset(&stats, 0, sizeof(stats));
     for (u32 i = 0; i < 64u; ++i) {
         u16 row_y = (u16)(300u + i);
@@ -355,23 +357,23 @@ static int test_small_mem_mru_inflight(u16 *vram) {
     memset(&stats, 0, sizeof(stats));
     memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
 
-    /* --- Old 3DS: 20-slot cap, RGBA5551 only --- */
+    /* --- Old 3DS: 32-slot cap, RGBA5551 only --- */
     CHECK(gpu_texcache_init(&tc, false, GPU_HW_TEXCACHE_SLOTS_SMALL), "init small_mem");
-    CHECK(tc.max_slots == 20u && !tc.allow_rgba8, "small_mem config");
+    CHECK(tc.max_slots == 32u && !tc.allow_rgba8, "small_mem config");
     vram[(400u << 10) + 1u] = 0x001Fu;
     vram[(400u << 10) + 2u] = 0x8000u; /* MIXED CLUT -> still 5551 */
     vram[0] = 0x2121u;
     const GpuTexSlot *sm = gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(400u << 6), NULL, &stats, &hit);
     CHECK(sm != NULL && !sm->is_rgba8 && sm->pixel_bytes == GPU_HW_TEXPAGE_PIXELS * 2u,
           "small_mem MIXED page stays RGBA5551");
-    for (u32 i = 0; i < 25u; ++i) {
+    for (u32 i = 0; i < 40u; ++i) {
         u16 row_y = (u16)(300u + i);
         vram[(row_y << 10) + 1u] = (u16)(0x0001u + i);
         (void)gpu_texcache_lookup(&tc, vram, 0u, 0u, (u16)(row_y << 6), NULL, &stats, &hit);
         CHECK(!hit, "small_mem unique CLUT miss");
     }
-    for (u32 i = 20u; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
-        CHECK(!tc.slots[i].valid && tc.slots[i].pixels == NULL, "slots >= 20 never used");
+    for (u32 i = 32u; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
+        CHECK(!tc.slots[i].valid && tc.slots[i].pixels == NULL, "slots >= 32 never used");
     }
     gpu_texcache_shutdown(&tc);
 
@@ -509,6 +511,86 @@ static int test_texpage_wrap_and_cell_coherence(u16 *vram) {
     return 0;
 }
 
+/*
+ * v0.2.5 regression (Winning Eleven 3 animated CLUTs 0x7fd4..0x7fd6 rewritten every frame):
+ * each rewrite leaves the previous decode CLUT-dirty. Those stale slots must be recycled
+ * before ANY clean, live texture is evicted -- even when the live pages are older in LRU
+ * order -- and the LINEAR RAM byte budget caps how many slots ever get storage.
+ */
+static int test_texcache_clut_dirty_victim_priority(u16 *vram) {
+    GpuTexCache tc;
+    PsxStats stats;
+    bool hit = false;
+    memset(&stats, 0, sizeof(stats));
+    memset(vram, 0, GPU_HW_VRAM_W * GPU_HW_VRAM_H * sizeof(u16));
+
+    CHECK(gpu_texcache_init(&tc, false, 8u), "init 8-slot cache");
+
+    /* 7 clean, live 4bpp pages (texpage 1..7) sharing one static CLUT at row 300 */
+    u16 clut_static = (u16)(300u << 6);
+    vram[(300u << 10) + 1u] = 0x001Fu;
+    const GpuTexSlot *live[8];
+    for (u32 tp = 1u; tp <= 7u; ++tp) {
+        vram[tp * 64u] = 0x1111u;
+        live[tp] = gpu_texcache_lookup(&tc, vram, (u16)tp, 0u, clut_static, NULL, &stats, &hit);
+        CHECK(live[tp] != NULL && !hit, "live page decoded");
+    }
+    /* Animated page 0 with its CLUT at row 480: the 8th (last free) slot, newest in LRU */
+    u16 clut_anim = (u16)(480u << 6);
+    vram[0] = 0x1111u;
+    vram[(480u << 10) + 1u] = 0x0001u;
+    CHECK(gpu_texcache_lookup(&tc, vram, 0u, 0u, clut_anim, NULL, &stats, &hit) != NULL && !hit,
+          "animated page decoded");
+    CHECK(stats.gpu_tex_uploads == 8u, "cache full (8 slots)");
+
+    /* 40 frames of palette animation with never-repeating colours */
+    for (u32 f = 0u; f < 40u; ++f) {
+        vram[(480u << 10) + 1u] = (u16)(0x0002u + f);
+        gpu_texcache_invalidate_vram(&tc, 0u, 480u, 16u, 1u);
+        const GpuTexSlot *sa = gpu_texcache_lookup(&tc, vram, 0u, 0u, clut_anim, NULL, &stats, &hit);
+        CHECK(sa != NULL && !hit, "new palette decodes");
+        CHECK(((const u16 *)sa->pixels)[0] == gpu_psx_to_rgba5551((u16)(0x0002u + f)),
+              "animated page shows the current palette");
+        for (u32 tp = 1u; tp <= 7u; ++tp) {
+            CHECK(sa != live[tp], "stale CLUT slot recycled instead of a live page");
+        }
+    }
+    CHECK(stats.gpu_tex_uploads == 48u, "one decode per animation frame");
+
+    /* Every live page is still resident with zero re-decodes */
+    u32 uploads_before = stats.gpu_tex_uploads;
+    for (u32 tp = 1u; tp <= 7u; ++tp) {
+        const GpuTexSlot *s = gpu_texcache_lookup(&tc, vram, (u16)tp, 0u, clut_static, NULL, &stats, &hit);
+        CHECK(s == live[tp] && hit, "live page survived CLUT animation");
+    }
+    CHECK(stats.gpu_tex_uploads == uploads_before, "no live page re-decoded");
+    gpu_texcache_shutdown(&tc);
+
+    /* --- LINEAR RAM byte budget: 3 RGBA5551 pages for a 16-slot cache --- */
+    memset(&stats, 0, sizeof(stats));
+    CHECK(gpu_texcache_init(&tc, false, 16u), "init 16-slot cache");
+    gpu_texcache_set_byte_budget(&tc, 3u * GPU_HW_TEXPAGE_PIXELS * 2u);
+    for (u32 tp = 0u; tp < 6u; ++tp) {
+        vram[tp * 64u] = 0x1111u;
+        CHECK(gpu_texcache_lookup(&tc, vram, (u16)tp, 0u, clut_static, NULL, &stats, &hit) != NULL,
+              "budgeted lookup succeeds");
+        CHECK(tc.bytes_alloc <= 3u * GPU_HW_TEXPAGE_PIXELS * 2u, "storage stays within budget");
+    }
+    u32 with_storage = 0u;
+    for (u32 i = 0u; i < tc.max_slots; ++i) {
+        with_storage += (tc.slots[i].pixels != NULL) ? 1u : 0u;
+    }
+    CHECK(with_storage == 3u, "only 3 slots ever allocated storage");
+    /* Strict LRU among the 3 resident pages: 3, 4, 5 hit; 2 was evicted */
+    for (u32 tp = 3u; tp < 6u; ++tp) {
+        (void)gpu_texcache_lookup(&tc, vram, (u16)tp, 0u, clut_static, NULL, &stats, &hit);
+        CHECK(hit, "most recent pages resident under budget");
+    }
+    gpu_texcache_shutdown(&tc);
+    CHECK(tc.bytes_alloc == 0u, "shutdown releases all storage");
+    return 0;
+}
+
 int main(void) {
     u16 *vram = (u16 *)calloc(GPU_HW_VRAM_W * GPU_HW_VRAM_H, sizeof(u16));
     CHECK(vram != NULL, "calloc 1 MiB shadow VRAM");
@@ -519,7 +601,8 @@ int main(void) {
         test_texcache_lru_clut_and_invalidation(vram) != 0 ||
         test_tile_masks_classify(vram) != 0 ||
         test_small_mem_mru_inflight(vram) != 0 ||
-        test_texpage_wrap_and_cell_coherence(vram) != 0) {
+        test_texpage_wrap_and_cell_coherence(vram) != 0 ||
+        test_texcache_clut_dirty_victim_priority(vram) != 0) {
         free(vram);
         return 1;
     }

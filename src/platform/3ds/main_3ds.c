@@ -127,6 +127,8 @@ typedef struct CtrAutorunCfg {
     char json[256];
     char tty[256];
     char done[256];
+    char state[256];      /* optional savestate loaded after the disc/exe is mounted */
+    int  scale;           /* -1 = default, else PsxVideoScale (0 = 1:1, 1 = stretch, 2 = 4:3) */
     int  small_mem; /* -1 = auto (O3DS), 0 = force off, 1 = force Old-3DS memory profile */
 } CtrAutorunCfg;
 
@@ -145,6 +147,7 @@ static bool parse_autorun_cfg(CtrAutorunCfg *ar) {
     memset(ar, 0, sizeof(*ar));
     ar->frames = 120u;
     ar->small_mem = -1;
+    ar->scale = -1;
 
     FILE *fp = fopen(AUTORUN_CFG_PATH, "r");
     if (!fp) {
@@ -200,6 +203,18 @@ static bool parse_autorun_cfg(CtrAutorunCfg *ar) {
             snprintf(ar->tty, sizeof(ar->tty), "%s", val);
         } else if (strcmp(key, "done") == 0) {
             snprintf(ar->done, sizeof(ar->done), "%s", val);
+        } else if (strcmp(key, "savestate") == 0 || strcmp(key, "state") == 0) {
+            snprintf(ar->state, sizeof(ar->state), "%s", val);
+        } else if (strcmp(key, "scale") == 0) {
+            if (strcmp(val, "1x1") == 0) {
+                ar->scale = (int)PSX_SCALE_1X1;
+            } else if (strcmp(val, "stretch") == 0) {
+                ar->scale = (int)PSX_SCALE_STRETCH;
+            } else if (strcmp(val, "fit") == 0 || strcmp(val, "4:3") == 0) {
+                ar->scale = (int)PSX_SCALE_FIT_4_3;
+            } else {
+                ar->scale = (int)strtol(val, NULL, 0);
+            }
         } else if (strcmp(key, "small_mem") == 0) {
             ar->small_mem = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0) ? 1 : 0;
         }
@@ -267,6 +282,9 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         cfg.jit_code_bytes = cfg.small_mem ? 6u * 1024u * 1024u : 16u * 1024u * 1024u;
         cfg.jit_max_blocks = cfg.small_mem ? 32768u : 65536u;
     }
+    if (ar->scale >= (int)PSX_SCALE_1X1 && ar->scale <= (int)PSX_SCALE_FIT_4_3) {
+        cfg.scale = (u8)ar->scale;
+    }
     if (strcmp(ar->cpu, "interp") == 0) {
         cfg.cpu_engine = CPU_INTERP;
     } else if (strcmp(ar->cpu, "cached") == 0) {
@@ -330,7 +348,12 @@ static int run_autorun_mode(const CtrAutorunCfg *ar, CtrHwInfo *hw) {
         PsxResult erc = psx_load_exe(sys, ar->exe);
         plat_log("[boot] autorun exe=%s rc=%d\n", ar->exe, (int)erc);
     }
+    if (ar->state[0] != '\0') {
+        PsxResult src = psx_state_load_file(sys, ar->state);
+        plat_log("[autorun] loaded savestate %s (rc=%d)\n", ar->state, (int)src);
+    }
 
+    ctr_input_set_scale_mode((PsxVideoScale)sys->cfg.scale);
     ctr_audio_bind_system(sys);
     ctr_threads_start_workers(sys, hw);
 
@@ -642,7 +665,13 @@ int main(int argc, char **argv) {
                 ctr_ui_set_status(ui, "Quick-saved state (L+R+X)");
             }
             psx_run_frame(sys);
-            if ((ui_frame_div++ & 3u) == 0u) {
+            /*
+             * v0.2.5: the bottom-screen UI is software-rendered on the ARM11 (~1-2 ms per
+             * redraw on real hardware). While idle during gameplay redraw it only every 16th
+             * frame (~3.75 Hz); any new button press or touch redraws it immediately.
+             */
+            bool ui_input = (kdown != 0u) || ((kheld & KEY_TOUCH) != 0u);
+            if (ui_input || (ui_frame_div++ & 15u) == 0u) {
                 ctr_ui_render(ui, sys, &hw);
             }
         } else {

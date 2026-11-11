@@ -589,11 +589,18 @@ static void exec_gp0_packet(PsxSystem *sys) {
         u16 w  = (u16)(((f[3] - 1u) & 0x3FFu) + 1u);
         u16 h  = (u16)((((f[3] >> 16) - 1u) & 0x1FFu) + 1u);
 
-        sync_shadow_wrapped(g, sx, sy, w, h);
-        gpu_vram_copy_rect(g->vram, sx, sy, dx, dy, w, h,
-                           g->env.check_mask, g->env.set_mask);
-        if (g->be && g->be->vram_copy) {
-            g->be->vram_copy(g->be_self, sx, sy, dx, dy, w, h);
+        /*
+         * v0.2.5: a self-copy without mask bits (Winning Eleven 3 issues GP0(80h)
+         * (0,0)->(0,0) 2x512 at the end of EVERY frame) leaves VRAM unchanged. Skipping it
+         * avoids a full GPU->shadow readback plus a CPU re-upload (two PICA200 stalls/frame).
+         */
+        if (!gpu_vram_copy_is_noop(sx, sy, dx, dy, g->env.check_mask, g->env.set_mask)) {
+            sync_shadow_wrapped(g, sx, sy, w, h);
+            gpu_vram_copy_rect(g->vram, sx, sy, dx, dy, w, h,
+                               g->env.check_mask, g->env.set_mask);
+            if (g->be && g->be->vram_copy) {
+                g->be->vram_copy(g->be_self, sx, sy, dx, dy, w, h);
+            }
         }
         gpu_schedule_cmd_cost(sys, (u32)w * (u32)h);
         return;
@@ -608,6 +615,13 @@ static void exec_gp0_packet(PsxSystem *sys) {
         g->xfer_cy = 0u;
         u32 npix   = (u32)g->xfer_w * (u32)g->xfer_h;
         g->xfer_words_left = (npix + 1u) >> 1;
+        if (g->env.check_mask && g->xfer_words_left > 0u) {
+            /*
+             * Masked CPU->VRAM writes test bit 15 of the destination in shadow VRAM, so
+             * GPU-rendered pixels (and their mask bits) must be pulled in first.
+             */
+            sync_shadow_wrapped(g, g->xfer_x, g->xfer_y, g->xfer_w, g->xfer_h);
+        }
         g->st = (g->xfer_words_left > 0u) ? GP0_IMG_LOAD : GP0_IDLE;
         return;
     }

@@ -133,54 +133,14 @@ static u32 scan_clut_class_union(const u16 *vram, u16 clut_x, u16 clut_y, u32 co
     return mask;
 }
 
-static bool ensure_slot_storage(GpuTexSlot *slot, bool want_rgba8) {
-    u32 want_bytes = GPU_HW_TEXPAGE_PIXELS * (want_rgba8 ? 4u : 2u);
-
-#if PSX3DS_HAVE_CITRO3D
-    C3D_Tex *tex = (C3D_Tex *)slot->hw_tex;
-    if (tex != NULL && slot->pixels != NULL && slot->is_rgba8 == want_rgba8 &&
-        slot->pixel_bytes == want_bytes) {
-        return true;
+/*
+ * (Re)allocate a slot's pixel storage for the wanted format, keeping tc->bytes_alloc exact.
+ * Never grows the cache's total storage beyond tc->byte_budget (returns false instead).
+ */
+static void free_slot_storage(GpuTexCache *tc, GpuTexSlot *slot) {
+    if (tc != NULL && slot->pixel_bytes <= tc->bytes_alloc) {
+        tc->bytes_alloc -= slot->pixel_bytes;
     }
-    if (tex == NULL) {
-        tex = (C3D_Tex *)calloc(1, sizeof(C3D_Tex));
-        if (tex == NULL) {
-            return false;
-        }
-        slot->hw_tex = tex;
-    } else if (tex->data != NULL) {
-        C3D_TexDelete(tex);
-        memset(tex, 0, sizeof(*tex));
-    }
-
-    GPU_TEXCOLOR fmt = want_rgba8 ? GPU_RGBA8 : GPU_RGBA5551;
-    if (!C3D_TexInit(tex, GPU_HW_TEXPAGE_DIM, GPU_HW_TEXPAGE_DIM, fmt)) {
-        return false;
-    }
-    C3D_TexSetWrap(tex, GPU_REPEAT, GPU_REPEAT);
-    C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST);
-
-    slot->pixels = tex->data;
-    slot->pixel_bytes = want_bytes;
-    slot->is_rgba8 = want_rgba8;
-    return true;
-#else
-    if (slot->pixels != NULL && slot->is_rgba8 == want_rgba8 && slot->pixel_bytes == want_bytes) {
-        return true;
-    }
-    free(slot->pixels);
-    slot->pixels = malloc(want_bytes);
-    if (slot->pixels == NULL) {
-        slot->pixel_bytes = 0u;
-        return false;
-    }
-    slot->pixel_bytes = want_bytes;
-    slot->is_rgba8 = want_rgba8;
-    return true;
-#endif
-}
-
-static void free_slot_storage(GpuTexSlot *slot) {
 #if PSX3DS_HAVE_CITRO3D
     if (slot->hw_tex != NULL) {
         C3D_Tex *tex = (C3D_Tex *)slot->hw_tex;
@@ -199,6 +159,56 @@ static void free_slot_storage(GpuTexSlot *slot) {
 #endif
 }
 
+static bool ensure_slot_storage(GpuTexCache *tc, GpuTexSlot *slot, bool want_rgba8) {
+    u32 want_bytes = GPU_HW_TEXPAGE_PIXELS * (want_rgba8 ? 4u : 2u);
+    if (slot->pixels != NULL && slot->is_rgba8 == want_rgba8 && slot->pixel_bytes == want_bytes) {
+        return true;
+    }
+    u32 have_bytes = (slot->pixels != NULL) ? slot->pixel_bytes : 0u;
+    u32 base = (tc->bytes_alloc >= have_bytes) ? (tc->bytes_alloc - have_bytes) : 0u;
+    if (base + want_bytes > tc->byte_budget) {
+        return false;
+    }
+
+#if PSX3DS_HAVE_CITRO3D
+    C3D_Tex *tex = (C3D_Tex *)slot->hw_tex;
+    if (tex == NULL) {
+        tex = (C3D_Tex *)calloc(1, sizeof(C3D_Tex));
+        if (tex == NULL) {
+            return false;
+        }
+        slot->hw_tex = tex;
+    } else if (tex->data != NULL) {
+        C3D_TexDelete(tex);
+        memset(tex, 0, sizeof(*tex));
+    }
+    tc->bytes_alloc = base;
+    slot->pixels = NULL;
+    slot->pixel_bytes = 0u;
+
+    GPU_TEXCOLOR fmt = want_rgba8 ? GPU_RGBA8 : GPU_RGBA5551;
+    if (!C3D_TexInit(tex, GPU_HW_TEXPAGE_DIM, GPU_HW_TEXPAGE_DIM, fmt)) {
+        return false;
+    }
+    C3D_TexSetWrap(tex, GPU_REPEAT, GPU_REPEAT);
+    C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST);
+
+    slot->pixels = tex->data;
+#else
+    free(slot->pixels);
+    tc->bytes_alloc = base;
+    slot->pixel_bytes = 0u;
+    slot->pixels = malloc(want_bytes);
+    if (slot->pixels == NULL) {
+        return false;
+    }
+#endif
+    slot->pixel_bytes = want_bytes;
+    slot->is_rgba8 = want_rgba8;
+    tc->bytes_alloc += want_bytes;
+    return true;
+}
+
 bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8, u32 max_slots) {
     if (tc == NULL) {
         return false;
@@ -209,6 +219,8 @@ bool gpu_texcache_init(GpuTexCache *tc, bool allow_rgba8, u32 max_slots) {
         max_slots = GPU_HW_TEXCACHE_SLOTS;
     }
     tc->max_slots = max_slots;
+    tc->bytes_alloc = 0u;
+    tc->byte_budget = max_slots * GPU_HW_TEXPAGE_PIXELS * 4u;
     return true;
 }
 
@@ -248,7 +260,7 @@ void gpu_texcache_shutdown(GpuTexCache *tc) {
         return;
     }
     for (u32 i = 0; i < GPU_HW_TEXCACHE_SLOTS; ++i) {
-        free_slot_storage(&tc->slots[i]);
+        free_slot_storage(tc, &tc->slots[i]);
     }
     memset(tc, 0, sizeof(*tc));
 }
@@ -300,6 +312,58 @@ static void update_slot_clut_footprint(GpuTexSlot *s, u16 clut_norm, u8 eff_dept
     s->clut_col_mask = ccols;
     s->clut_row_bit = crows;
     s->clut_dirty = false;
+}
+
+/*
+ * Victim choice for a cache miss, never a slot the PICA200 may still sample this frame:
+ *   1. a free slot that already owns storage, or a texel-dirty slot (dead: never hits again)
+ *   2. the retired exact (texpage, clut, window) match of this lookup
+ *   3. a never-allocated slot, while the LINEAR RAM byte budget allows a new page
+ *   4. the oldest CLUT-dirty slot: stale palette variants (animated CLUTs rewritten every
+ *      frame) are kept while memory allows, so A <-> B palette toggles still hit via the
+ *      FNV-1a content hash, but are always recycled before any clean, live texture
+ *   5. the oldest clean slot (strict LRU)
+ */
+static GpuTexSlot *select_victim_slot(GpuTexCache *tc, GpuTexSlot *dirty_match) {
+    u32 page_max = GPU_HW_TEXPAGE_PIXELS * (tc->allow_rgba8 ? 4u : 2u);
+    bool can_grow = tc->bytes_alloc + page_max <= tc->byte_budget;
+    GpuTexSlot *free_alloc = NULL, *free_new = NULL, *dead = NULL, *stale = NULL, *clean = NULL;
+
+    for (u32 i = 0; i < tc->max_slots; ++i) {
+        GpuTexSlot *s = &tc->slots[i];
+        if (slot_in_flight(tc, s)) {
+            continue;
+        }
+        if (!s->valid) {
+            if (s == dirty_match) {
+                continue;
+            }
+            if (s->pixels != NULL) {
+                if (free_alloc == NULL) {
+                    free_alloc = s;
+                }
+            } else if (can_grow && free_new == NULL) {
+                free_new = s;
+            }
+        } else if (s->texel_dirty) {
+            if (dead == NULL || s->last_used < dead->last_used) {
+                dead = s;
+            }
+        } else if (s->clut_dirty) {
+            if (stale == NULL || s->last_used < stale->last_used) {
+                stale = s;
+            }
+        } else if (clean == NULL || s->last_used < clean->last_used) {
+            clean = s;
+        }
+    }
+    if (free_alloc != NULL) return free_alloc;
+    if (dead != NULL)       return dead;
+    if (dirty_match != NULL && dirty_match->pixels != NULL) return dirty_match;
+    if (free_new != NULL)   return free_new;
+    if (dirty_match != NULL) return dirty_match;
+    if (stale != NULL)      return stale;
+    return clean;
 }
 
 const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
@@ -381,9 +445,8 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
     }
 
     /*
-     * 3. Cache miss: retire any texel-dirty matching slots, then pick a victim that the
-     * PICA200 is not still going to sample this frame: a free slot first (preferring one
-     * other than the retired exact match), else the oldest LRU slot that is not in flight.
+     * 3. Cache miss: retire every texel-dirty slot of this page (it can never hit again) and
+     * remember a retired exact match for reuse, then pick a victim (see select_victim_slot).
      */
     GpuTexSlot *dirty_match = NULL;
     for (u32 i = 0; i < nslots; ++i) {
@@ -397,28 +460,7 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         }
     }
 
-    GpuTexSlot *victim = NULL;
-    for (u32 i = 0; i < nslots; ++i) {
-        GpuTexSlot *s = &tc->slots[i];
-        if (!s->valid && s != dirty_match && !slot_in_flight(tc, s)) {
-            victim = s;
-            break;
-        }
-    }
-    if (victim == NULL && dirty_match != NULL) {
-        victim = dirty_match;
-    }
-    if (victim == NULL) {
-        for (u32 i = 0u; i < nslots; ++i) {
-            GpuTexSlot *s = &tc->slots[i];
-            if (slot_in_flight(tc, s)) {
-                continue;
-            }
-            if (victim == NULL || s->last_used < victim->last_used) {
-                victim = s;
-            }
-        }
-    }
+    GpuTexSlot *victim = select_victim_slot(tc, dirty_match);
     if (victim == NULL) {
         tc->stalled = true;
         if (out_hit) {
@@ -432,12 +474,31 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
     u16 clut_x = (u16)(((u32)clut_norm & 0x3Fu) << 4);
     u16 clut_y = (u16)(((u32)clut_norm >> 6) & 0x1FFu);
 
+    /* Paletted pages holding both STP=0 and STP=1 colours want RGBA8 (2-pass MIXED split) */
+    bool want8_hint = false;
+    if (has_clut && tc->allow_rgba8) {
+        u32 c_union = scan_clut_class_union(vram, clut_x, clut_y, eff_depth == 0u ? 16u : 256u);
+        want8_hint = ((c_union & 3u) == 3u);
+    }
+    if (victim->pixels == NULL && !ensure_slot_storage(tc, victim, want8_hint) &&
+        !(want8_hint && ensure_slot_storage(tc, victim, false))) {
+        /* LINEAR RAM exhausted below the budget: stop growing and recycle existing storage */
+        tc->byte_budget = tc->bytes_alloc;
+        victim = select_victim_slot(tc, dirty_match);
+        if (victim == NULL || victim->pixels == NULL) {
+            tc->stalled = (victim == NULL);
+            if (out_hit) {
+                *out_hit = false;
+            }
+            return NULL;
+        }
+    }
+
     GpuTexAlphaClass acls = GPU_TEX_ALPHA_ALL_OPAQUE;
     if (eff_depth == 0u) {
-        u32 c_union = scan_clut_class_union(vram, clut_x, clut_y, 16u);
-        bool want8 = tc->allow_rgba8 && ((c_union & 3u) == 3u);
-        if (!ensure_slot_storage(victim, want8)) {
-            if (!want8 || !ensure_slot_storage(victim, false)) {
+        bool want8 = want8_hint;
+        if (!ensure_slot_storage(tc, victim, want8)) {
+            if (!want8 || !ensure_slot_storage(tc, victim, false)) {
                 if (out_hit) {
                     *out_hit = false;
                 }
@@ -458,10 +519,9 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
             }
         }
     } else if (eff_depth == 1u) {
-        u32 c_union = scan_clut_class_union(vram, clut_x, clut_y, 256u);
-        bool want8 = tc->allow_rgba8 && ((c_union & 3u) == 3u);
-        if (!ensure_slot_storage(victim, want8)) {
-            if (!want8 || !ensure_slot_storage(victim, false)) {
+        bool want8 = want8_hint;
+        if (!ensure_slot_storage(tc, victim, want8)) {
+            if (!want8 || !ensure_slot_storage(tc, victim, false)) {
                 if (out_hit) {
                     *out_hit = false;
                 }
@@ -482,7 +542,7 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
             }
         }
     } else {
-        if (!ensure_slot_storage(victim, false)) {
+        if (!ensure_slot_storage(tc, victim, false)) {
             if (out_hit) {
                 *out_hit = false;
             }
@@ -491,7 +551,7 @@ const GpuTexSlot *gpu_texcache_lookup(GpuTexCache *tc, const u16 *vram,
         acls = gpu_morton_decode_15bpp_5551((u16 *)victim->pixels, vram, tp_x, tp_y, &tw_norm,
                                             &victim->tiles);
         if (acls == GPU_TEX_ALPHA_MIXED) {
-            if (tc->allow_rgba8 && ensure_slot_storage(victim, true)) {
+            if (tc->allow_rgba8 && ensure_slot_storage(tc, victim, true)) {
                 acls = gpu_morton_decode_15bpp_8888((u32 *)victim->pixels, vram, tp_x, tp_y,
                                                     &tw_norm, &victim->tiles);
             } else {

@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.4`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.5`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -277,6 +277,25 @@ The emulator creates the `psx3ds/` directories on first launch.
 > buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
 > every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
 > offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
+
+> [!NOTE]
+> **`v0.2.5` fixes (Winning Eleven 3 ~20 FPS and texture glitches on real New 3DS):**
+> - **No-op `GP0(80h)`:** WE3 ends every frame with an unmasked `(0,0)->(0,0) 2x512` self-copy;
+>   it used to force a full GPU->shadow readback plus a CPU re-upload (two PICA200 stalls/frame).
+>   It is now skipped (`gpu_vram_copy_is_noop`); masked `GP0(A0h)` loads sync the destination first.
+> - **Early scissor culling:** primitives fully outside the drawing area (~39% of WE3 match draws)
+>   are dropped before any texture decode; CPU-upload flushes use the clipped primitive bbox.
+> - **Fewer GPU syncs:** one vertex D-cache flush per frame submission (was one GSPGPU IPC per batch),
+>   `upload_tex` rewrites only stall when the open frame already sampled it and flush only the dirty
+>   tile rows, 8192-vertex rings, one ARM11 I-cache invalidate per eager JIT compile (was per block),
+>   and the bottom-screen UI redraws at ~3.75 Hz while idle in game.
+> - **Texture cache:** stale CLUT-dirty slots (animated palettes) are recycled before any clean,
+>   live page is evicted; New 3DS uses 128 lazily allocated slots capped at 24 MiB of LINEAR RAM.
+> - **Texel-exact sampling:** UVs are 1/16-texel fixed point, VRAM-pass geometry is shifted by 7/16 px
+>   to sample at PS1 integer pixel positions, polygons get the PS1 `floor(u + 0.5)` lookup with the
+>   gradient correction (minified shadows no longer turn into dotted lines), and integral `v` no longer
+>   fetches row `v - 1` (or wraps `v = 0` to row 255). The WE3 menus/dialogs now match `gpu_soft`
+>   pixel-for-pixel in Azahar.
 
 > [!NOTE]
 > **`v0.2.4` fixes (Winning Eleven 3 freeze after the logo, HOME -> Close hang):**
