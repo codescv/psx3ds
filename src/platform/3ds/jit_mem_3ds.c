@@ -125,7 +125,12 @@ PsxResult jit_mem_alloc(JitMem *m, u32 size) {
     m->size = size;
     m->mode = JIT_MEM_NONE;
 
-    u8 *rw = (u8 *)memalign(0x1000u, size);
+    /*
+     * v0.2.3: 16 KiB alignment (>= 8 KiB per-way size of the 32 KiB 4-way ARM11
+     * MPCore VIPT L1 caches) so `rw` and the 1 MiB-aligned `rx` mirror share the
+     * same cache colour (VA bits [13:12]); otherwise an odd-4KiB `rw` aliases.
+     */
+    u8 *rw = (u8 *)memalign(0x4000u, size);
     if (!rw) {
         return PSX_ERR_NOMEM;
     }
@@ -144,6 +149,7 @@ PsxResult jit_mem_alloc(JitMem *m, u32 size) {
     bool has_citra_info = (svcGetSystemInfo(&citra_info, 0x20000, 0) == 0);
     bool real_luma = has_luma_info && !has_citra_info;
     m->luma_icache_svc = false;
+    m->is_hle_emu = !real_luma;
 
     u32 pid = 0u;
     Handle proc = 0;
@@ -210,6 +216,7 @@ PsxResult jit_mem_alloc(JitMem *m, u32 size) {
      *        real 3DS W^X kernels always return a negative Result < 0 on SVC failure).
      */
     bool is_hle_emu = (!real_luma) || (have_proc && rc_prot > 0);
+    m->is_hle_emu = is_hle_emu;
     if (is_hle_emu && g_jit_allow_hle_exec && probe_hle_exec_buffer(rw + size - 64u)) {
         m->rx = rw;
         m->size = size - 0x1000u; /* Reserve trailing probe page; keep [rw, rw+m->size) virgin */
@@ -268,9 +275,32 @@ void jit_mem_commit(JitMem *m, const void *rw_begin, u32 bytes) {
     if (!m || !rw_begin || bytes == 0u || m->mode == JIT_MEM_NONE) {
         return;
     }
+    /* 32-byte ARM11 cache-line aligned [start, end) in m->rw */
     uintptr_t start = (uintptr_t)rw_begin & ~(uintptr_t)31u;
     uintptr_t end = ((uintptr_t)rw_begin + (uintptr_t)bytes + 31u) & ~(uintptr_t)31u;
-    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)start, (u32)(end - start));
+    u32 len = (u32)(end - start);
+
+    /* 1. Clean D-cache of the RW view (and the RX alias) out to FCRAM. */
+    (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)start, len);
+    if (m->rx && m->rx != m->rw) {
+        uintptr_t rx_start = (uintptr_t)m->rx + (start - (uintptr_t)m->rw);
+        (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)rx_start, len);
+    }
+
+    /*
+     * 2. v0.2.3: invalidate the ARM11 L1 I-cache + BTB. Without this a freshly
+     *    emitted block could execute stale I-cache lines (e.g. zero words decoded
+     *    as `andeq r0, r0, r0`), skipping `blx`/`pop` and corrupting SP before
+     *    jit_exit (real New 3DS prefetch abort at PC = 0x08067E70).
+     *    Luma3DS svcInvalidateEntireInstructionCache (SVC 0x94) clobbers r0-r3, r12.
+     */
+    if (m->luma_icache_svc) {
+        __asm__ volatile("svc 0x94\n\t" ::: "r0", "r1", "r2", "r3", "r12", "memory");
+    } else if (!m->is_hle_emu) {
+        psx3ds_icache_evict_sled();
+    }
+
+    /* 3. DSB + ISB (EL0-safe) */
     ctr_el0_dsb_isb();
 }
 
@@ -280,7 +310,7 @@ void jit_mem_icache_flush_all(JitMem *m) {
     }
     (void)svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)m->rw, m->size);
     if (m->luma_icache_svc) {
-        __asm__ volatile("svc 0x94\n\t" ::: "r0", "r1", "r2", "r3", "memory");
+        __asm__ volatile("svc 0x94\n\t" ::: "r0", "r1", "r2", "r3", "r12", "memory");
     } else {
         psx3ds_icache_evict_sled();
     }

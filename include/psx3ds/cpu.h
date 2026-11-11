@@ -63,8 +63,9 @@ typedef struct PSX_ALIGNED(32) PsxCpu {
     u32 gte_scratch[8];
     u32 icache_dirty;
     u32 psexe_pending;
+    u32 jit_saved_sp;  /* host SP saved by jit_enter, restored by jit_exit* (v0.2.3) */
 
-    u8  _hot_pad[PSX_OFF_HOT_END - 0x270];
+    u8  _hot_pad[PSX_OFF_HOT_END - 0x274];
 
     /* ---- cold (>= 0x300) ---- */
     u64 total_cycles;
@@ -107,6 +108,7 @@ PSX_ASSERT_OFF(PsxCpu, abort_badvaddr, PSX_OFF_ABORT_BADVADDR);
 PSX_ASSERT_OFF(PsxCpu, gte_scratch,    PSX_OFF_GTE_SCRATCH);
 PSX_ASSERT_OFF(PsxCpu, icache_dirty,   PSX_OFF_ICACHE_DIRTY);
 PSX_ASSERT_OFF(PsxCpu, psexe_pending,  PSX_OFF_PSEXE_PENDING);
+PSX_ASSERT_OFF(PsxCpu, jit_saved_sp,   PSX_OFF_JIT_SP);
 _Static_assert(offsetof(PsxCpu, total_cycles) >= PSX_OFF_HOT_END, "hot region overflow");
 _Static_assert(offsetof(PsxCpu, total_cycles) == PSX_OFF_HOT_END, "unexpected padding at hot/cold boundary");
 

@@ -23,6 +23,7 @@
 jit_enter:
     push    {r4-r12, lr}                @ 10 regs (40 B) -> preserves 8-byte SP alignment
     mov     r11, r0                     @ r11 = PsxCpu *
+    str     sp,  [r11, #PSX_OFF_JIT_SP] @ v0.2.3: SP guard, restored by every jit_exit* path
     ldr     r9,  [r11, #PSX_OFF_FASTMEM_R]
     ldr     r10, [r11, #PSX_OFF_CYCLES_LEFT]
     ldr     r2,  [r11, #PSX_OFF_BLOCKTAB_RAM]
@@ -161,6 +162,7 @@ jit_exit:
     str     r10, [r11, #PSX_OFF_CYCLES_LEFT]
     mov     r0,  #PSX_EXIT_EVENTS
     str     r0,  [r11, #PSX_OFF_EXIT_REASON]
+    ldr     sp,  [r11, #PSX_OFF_JIT_SP] @ v0.2.3: exact SP saved by jit_enter
     pop     {r4-r12, pc}
     .size jit_exit, . - jit_exit
 
@@ -172,6 +174,7 @@ jit_exit_step_one:
     str     r10, [r11, #PSX_OFF_CYCLES_LEFT]
     mov     r0,  #PSX_EXIT_STEP_ONE
     str     r0,  [r11, #PSX_OFF_EXIT_REASON]
+    ldr     sp,  [r11, #PSX_OFF_JIT_SP] @ v0.2.3: exact SP saved by jit_enter
     pop     {r4-r12, pc}
     .size jit_exit_step_one, . - jit_exit_step_one
 
@@ -182,6 +185,7 @@ jit_exit_with_reason:
     str     r2,  [r11, #PSX_OFF_IN_JIT]
     str     r10, [r11, #PSX_OFF_CYCLES_LEFT]
     ldr     r0,  [r11, #PSX_OFF_EXIT_REASON]
+    ldr     sp,  [r11, #PSX_OFF_JIT_SP] @ v0.2.3: exact SP saved by jit_enter
     pop     {r4-r12, pc}
     .size jit_exit_with_reason, . - jit_exit_with_reason
 
@@ -200,6 +204,7 @@ jit_raise_exception_exit:
     ldr     r10, [r11, #PSX_OFF_CYCLES_LEFT]
     mov     r0,  #PSX_EXIT_EXCEPTION
     str     r0,  [r11, #PSX_OFF_EXIT_REASON]
+    ldr     sp,  [r11, #PSX_OFF_JIT_SP] @ v0.2.3: exact SP saved by jit_enter
     pop     {r4-r12, pc}
     .size jit_raise_exception_exit, . - jit_raise_exception_exit
 

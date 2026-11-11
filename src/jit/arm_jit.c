@@ -894,10 +894,24 @@ static JIT_NOINLINE JitBlock *jit_emit_block_one_try(PsxSystem *sys, u32 start_p
 #define e     g_emit_scratch
 #define stubs g_stubs_scratch
 
-    u8 *rw_begin = j->code_ptr;
+    /*
+     * v0.2.3: every native block starts on a fresh 32-byte ARM11 L1 cache line
+     * (code_ptr may be only 8-byte aligned after cached-interpreter blocks).
+     */
+    u8 *rw_begin = (u8 *)(((uintptr_t)j->code_ptr + 31u) & ~(uintptr_t)31u);
+    if (rw_begin >= j->code_end) {
+        return NULL;
+    }
+    u32 emit_cap = JIT_MAX_BLOCK_BYTES;
+    if ((size_t)(j->code_end - rw_begin) < (size_t)emit_cap) {
+        emit_cap = (u32)(j->code_end - rw_begin) & ~31u;
+        if (emit_cap == 0u) {
+            return NULL;
+        }
+    }
     ptrdiff_t rw_to_rx = j->mem.rx - j->mem.rw;
 
-    arm_emit_reset_dual(&e, rw_begin, rw_to_rx, JIT_MAX_BLOCK_BYTES);
+    arm_emit_reset_dual(&e, rw_begin, rw_to_rx, emit_cap);
 
     JitRegAlloc ra;
     jit_ra_init(&ra, &scan);
@@ -1886,8 +1900,21 @@ emit_tails:
         return NULL;
     }
 
+    /*
+     * v0.2.3: pad the block to a 32-byte ARM11 cache-line boundary so no two blocks
+     * share an L1 I-cache line (real New 3DS prefetch abort at PC = 0x08067E70 was
+     * caused by a stale I-cache line straddling adjacent blocks).
+     */
+    u32 aligned_bytes = (emitted_bytes + 31u) & ~31u;
+    if ((size_t)(j->code_end - rw_begin) < (size_t)aligned_bytes) {
+        return NULL;
+    }
+    if (aligned_bytes > emitted_bytes) {
+        memset(rw_begin + emitted_bytes, 0, aligned_bytes - emitted_bytes);
+    }
+
     u8 *entry_rx = JIT_RW2RX(&j->mem, rw_begin);
-    jit_mem_commit(&j->mem, rw_begin, emitted_bytes);
+    jit_mem_commit(&j->mem, rw_begin, aligned_bytes);
 
     u16 b_idx = (u16)j->n_blocks++;
     JitBlock *b = &j->blocks[b_idx];
@@ -1904,7 +1931,7 @@ emit_tails:
     b->flags = scan.block_flags;
     b->_pad = fast_off_bytes;
 
-    j->code_ptr = rw_begin + emitted_bytes;
+    j->code_ptr = rw_begin + aligned_bytes;
 
     for (u32 k = 0u; k < 2u; ++k) {
         if (scan.ram_pages[k] != JIT_PAGE_NONE) {

@@ -4,12 +4,12 @@
 #include "psx3ds/types.h"
 
 /* --------------------------------------------------------------------------
- * Semantic version constants (v0.2.1)
+ * Semantic version constants (v0.2.3)
  * -------------------------------------------------------------------------- */
 #define PSX3DS_VERSION_MAJOR 0
 #define PSX3DS_VERSION_MINOR 2
-#define PSX3DS_VERSION_PATCH 1
-#define PSX3DS_VERSION_STR   "0.2.2"
+#define PSX3DS_VERSION_PATCH 3
+#define PSX3DS_VERSION_STR   "0.2.3"
 
 /* --------------------------------------------------------------------------
  * Compile-time platform & architecture detection (single source of truth)

@@ -1,4 +1,4 @@
-# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.2`)
+# psx3ds — A PlayStation 1 emulator for Nintendo 3DS, tuned for ARM11 (`v0.2.3`)
 
 psx3ds is a PlayStation 1 (PSX) emulator for the Nintendo 3DS, written in C11 and ARMv6K
 assembly. It is designed around the 3DS ARM11 MPCore CPU (ARMv6K + VFPv2, **no NEON, no ARMv7**)
@@ -187,11 +187,11 @@ Useful `psx3ds-cli` options (run `psx3ds-cli --help` for all of them):
 
 ### Installation (CIA via FBI or 3DSX via Homebrew Launcher)
 
-Grab the latest release bundle (`psx3ds-v0.2.2-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
+Grab the latest release bundle (`psx3ds-v0.2.3-3ds.zip` or standalone `psx3ds.cia` / `psx3ds.3dsx`)
 from [**GitHub Releases**](https://github.com/codescv/psx3ds/releases):
 
 * **Option A — Installable `.cia` (Recommended on Luma3DS, New 3DS & Old 3DS):**
-  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.2-3ds.zip` to the root
+  1. Copy `psx3ds.cia` to `sdmc:/cia/psx3ds.cia` (or extract `psx3ds-v0.2.3-3ds.zip` to the root
      of your SD card).
   2. Open **FBI** → `SD` → `cia` → `psx3ds.cia` → **Install and delete CIA**, then launch
      **PSX3DS** from the 3DS Home Menu.
@@ -234,13 +234,14 @@ with an 8-hunk LRU cache on New 3DS (`~1.2 MiB`, Core 2 async offload) and a 4-h
 (`~0.6 MiB`); `.chd` titles show a `[CHD]` badge in the ROM browser and live cache hit rates on the
 telemetry HUD.
 
-The ROM browser scans `sdmc:/psx3ds/roms`, `sdmc:/psx`, `sdmc:/roms/psx` and `sdmc:/`.
+The ROM browser scans only `sdmc:/psx3ds/roms`, `sdmc:/roms/psx` and `sdmc:/psx` (`v0.2.3`: the SD
+card root is no longer scanned).
 
 **BIOS (`v0.2.2`): no setup required.** A 512 KiB **OpenBIOS** image (MIT, PCSX-Redux) is embedded
 directly in `psx3ds.cia` / `.3dsx` / `.cci`, so `.chd` / `.cue` / `.bin` / `.iso` discs boot out of the
 box (header badge `[OPENBIOS]`). If you place your own 512 KiB BIOS dump (`scph*.bin`, `psxonpsp*.bin`,
-`bios*.bin`; any case) in `sdmc:/psx3ds/bios/`, `sdmc:/psx/`, `sdmc:/roms/psx/`, `sdmc:/bios/` or
-`sdmc:/`, it is used instead (badge e.g. `[SCPH1001]`, `[SCPH5501]`). The `3:CTRL` tab toggles
+`bios*.bin`; any case) in `sdmc:/psx3ds/bios/`, `sdmc:/bios/`, `sdmc:/psx3ds/roms/`, `sdmc:/roms/psx/`
+or `sdmc:/psx/` (never the SD root), it is used instead (badge e.g. `[SCPH1001]`, `[SCPH5501]`). The `3:CTRL` tab toggles
 `BIOS: Auto/OpenBIOS` ↔ `BIOS: HLE Direct` and `CD Boot: Native` ↔ `CD Boot: Fast`:
 
 * **Native** (default): the BIOS kernel boots, the BIOS shell/logo is skipped, and the BIOS reads
@@ -265,6 +266,17 @@ The emulator creates the `psx3ds/` directories on first launch.
 > profile (`20 MiB` linear heap + `42.6 MiB` normal heap fitting `26 MiB` arena + `6 MiB` JIT + CHD);
 > New 3DS gets an `80 MiB` normal heap + `42.6 MiB` linear heap (`v0.2.1` fixes the `v0.2.0` boot
 > crash where the normal heap overflowed the 96 MiB Kernel11 heap window on New 3DS).
+
+> [!NOTE]
+> **`v0.2.3` real-hardware JIT fix (New 3DS `prefetch abort` at `PC = 0x08067E70`):** `v0.2.2`'s
+> `jit_mem_commit()` only cleaned the D-cache, never invalidating the ARM11 L1 I-cache, and blocks
+> were packed at 4-byte granularity, so a freshly emitted block could run a stale I-cache line of zero
+> words (`andeq r0, r0, r0`), skipping a helper `blx`/`pop` and leaving `SP` 8 bytes off at
+> `jit_exit`. `v0.2.3` (1) cleans the D-cache of both the RW and RX views and invalidates the L1
+> I-cache + BTB (Luma3DS `SVC 0x94`) + `DSB`/`ISB` on every block commit, (2) allocates the RW code
+> buffer 16 KiB aligned so it shares VIPT cache colours with the 1 MiB-aligned RX mirror, (3) pads
+> every block to a 32-byte cache line, and (4) saves `SP` in `jit_enter` (`PsxCpu.jit_saved_sp`,
+> offset `0x270`) and restores it in every `jit_exit*` path before `pop {r4-r12, pc}`.
 
 ### Controls
 

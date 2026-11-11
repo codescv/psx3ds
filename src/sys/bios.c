@@ -50,7 +50,12 @@ static int bios_name_rank(const char *name) {
 bool psx_bios_find_external(char *path_out, u32 path_cap, char *badge_out, u32 badge_cap) {
     static const char *const k_dirs[] = {
 #if PSX3DS_PLATFORM_3DS
-        "sdmc:/psx3ds/bios", "sdmc:/psx", "sdmc:/roms/psx", "sdmc:/bios", "sdmc:/",
+        /* v0.2.3: dedicated BIOS/PS1 directories only; the SD root is never scanned. */
+        "sdmc:/psx3ds/bios",
+        "sdmc:/bios",
+        "sdmc:/psx3ds/roms",
+        "sdmc:/roms/psx",
+        "sdmc:/psx",
 #else
         ".", "bios",
 #endif

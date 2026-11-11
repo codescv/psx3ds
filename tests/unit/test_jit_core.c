@@ -647,6 +647,37 @@ static int test_diff_fibonacci(void) {
                g_sys[2].stats.ibtc_misses > 0u && g_sys[2].stats.ibtc_misses <= 5u &&
                g_sys[2].jit.ibtc[(ret_main_va >> 2) & 0x3FFu].tag == ret_main_va,
                "IBTC populated & >=99% inline hit rate on 753 JR $ra returns");
+
+    /*
+     * v0.2.3 (real New 3DS prefetch abort at PC = 0x08067E70): every native block must
+     * start on its own 32-byte ARM11 L1 cache line, and jit_enter must have saved the
+     * host SP (PsxCpu.jit_saved_sp @ 0x270) that every jit_exit* path restores.
+     */
+    {
+        const JitState *j = &g_sys[2].jit;
+        u32 n_native = 0u;
+        CHECK_TRUE(j->n_blocks > 0u, "fib(14) compiled JIT blocks");
+        for (u32 k = 0u; k < j->n_blocks; ++k) {
+            const JitBlock *b = &j->blocks[k];
+            if (!b->entry.p || b->code_bytes == 0u) {
+                continue;
+            }
+            CHECK_TRUE(((uintptr_t)b->entry.p & 31u) == 0u,
+                       "JIT block entry is 32-byte ARM11 cache-line aligned");
+            n_native++;
+        }
+        CHECK_TRUE(n_native > 0u, "fib(14) produced native JIT blocks");
+        CHECK_TRUE(((uintptr_t)j->code_ptr & 31u) == 0u,
+                   "JIT code_ptr advanced to a 32-byte cache-line boundary");
+
+        u32 stack_probe = 0u;
+        uintptr_t here = (uintptr_t)&stack_probe;
+        uintptr_t saved = (uintptr_t)g_sys[2].cpu.jit_saved_sp;
+        CHECK_TRUE(saved != 0u && (saved & 7u) == 0u,
+                   "jit_enter saved an 8-byte aligned host SP in cpu.jit_saved_sp");
+        CHECK_TRUE(saved < here && (here - saved) < 0x10000u,
+                   "cpu.jit_saved_sp lies just below the caller's stack frame");
+    }
 #endif
     return 0;
 }

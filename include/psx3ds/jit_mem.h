@@ -21,6 +21,7 @@ typedef struct JitMem {
     u32        size;
     JitMemMode mode;
     bool       luma_icache_svc;
+    bool       is_hle_emu; /* Citra/Azahar HLE (no real ARM11 L1 I-cache to evict) */
 } JitMem;
 
 PsxResult jit_mem_alloc(JitMem *m, u32 size);

@@ -173,7 +173,8 @@ static bool has_rom_extension(const char *name) {
 
 /*
  * BIOS selection (v0.2.2): an external 512 KiB SD BIOS (SCPH*.BIN, PSXONPSP*.BIN, BIOS*.BIN,
- * openbios.bin in sdmc:/psx3ds/bios, sdmc:/psx, sdmc:/roms/psx, sdmc:/bios, sdmc:/) wins; else the
+ * openbios.bin in sdmc:/psx3ds/bios, sdmc:/bios, sdmc:/psx3ds/roms, sdmc:/roms/psx, sdmc:/psx) wins;
+ * the SD root is never scanned (v0.2.3); else the
  * embedded OpenBIOS ("builtin") is used. HLE Direct is an explicit opt-in (ui->bios_mode).
  */
 static void detect_sdmc_bios(CtrUiState *ui) {
@@ -206,11 +207,11 @@ void ctr_ui_scan_roms(CtrUiState *ui) {
     ui->rom_sel = 0u;
     ui->rom_scroll = 0u;
 
+    /* v0.2.3: only dedicated PS1 ROM directories; never walk the whole SD card root. */
     static const char *const k_dirs[] = {
         "sdmc:/psx3ds/roms",
-        "sdmc:/psx",
         "sdmc:/roms/psx",
-        "sdmc:/"
+        "sdmc:/psx",
     };
 
     char (*entries)[256] = (char (*)[256])malloc(128u * 256u);
@@ -224,7 +225,7 @@ void ctr_ui_scan_roms(CtrUiState *ui) {
             if (!has_rom_extension(entries[i])) {
                 continue;
             }
-            /* Skip BIOS binaries when scanning root directories */
+            /* Skip BIOS binaries that share a ROM directory */
             if (looks_like_bios_file(entries[i])) {
                 continue;
             }
@@ -537,7 +538,7 @@ void ctr_ui_render(const CtrUiState *ui, const PsxSystem *sys, const CtrHwInfo *
                             ui->bios_path[0] != '\0';
             fb_draw_text(fb, 16, 64, "No PS1 discs/EXEs found on SD.", COL_WARN, 36);
             fb_draw_text(fb, 16, 82, "Place .chd/.cue/.bin/.iso/.exe in:", COL_DIM, 36);
-            fb_draw_text(fb, 16, 98, "  sdmc:/psx/ or sdmc:/psx3ds/roms/", COL_TEXT, 36);
+            fb_draw_text(fb, 16, 98, "  sdmc:/psx3ds/roms/ sdmc:/roms/psx/", COL_TEXT, 36);
             if (ui->bios_mode == CTR_BIOS_MODE_HLE) {
                 fb_draw_text(fb, 16, 118, "HLE Direct BIOS (3:CTRL to change)", COL_WARN, 36);
             } else if (external) {

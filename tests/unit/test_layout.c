@@ -119,7 +119,11 @@ int main(void) {
     CHECK_OFF(gte_scratch,    PSX_OFF_GTE_SCRATCH);
     CHECK_OFF(icache_dirty,   PSX_OFF_ICACHE_DIRTY);
     CHECK_OFF(psexe_pending,  PSX_OFF_PSEXE_PENDING);
+    CHECK_OFF(jit_saved_sp,   PSX_OFF_JIT_SP);
     CHECK_OFF(total_cycles,   PSX_OFF_HOT_END);
+    CHECK_TRUE(PSX_OFF_JIT_SP == 0x270, "PSX_OFF_JIT_SP == 0x270 (v0.2.3 SP guard)");
+    CHECK_TRUE(offsetof(PsxCpu, _hot_pad) + sizeof(((PsxCpu *)0)->_hot_pad) == PSX_OFF_HOT_END,
+               "hot region ends exactly at PSX_OFF_HOT_END");
 
     CHECK_TRUE(offsetof(PsxCpu, cop0) + COP0_SR * 4u == PSX_OFF_COP0_SR, "COP0 SR offset");
     CHECK_TRUE(offsetof(PsxCpu, cop0) + COP0_CAUSE * 4u == PSX_OFF_COP0_CAUSE, "COP0 CAUSE offset");

@@ -228,7 +228,7 @@ typedef struct {
 
 bool ctr_jit_init(CtrJitBuffer *jb, size_t size_bytes) {
     size_bytes = (size_bytes + 0xFFFu) & ~0xFFFu;
-    jb->rw_base  = (uint32_t *)memalign(0x1000, size_bytes);
+    jb->rw_base  = (uint32_t *)memalign(0x4000, size_bytes); /* 16 KiB: same VIPT colour as rx (v0.2.3) */
     if (!jb->rw_base) return false;
     jb->rx_base  = jb->rw_base;
     jb->capacity = size_bytes;
@@ -255,6 +255,8 @@ bool ctr_jit_init(CtrJitBuffer *jb, size_t size_bytes) {
 
 static inline void ctr_jit_flush(CtrJitBuffer *jb, void *rw_start, size_t bytes) {
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)rw_start, (u32)bytes);
+    /* v0.2.3: MUST also invalidate the ARM11 L1 I-cache + BTB (Luma3DS SVC 0x94) */
+    __asm__ volatile("svc 0x94\n\t" ::: "r0", "r1", "r2", "r3", "r12", "memory");
     uint32_t zero = 0;
     __asm__ volatile (
         "mcr p15, 0, %0, c7, c10, 4\n\t" /* DSB (EL0-safe) */
@@ -263,6 +265,13 @@ static inline void ctr_jit_flush(CtrJitBuffer *jb, void *rw_start, size_t bytes)
     );
 }
 ```
+
+> **ARM11 L1 I-cache invalidation & VIPT alignment (`v0.2.3`, real New 3DS `prefetch abort` at `PC = 0x08067E70`):**
+> - `svcFlushProcessDataCache` only cleans the D-cache to FCRAM; the 32 KiB 4-way (8 KiB/way) VIPT L1 **I-cache** keeps stale lines. `v0.2.2` never invalidated it, so a newly emitted block executed stale zero words (`andeq r0, r0, r0` = NOP), skipping `blx r12` / `pop {r12, lr}` of a helper call and leaving `SP` 8 bytes low at `jit_exit`; `pop {r4-r12, pc}` then loaded `saved_r11` (`sys + 0xb000`) into `PC`.
+> - `jit_mem_commit()` (`src/platform/3ds/jit_mem_3ds.c`) now cleans the D-cache for the 32-byte aligned range in **both** the RW buffer and the RX mirror, then runs Luma3DS `svcInvalidateEntireInstructionCache` (`svc 0x94`, clobbers `r0-r3, r12`; I-cache + BTB) — or the 128 KiB NOP eviction sled on real hardware without it (skipped under Citra/Azahar HLE) — followed by EL0-safe `DSB` + `ISB`.
+> - `jit_mem_alloc()` allocates the RW buffer with `memalign(0x4000, size)` so `rw` and the 1 MiB-aligned `rx` mirror share VA bits `[13:12]` (no cache-colour aliasing); `src/jit/arm_jit.c` starts and pads every native block on a 32-byte cache line.
+> - `jit_enter` saves the host `SP` in `PsxCpu.jit_saved_sp` (`PSX_OFF_JIT_SP = 0x270`) and `jit_exit`, `jit_exit_step_one`, `jit_exit_with_reason` and `jit_raise_exception_exit` reload it before `pop {r4-r12, pc}`.
+> - SD scanning (`v0.2.3`): ROMs only from `sdmc:/psx3ds/roms`, `sdmc:/roms/psx`, `sdmc:/psx`; external BIOS only from `sdmc:/psx3ds/bios`, `sdmc:/bios` and those ROM folders. The SD root is never walked.
 
 ---
 

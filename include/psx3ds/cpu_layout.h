@@ -42,6 +42,7 @@
 #define PSX_OFF_GTE_SCRATCH    0x248 /* u32[8]   0x248..0x267 inline GTE scratch               */
 #define PSX_OFF_ICACHE_DIRTY   0x268 /* u32      deferred jit_mem_icache_flush_all() flag      */
 #define PSX_OFF_PSEXE_PENDING  0x26C /* u32      PS-EXE injection armed at 0x80030000          */
+#define PSX_OFF_JIT_SP         0x270 /* u32      host SP saved by jit_enter (v0.2.3 SP guard)  */
 #define PSX_OFF_HOT_END        0x300 /* end of hot JIT-addressable region                      */
 
 /* Convenience COP0 byte offsets from r11 (PsxCpu*) */
